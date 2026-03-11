@@ -37,7 +37,8 @@ var (
 )
 
 // 获取设备数据的最大尝试次数
-const maxDeviceDataFetchAttempts = 3
+// 在 Android 等特殊平台上，初始化可能需要更多尝试
+const maxDeviceDataFetchAttempts = 60
 
 const (
 	CPU = iota + 1
@@ -196,6 +197,7 @@ func TrackNetworkSpeed() {
 	ctx := context.WithValue(context.Background(), nic.NICKey, agentConfig.NICAllowlist)
 	nc, err := nic.GetState(ctx)
 	if err != nil {
+		printf("TrackNetworkSpeed error: %v", err)
 		return
 	}
 
@@ -265,6 +267,9 @@ func tryHost[T any](ctx context.Context, typ uint8, f hostStateFunc[T]) T {
 			val = v
 			hostDataFetchAttempts[typ] = 0
 		}
+	} else {
+		// 达到上限后周期性重试，避免因临时故障永久禁用
+		hostDataFetchAttempts[typ] = maxDeviceDataFetchAttempts - 1
 	}
 	return val
 }
@@ -285,6 +290,10 @@ func tryStat[T any](ctx context.Context, typ uint8, f hostStateFunc[T]) T {
 			val = v
 			statDataFetchAttempts[typ] = 0
 		}
+	} else {
+		// 达到最大尝试次数后，不永久放弃，而是每隔一段时间重试一次
+		// 防止因临时故障（如 Android 启动初期权限未就绪）导致监控永久失效
+		statDataFetchAttempts[typ] = maxDeviceDataFetchAttempts - 1
 	}
 	return val
 }

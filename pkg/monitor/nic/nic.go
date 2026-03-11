@@ -1,22 +1,11 @@
+//go:build !android
+
 package nic
 
 import (
 	"context"
 
-	"github.com/cloudflare/ahocorasick"
 	"github.com/shirou/gopsutil/v4/net"
-)
-
-type NICKeyType string
-
-const NICKey NICKeyType = "nic"
-
-var (
-	excludeNetInterfaces = []string{
-		"lo", "tun", "docker", "veth", "br-", "vmbr", "vnet", "kube", "Meta", "tailscale", "fw", "tap",
-	}
-
-	defaultMatcher = ahocorasick.NewStringMatcher(excludeNetInterfaces)
 )
 
 func GetState(ctx context.Context) ([]uint64, error) {
@@ -29,7 +18,7 @@ func GetState(ctx context.Context) ([]uint64, error) {
 	allowList, _ := ctx.Value(NICKey).(map[string]bool)
 
 	for _, v := range nc {
-		if defaultMatcher.Contains([]byte(v.Name)) && !allowList[v.Name] {
+		if DefaultMatcher.Contains([]byte(v.Name)) && !allowList[v.Name] {
 			continue
 		}
 		if len(allowList) > 0 && !allowList[v.Name] {

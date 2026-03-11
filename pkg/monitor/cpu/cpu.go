@@ -1,3 +1,5 @@
+//go:build !android
+
 package cpu
 
 import (
@@ -6,10 +8,6 @@ import (
 
 	psCpu "github.com/shirou/gopsutil/v4/cpu"
 )
-
-type CPUHostType string
-
-const CPUHostKey CPUHostType = "cpu"
 
 func GetHost(ctx context.Context) ([]string, error) {
 	ci, err := psCpu.InfoWithContext(ctx)
