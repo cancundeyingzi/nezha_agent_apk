@@ -37,7 +37,7 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(
                 // 适配暗色沉浸主题
                 colorScheme = darkColorScheme(
-                    primary = Color(0xFF6200EE),
+                    primary = Color(0xFF03A9F4),
                     background = Color(0xFF121212),
                     surface = Color(0xFF1E1E1E)
                 )
