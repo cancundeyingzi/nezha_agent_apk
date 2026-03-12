@@ -2,21 +2,26 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Network -->
+    <!-- 网络访问 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
-    <!-- Foreground Service & WakeLock for Keep Alive -->
+    <!-- 前台服务保活：WakeLock 防止 CPU 睡眠，REQUEST_IGNORE_BATTERY_OPTIMIZATIONS 申请豁免 Doze -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- Android 14+ specific foreground service types -->
+    <!-- Android 14+ 专用前台服务类型权限（需与 startForeground 中传入的类型一致）-->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Android 13 (API 33)+ 通知权限：不申请则前台服务通知不显示，保活优先级下降 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Hardware / OS Info -->
+    <!-- 开机自启权限 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 硬件/系统信息读取 -->
     <uses-permission android:name="android.permission.BATTERY_STATS" tools:ignore="ProtectedPermissions"/>
 
     <application
@@ -26,7 +31,7 @@
         android:theme="@style/Theme.NezhaAgent"
         android:networkSecurityConfig="@xml/network_security_config"
         tools:targetApi="31">
-        
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -37,12 +42,41 @@
             </intent-filter>
         </activity>
 
+        <!--
+            前台服务：声明 dataSync|specialUse 两种类型，
+            代码中根据 API 级别在运行时选择使用哪种类型：
+              - API 10~33: FOREGROUND_SERVICE_TYPE_DATA_SYNC
+              - API 34+  : FOREGROUND_SERVICE_TYPE_SPECIAL_USE（保活更稳定）
+        -->
         <service
             android:name=".service.AgentService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
-            
+            android:foregroundServiceType="dataSync|specialUse">
+            <!--
+                Android 14 (API 34)+ 要求为 specialUse 类型的前台服务提供用途说明。
+                此属性用于 Google Play 审核和系统日志，描述该服务的实际功能。
+            -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="哪吒探针系统监控服务：持续采集设备 CPU、内存、网络等运行指标，并通过 gRPC 上报至哪吒监控面板，实现设备实时运行状态监控。" />
+        </service>
+
+        <!--
+            开机自启接收器。
+            - android:exported="false"：防止第三方 App 伪造广播触发服务。
+            - BOOT_COMPLETED 被列入 Android 8.0+ 隐式广播豁免名单，可正常接收。
+            - MY_PACKAGE_REPLACED 在应用更新后触发，自动恢复探针运行。
+        -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

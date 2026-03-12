@@ -1,0 +1,13 @@
+# Git Ignore File
+
+# AI Context
+.cobridge
+
+# .traerules
+.traerules
+
+# .cursorrules
+.cursorrules
+
+# GitHub Copilot Instructions
+.github/copilot-instructions.md

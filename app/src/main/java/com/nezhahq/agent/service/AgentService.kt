@@ -19,6 +19,7 @@ import com.nezhahq.agent.executor.TaskExecutor
 import com.nezhahq.agent.grpc.GrpcManager
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
+import com.nezhahq.agent.util.RootShell
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import proto.Nezha.Receipt
@@ -36,17 +37,28 @@ class AgentService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        // Android Q (10) 及以上版本要求在 startForeground() 时指定 foregroundServiceType，
-        // 否则 Android 14+ 会直接抛出 ForegroundServiceTypeException 导致崩溃。
-        // Manifest 中已声明 foregroundServiceType="dataSync"，此处必须与之一致。
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                1001,
-                createNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            startForeground(1001, createNotification())
+        // ── 前台服务 startForeground 类型适配 ─────────────────────────────────
+        // Android Q (10, API 29)+ 要求在调用时传入与 Manifest 声明一致的 serviceType。
+        // Android 14 (API 34)+ 对 dataSync 的审查更严格（需真实数据同步活动），
+        // 改用 FOREGROUND_SERVICE_TYPE_SPECIAL_USE 对长期系统监控进程保活效果更佳，
+        // 且 Manifest 中已声明对应权限 FOREGROUND_SERVICE_SPECIAL_USE 与用途说明。
+        when {
+            Build.VERSION.SDK_INT >= 34 -> {
+                @Suppress("InlinedApi")
+                startForeground(
+                    1001,
+                    createNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            }
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
+                startForeground(
+                    1001,
+                    createNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            }
+            else -> startForeground(1001, createNotification())
         }
         acquireWakeLock()
         
@@ -152,9 +164,10 @@ class AgentService : Service() {
         Logger.i("Service is being destroyed globally by system or user intent.")
         super.onDestroy()
         job.cancel()
-        wakeLock?.let {
-            if (it.isHeld) it.release()
-        }
+        wakeLock?.let { if (it.isHeld) it.release() }
         GrpcManager.shutdown()
+        // 关闭持久化 Root Shell 会话，释放后台 su 进程资源，防止进程泄漏
+        RootShell.shutdown()
+        Logger.i("RootShell persistent session closed.")
     }
 }
