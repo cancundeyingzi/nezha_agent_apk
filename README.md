@@ -6,4 +6,5 @@
 <img width="1081" height="533" alt="image" src="https://github.com/user-attachments/assets/9e951994-b06b-40be-a452-7da0d73344e7" />
 root:
 <img width="1583" height="1105" alt="image" src="https://github.com/user-attachments/assets/dc2bfd95-f57a-45f2-8e28-ab81213e917a" />
-移动云手机极致版：
+移动云手机极致版开机直装无rootadb开发者：
+![-6168098780167737467_119](https://github.com/user-attachments/assets/b9ac0c73-96dc-4ab7-beb7-7b16c83fabc1)
