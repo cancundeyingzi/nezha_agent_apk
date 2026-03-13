@@ -79,6 +79,13 @@ dependencies {
     implementation("io.grpc:grpc-stub:$grpcVersion")
     implementation("io.grpc:grpc-kotlin-stub:$grpcKotlinVersion")
     implementation("com.google.protobuf:protobuf-javalite:$protobufVersion")
+
+    // Shizuku API：提供 ADB 级别的高权限 Shell 执行能力，
+    // 当设备无 Root 但安装了 Shizuku 应用时，可作为 su 的替代方案。
+    val shizukuVersion = "13.1.5"
+    implementation("dev.rikka.shizuku:api:$shizukuVersion")
+    implementation("dev.rikka.shizuku:provider:$shizukuVersion")
+
     compileOnly("org.apache.tomcat:annotations-api:6.0.53") // For javax.annotation.Generated
 
     testImplementation("junit:junit:4.13.2")

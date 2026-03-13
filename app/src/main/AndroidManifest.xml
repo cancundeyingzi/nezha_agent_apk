@@ -63,6 +63,21 @@
         </service>
 
         <!--
+            Shizuku ContentProvider：用于从 Shizuku 应用获取 Binder，
+            实现 ADB 级别权限的 Shell 执行能力。
+            - exported="true"：Shizuku 框架要求必须对外公开
+            - INTERACT_ACROSS_USERS_FULL 权限保护：防止普通 App 访问
+            - multiprocess="false"：单进程模式，确保 Binder 一致性
+        -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!--
             开机自启接收器。
             - android:exported="false"：防止第三方 App 伪造广播触发服务。
             - BOOT_COMPLETED 被列入 Android 8.0+ 隐式广播豁免名单，可正常接收。

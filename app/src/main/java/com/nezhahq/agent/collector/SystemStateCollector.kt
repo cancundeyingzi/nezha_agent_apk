@@ -43,7 +43,7 @@ import java.io.File
  * ## 性能优化
  *  - 所有 Regex 均以伴生对象常量形式预编译（/proc/stat 分割）。
  *  - /proc/meminfo 解析改用纯字符串操作，避免临时 Regex 对象和 GC。
- *  - /proc/net/* 连接数统计改为字节缓冲区计换行符，无 String 对象分配。
+ *  - /proc/net/ 等连接数统计改为字节缓冲区计换行符，无 String 对象分配。
  *  - Root 模式下的所有 shell 命令通过 [RootShell] 单例持久会话执行，
  *    彻底消除每 2 秒 fork 新 su 进程的性能灾难。
  */
@@ -66,8 +66,8 @@ class SystemStateCollector(private val context: Context) {
     // ──────────────────────────────────────────────────────────────────────────
     // 状态变量：网络速度差值计算
     // ──────────────────────────────────────────────────────────────────────────
-    private var lastRxBytes = TrafficStats.getTotalRxBytes()
-    private var lastTxBytes = TrafficStats.getTotalTxBytes()
+    private var lastRxBytes = -1L
+    private var lastTxBytes = -1L
     private var lastTimeMs  = SystemClock.elapsedRealtime()
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -81,6 +81,7 @@ class SystemStateCollector(private val context: Context) {
     // ──────────────────────────────────────────────────────────────────────────
 
     fun getState(): State {
+        val isRootMode = ConfigStore.getRootMode(context)
 
         // ── 1. RAM ─────────────────────────────────────────────────────────────
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -97,15 +98,15 @@ class SystemStateCollector(private val context: Context) {
         val diskTotal = statFs.blockCountLong       * statFs.blockSizeLong
         val diskUsed  = diskTotal - diskFree
 
-        // ── 4. 网络速度（TrafficStats 差值计算）──────────────────────────────
-        val currentRx   = TrafficStats.getTotalRxBytes()
-        val currentTx   = TrafficStats.getTotalTxBytes()
+        // ── 4. 网络速度与流量 ──────────────────────────────────────────────────
+        val (currentRx, currentTx) = readNetworkTrafficBytes(isRootMode)
         val currentTime = SystemClock.elapsedRealtime()
         val timeDiff    = currentTime - lastTimeMs
 
         var rxSpeed = 0L
         var txSpeed = 0L
-        if (timeDiff > 0) {
+        // Ensure lastBytes is initialized properly (-1L) to avoid first tick huge speed
+        if (timeDiff > 0 && lastRxBytes >= 0 && lastTxBytes >= 0) {
             rxSpeed = (currentRx - lastRxBytes) * 1000 / timeDiff
             txSpeed = (currentTx - lastTxBytes) * 1000 / timeDiff
         }
@@ -125,8 +126,7 @@ class SystemStateCollector(private val context: Context) {
             .setTemperature(tempCelsius)
             .build()
 
-        // ── 6. CPU + 进程数 + 连接数（区分 root/普通模式）────────────────────
-        val isRootMode   = ConfigStore.getRootMode(context)
+        // ── 6. CPU + 进程数 + 连接数 ───────────────────────────────────────────
         val cpuUsage     = readCpuUsagePercent(isRootMode)
         var processCount = 0L
         var tcpConnCount = 0L
@@ -159,6 +159,62 @@ class SystemStateCollector(private val context: Context) {
             .setProcessCount(processCount)
             .addTemperatures(sensorTemp)
             .build()
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 网络流量采集
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 读取全系统的收发流量。
+     * - Root/Shizuku 模式：通过 `cat /proc/net/dev` 解析全网卡流量，规避 Android 11+ 对 TrafficStats 的限制。
+     * - 普通模式：使用 `TrafficStats`，若被系统拦截或不支持则回退为 0。
+     */
+    private fun readNetworkTrafficBytes(isRootMode: Boolean): Pair<Long, Long> {
+        var rx = -1L
+        var tx = -1L
+
+        if (isRootMode) {
+            try {
+                val output = RootShell.execute("cat /proc/net/dev")
+                if (output.isNotBlank()) {
+                    var tempRx = 0L
+                    var tempTx = 0L
+                    var hasData = false
+                    output.lineSequence().forEach { line ->
+                        if (line.contains(":")) {
+                            val parts = line.substringAfter(":").trim().split(WHITESPACE_RE)
+                            if (parts.size >= 9) {
+                                val iface = line.substringBefore(":").trim()
+                                if (iface != "lo") {
+                                    val r = parts[0].toLongOrNull() ?: 0L
+                                    val t = parts[8].toLongOrNull() ?: 0L
+                                    tempRx += r
+                                    tempTx += t
+                                    if (r > 0 || t > 0) hasData = true
+                                }
+                            }
+                        }
+                    }
+                    if (hasData) {
+                        rx = tempRx
+                        tx = tempTx
+                    }
+                }
+            } catch (e: Exception) {
+                Logger.e("StateCollector: Root 模式读取 /proc/net/dev 失败", e)
+            }
+        }
+
+        // 降级使用 TrafficStats（可能返回 UNSUPPORTED 即 -1）
+        if (rx < 0L || tx < 0L) {
+            val tsRx = TrafficStats.getTotalRxBytes()
+            val tsTx = TrafficStats.getTotalTxBytes()
+            rx = if (tsRx >= 0) tsRx else 0L
+            tx = if (tsTx >= 0) tsTx else 0L
+        }
+
+        return Pair(rx, tx)
     }
 
     // ──────────────────────────────────────────────────────────────────────────

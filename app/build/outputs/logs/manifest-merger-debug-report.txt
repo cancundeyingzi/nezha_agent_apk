@@ -1,9 +1,24 @@
 -- Merging decision tree log ---
+provider#rikka.shizuku.ShizukuProvider
+INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:72:9-78:82
+	android:enabled
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:76:13-35
+	android:authorities
+		INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:74:13-59
+	android:multiprocess
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:75:13-41
+	android:exported
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:77:13-36
+	android:permission
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:78:13-79
+	android:name
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:73:13-57
 manifest
-ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:2:1-48:12
-INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:2:1-48:12
-INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:2:1-48:12
-INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:2:1-48:12
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:2:1-97:12
+INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:2:1-97:12
+INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:2:1-97:12
+INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:2:1-97:12
 MERGED from [androidx.compose.material3:material3-android:1.2.0] C:\Users\17658\.gradle\caches\transforms-4\3244b2bf46f655b62527bc0f2682015e\transformed\material3-release\AndroidManifest.xml:17:1-22:12
 MERGED from [androidx.compose.material:material-android:1.6.1] C:\Users\17658\.gradle\caches\transforms-4\e6c0b56698f5e5b73816a2ce9018f4e6\transformed\material-release\AndroidManifest.xml:2:1-7:12
 MERGED from [androidx.compose.material:material-icons-core-android:1.6.1] C:\Users\17658\.gradle\caches\transforms-4\a98acd28e5652fa75f6b628b55d1d311\transformed\material-icons-core-release\AndroidManifest.xml:2:1-7:12
@@ -44,11 +59,15 @@ MERGED from [androidx.compose.runtime:runtime-android:1.6.1] C:\Users\17658\.gra
 MERGED from [androidx.annotation:annotation-experimental:1.4.0] C:\Users\17658\.gradle\caches\transforms-4\aa4fae928e15e1c04b3e815906df878c\transformed\annotation-experimental-1.4.0\AndroidManifest.xml:2:1-7:12
 MERGED from [androidx.security:security-crypto:1.1.0-alpha06] C:\Users\17658\.gradle\caches\transforms-4\fae4e0df9811ce34600896f694cd8180\transformed\security-crypto-1.1.0-alpha06\AndroidManifest.xml:17:1-22:12
 MERGED from [androidx.versionedparcelable:versionedparcelable:1.1.1] C:\Users\17658\.gradle\caches\transforms-4\d48cec7c2d1a631f07ff09014c254e60\transformed\versionedparcelable-1.1.1\AndroidManifest.xml:17:1-27:12
+MERGED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:2:1-16:12
+MERGED from [dev.rikka.shizuku:api:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\f7da490b61b130a55d9950154f12615e\transformed\api-13.1.5\AndroidManifest.xml:2:1-7:12
+MERGED from [dev.rikka.shizuku:shared:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\c224c4279cd9e9fb5a8fb3dfef25df07\transformed\shared-13.1.5\AndroidManifest.xml:2:1-7:12
 MERGED from [androidx.interpolator:interpolator:1.0.0] C:\Users\17658\.gradle\caches\transforms-4\728e63639e9812369c55925df30d128d\transformed\interpolator-1.0.0\AndroidManifest.xml:17:1-22:12
 MERGED from [androidx.arch.core:core-runtime:2.2.0] C:\Users\17658\.gradle\caches\transforms-4\5f120184f30e9ea7c0399614cf72439e\transformed\core-runtime-2.2.0\AndroidManifest.xml:17:1-22:12
 MERGED from [androidx.profileinstaller:profileinstaller:1.3.0] C:\Users\17658\.gradle\caches\transforms-4\34fa4013e9021aecf1f917b057611d1f\transformed\profileinstaller-1.3.0\AndroidManifest.xml:17:1-55:12
 MERGED from [androidx.startup:startup-runtime:1.1.1] C:\Users\17658\.gradle\caches\transforms-4\47cf93e84f25da5b78b3fc7c5badc2ec\transformed\startup-runtime-1.1.1\AndroidManifest.xml:17:1-33:12
 MERGED from [androidx.tracing:tracing:1.0.0] C:\Users\17658\.gradle\caches\transforms-4\a25e2543e9c7bc3ab53e861a6955c14b\transformed\tracing-1.0.0\AndroidManifest.xml:17:1-24:12
+MERGED from [dev.rikka.shizuku:aidl:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\685c8c6f26e6b14b99f583110ce8dc77\transformed\aidl-13.1.5\AndroidManifest.xml:2:1-7:12
 	package
 		INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml
 	android:versionName
@@ -92,18 +111,22 @@ ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManife
 	android:name
 		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:16:22-92
 uses-permission#android.permission.POST_NOTIFICATIONS
-ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:17:5-77
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:19:5-77
 	android:name
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:17:22-74
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:19:22-74
+uses-permission#android.permission.RECEIVE_BOOT_COMPLETED
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:22:5-81
+	android:name
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:22:22-78
 uses-permission#android.permission.BATTERY_STATS
-ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:20:5-107
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:25:5-107
 	tools:ignore
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:20:70-105
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:25:70-105
 	android:name
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:20:22-69
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:25:22-69
 application
-ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:22:5-46:19
-INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:22:5-46:19
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:27:5-95:19
+INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:27:5-95:19
 MERGED from [androidx.compose.ui:ui-tooling-android:1.6.1] C:\Users\17658\.gradle\caches\transforms-4\c90d8cea154c1eb6232c7f63aa90c2cf\transformed\ui-tooling-release\AndroidManifest.xml:22:5-26:19
 MERGED from [androidx.compose.ui:ui-tooling-android:1.6.1] C:\Users\17658\.gradle\caches\transforms-4\c90d8cea154c1eb6232c7f63aa90c2cf\transformed\ui-tooling-release\AndroidManifest.xml:22:5-26:19
 MERGED from [androidx.compose.ui:ui-test-manifest:1.6.1] C:\Users\17658\.gradle\caches\transforms-4\3d0ad51e6c5389f5a61da0aa88695b04\transformed\ui-test-manifest-1.6.1\AndroidManifest.xml:22:5-26:19
@@ -116,6 +139,8 @@ MERGED from [androidx.lifecycle:lifecycle-process:2.7.0] C:\Users\17658\.gradle\
 MERGED from [androidx.lifecycle:lifecycle-process:2.7.0] C:\Users\17658\.gradle\caches\transforms-4\2470838c7c483fd8124156d0bb1a9b84\transformed\lifecycle-process-2.7.0\AndroidManifest.xml:23:5-33:19
 MERGED from [androidx.versionedparcelable:versionedparcelable:1.1.1] C:\Users\17658\.gradle\caches\transforms-4\d48cec7c2d1a631f07ff09014c254e60\transformed\versionedparcelable-1.1.1\AndroidManifest.xml:24:5-25:19
 MERGED from [androidx.versionedparcelable:versionedparcelable:1.1.1] C:\Users\17658\.gradle\caches\transforms-4\d48cec7c2d1a631f07ff09014c254e60\transformed\versionedparcelable-1.1.1\AndroidManifest.xml:24:5-25:19
+MERGED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:10:5-14:19
+MERGED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:10:5-14:19
 MERGED from [androidx.profileinstaller:profileinstaller:1.3.0] C:\Users\17658\.gradle\caches\transforms-4\34fa4013e9021aecf1f917b057611d1f\transformed\profileinstaller-1.3.0\AndroidManifest.xml:23:5-53:19
 MERGED from [androidx.profileinstaller:profileinstaller:1.3.0] C:\Users\17658\.gradle\caches\transforms-4\34fa4013e9021aecf1f917b057611d1f\transformed\profileinstaller-1.3.0\AndroidManifest.xml:23:5-53:19
 MERGED from [androidx.startup:startup-runtime:1.1.1] C:\Users\17658\.gradle\caches\transforms-4\47cf93e84f25da5b78b3fc7c5badc2ec\transformed\startup-runtime-1.1.1\AndroidManifest.xml:25:5-31:19
@@ -125,45 +150,69 @@ MERGED from [androidx.startup:startup-runtime:1.1.1] C:\Users\17658\.gradle\cach
 	android:appComponentFactory
 		ADDED from [androidx.core:core:1.12.0] C:\Users\17658\.gradle\caches\transforms-4\5649136cf972b33424b9fbc5060bdb47\transformed\core-1.12.0\AndroidManifest.xml:28:18-86
 	android:supportsRtl
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:25:9-35
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:30:9-35
 	android:label
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:24:9-41
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:29:9-41
+	tools:ignore
+		ADDED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:10:18-69
 	tools:targetApi
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:28:9-29
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:33:9-29
 	android:allowBackup
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:23:9-35
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:28:9-35
 	android:theme
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:26:9-48
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:31:9-48
 	android:networkSecurityConfig
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:27:9-69
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:32:9-69
 activity#com.nezhahq.agent.MainActivity
-ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:30:9-38:20
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:35:9-43:20
 	android:exported
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:32:13-36
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:37:13-36
 	android:theme
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:33:13-52
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:38:13-52
 	android:name
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:31:13-41
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:36:13-41
 intent-filter#action:name:android.intent.action.MAIN+category:name:android.intent.category.LAUNCHER
-ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:34:13-37:29
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:39:13-42:29
 action#android.intent.action.MAIN
-ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:35:17-69
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:40:17-69
 	android:name
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:35:25-66
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:40:25-66
 category#android.intent.category.LAUNCHER
-ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:36:17-77
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:41:17-77
 	android:name
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:36:27-74
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:41:27-74
 service#com.nezhahq.agent.service.AgentService
-ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:40:9-44:56
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:51:9-63:19
 	android:enabled
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:42:13-35
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:53:13-35
 	android:exported
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:43:13-37
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:54:13-37
 	android:foregroundServiceType
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:44:13-53
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:55:13-64
 	android:name
-		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:41:13-49
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:52:13-49
+property#android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:60:13-62:101
+	android:value
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:62:17-98
+	android:name
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:61:17-76
+receiver#com.nezhahq.agent.BootReceiver
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:86:9-93:20
+	android:exported
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:88:13-37
+	android:name
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:87:13-41
+intent-filter#action:name:android.intent.action.BOOT_COMPLETED+action:name:android.intent.action.MY_PACKAGE_REPLACED
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:89:13-92:29
+action#android.intent.action.BOOT_COMPLETED
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:90:17-79
+	android:name
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:90:25-76
+action#android.intent.action.MY_PACKAGE_REPLACED
+ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:91:17-84
+	android:name
+		ADDED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml:91:25-81
 uses-sdk
 INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml reason: use-sdk injection requested
 INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml
@@ -248,6 +297,12 @@ MERGED from [androidx.security:security-crypto:1.1.0-alpha06] C:\Users\17658\.gr
 MERGED from [androidx.security:security-crypto:1.1.0-alpha06] C:\Users\17658\.gradle\caches\transforms-4\fae4e0df9811ce34600896f694cd8180\transformed\security-crypto-1.1.0-alpha06\AndroidManifest.xml:20:5-44
 MERGED from [androidx.versionedparcelable:versionedparcelable:1.1.1] C:\Users\17658\.gradle\caches\transforms-4\d48cec7c2d1a631f07ff09014c254e60\transformed\versionedparcelable-1.1.1\AndroidManifest.xml:20:5-22:41
 MERGED from [androidx.versionedparcelable:versionedparcelable:1.1.1] C:\Users\17658\.gradle\caches\transforms-4\d48cec7c2d1a631f07ff09014c254e60\transformed\versionedparcelable-1.1.1\AndroidManifest.xml:20:5-22:41
+MERGED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:6:5-44
+MERGED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:6:5-44
+MERGED from [dev.rikka.shizuku:api:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\f7da490b61b130a55d9950154f12615e\transformed\api-13.1.5\AndroidManifest.xml:5:5-44
+MERGED from [dev.rikka.shizuku:api:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\f7da490b61b130a55d9950154f12615e\transformed\api-13.1.5\AndroidManifest.xml:5:5-44
+MERGED from [dev.rikka.shizuku:shared:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\c224c4279cd9e9fb5a8fb3dfef25df07\transformed\shared-13.1.5\AndroidManifest.xml:5:5-44
+MERGED from [dev.rikka.shizuku:shared:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\c224c4279cd9e9fb5a8fb3dfef25df07\transformed\shared-13.1.5\AndroidManifest.xml:5:5-44
 MERGED from [androidx.interpolator:interpolator:1.0.0] C:\Users\17658\.gradle\caches\transforms-4\728e63639e9812369c55925df30d128d\transformed\interpolator-1.0.0\AndroidManifest.xml:20:5-44
 MERGED from [androidx.interpolator:interpolator:1.0.0] C:\Users\17658\.gradle\caches\transforms-4\728e63639e9812369c55925df30d128d\transformed\interpolator-1.0.0\AndroidManifest.xml:20:5-44
 MERGED from [androidx.arch.core:core-runtime:2.2.0] C:\Users\17658\.gradle\caches\transforms-4\5f120184f30e9ea7c0399614cf72439e\transformed\core-runtime-2.2.0\AndroidManifest.xml:20:5-44
@@ -258,6 +313,8 @@ MERGED from [androidx.startup:startup-runtime:1.1.1] C:\Users\17658\.gradle\cach
 MERGED from [androidx.startup:startup-runtime:1.1.1] C:\Users\17658\.gradle\caches\transforms-4\47cf93e84f25da5b78b3fc7c5badc2ec\transformed\startup-runtime-1.1.1\AndroidManifest.xml:21:5-23:41
 MERGED from [androidx.tracing:tracing:1.0.0] C:\Users\17658\.gradle\caches\transforms-4\a25e2543e9c7bc3ab53e861a6955c14b\transformed\tracing-1.0.0\AndroidManifest.xml:20:5-22:41
 MERGED from [androidx.tracing:tracing:1.0.0] C:\Users\17658\.gradle\caches\transforms-4\a25e2543e9c7bc3ab53e861a6955c14b\transformed\tracing-1.0.0\AndroidManifest.xml:20:5-22:41
+MERGED from [dev.rikka.shizuku:aidl:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\685c8c6f26e6b14b99f583110ce8dc77\transformed\aidl-13.1.5\AndroidManifest.xml:5:5-44
+MERGED from [dev.rikka.shizuku:aidl:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\685c8c6f26e6b14b99f583110ce8dc77\transformed\aidl-13.1.5\AndroidManifest.xml:5:5-44
 	android:targetSdkVersion
 		INJECTED from C:\Users\17658\AndroidStudioProjects\agent\app\src\main\AndroidManifest.xml
 	android:minSdkVersion
@@ -322,6 +379,16 @@ ADDED from [androidx.lifecycle:lifecycle-process:2.7.0] C:\Users\17658\.gradle\c
 		ADDED from [androidx.lifecycle:lifecycle-process:2.7.0] C:\Users\17658\.gradle\caches\transforms-4\2470838c7c483fd8124156d0bb1a9b84\transformed\lifecycle-process-2.7.0\AndroidManifest.xml:31:17-49
 	android:name
 		ADDED from [androidx.lifecycle:lifecycle-process:2.7.0] C:\Users\17658\.gradle\caches\transforms-4\2470838c7c483fd8124156d0bb1a9b84\transformed\lifecycle-process-2.7.0\AndroidManifest.xml:30:17-78
+uses-permission#moe.shizuku.manager.permission.API_V23
+ADDED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:8:5-78
+	android:name
+		ADDED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:8:22-75
+meta-data#moe.shizuku.client.V3_SUPPORT
+ADDED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:11:9-13:36
+	android:value
+		ADDED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:13:13-33
+	android:name
+		ADDED from [dev.rikka.shizuku:provider:13.1.5] C:\Users\17658\.gradle\caches\transforms-4\515f62241d9ccc6c8386a7f0659d5023\transformed\provider-13.1.5\AndroidManifest.xml:12:13-57
 meta-data#androidx.profileinstaller.ProfileInstallerInitializer
 ADDED from [androidx.profileinstaller:profileinstaller:1.3.0] C:\Users\17658\.gradle\caches\transforms-4\34fa4013e9021aecf1f917b057611d1f\transformed\profileinstaller-1.3.0\AndroidManifest.xml:29:13-31:52
 	android:value

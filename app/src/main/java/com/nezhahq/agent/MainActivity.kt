@@ -31,16 +31,53 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.nezhahq.agent.service.AgentService
 import com.nezhahq.agent.util.ConfigStore
+import rikka.shizuku.Shizuku
 import java.util.*
 
 /**
  * Android 平台哪吒监控探针主界面 (采用 Material 3 标准 Compose 构建)
+ *
+ * ## Shizuku 集成说明
+ * Activity 生命周期中管理 Shizuku 权限回调监听器的注册/注销：
+ * - onCreate: 注册 [Shizuku.OnRequestPermissionResultListener]
+ * - onDestroy: 注销监听器，避免内存泄漏
  */
 class MainActivity : ComponentActivity() {
+
+    /** Shizuku 权限请求码（任意唯一整数）。 */
+    private val SHIZUKU_REQUEST_CODE = 19527
+
+    /**
+     * Shizuku 权限回调监听器的实例引用，用于在 onDestroy 中精确移除。
+     *
+     * 使用可空 var + lateinit 模式而非 lazy，因为需要引用 Compose 状态回调，
+     * 但监听器注册发生在 onCreate 时，此时 Compose 尚未初始化。
+     * 因此采用先注册一个"桥接"监听器，在回调内通过 volatile 变量通知 Compose 侧。
+     */
+    @Volatile
+    private var shizukuPermissionGranted: Boolean = false
+
+    @Volatile
+    private var shizukuPermissionCallback: ((Boolean) -> Unit)? = null
+
+    /** Shizuku 权限回调：将结果转发给 Compose 侧的回调函数。 */
+    private val shizukuPermResultListener =
+        Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+            if (requestCode == SHIZUKU_REQUEST_CODE) {
+                val granted = grantResult == PackageManager.PERMISSION_GRANTED
+                shizukuPermissionGranted = granted
+                // 转发给 Compose 侧注册的回调
+                shizukuPermissionCallback?.invoke(granted)
+            }
+        }
 
     @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 注册 Shizuku 权限回调监听器（必须在 Activity 生命周期内注册）
+        Shizuku.addRequestPermissionResultListener(shizukuPermResultListener)
+
         setContent {
             MaterialTheme(
                 // 适配暗色沉浸主题
@@ -54,16 +91,33 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    MainScreen()
+                    MainScreen(
+                        shizukuRequestCode = SHIZUKU_REQUEST_CODE,
+                        onShizukuCallbackRegistered = { callback ->
+                            // 将 Compose 侧的回调注册到 Activity 属性，
+                            // 这样 Shizuku 的原生回调可以桥接到 Compose 状态
+                            shizukuPermissionCallback = callback
+                        }
+                    )
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // 注销 Shizuku 权限回调监听器，防止内存泄漏
+        Shizuku.removeRequestPermissionResultListener(shizukuPermResultListener)
+        shizukuPermissionCallback = null
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen() {
+fun MainScreen(
+    shizukuRequestCode: Int = 19527,
+    onShizukuCallbackRegistered: ((callback: (Boolean) -> Unit) -> Unit)? = null
+) {
     val context = LocalContext.current
     var server by remember { mutableStateOf(ConfigStore.getServer(context)) }
     var port by remember { mutableStateOf(ConfigStore.getPort(context).toString()) }
@@ -74,6 +128,24 @@ fun MainScreen() {
     var clipboardInput by remember { mutableStateOf("") }
 
     val scrollState = rememberScrollState()
+
+    // ── Shizuku 状态文本（仅用于 UI 展示）────────────────────────────────
+    var shizukuStatusText by remember { mutableStateOf("") }
+
+    // ── 注册 Shizuku 权限回调的 Compose 端处理器 ─────────────────────────
+    // 当 Shizuku 权限结果返回时，更新 UI 状态
+    LaunchedEffect(Unit) {
+        onShizukuCallbackRegistered?.invoke { granted ->
+            if (granted) {
+                shizukuStatusText = "✅ Shizuku 已授权"
+                Toast.makeText(context, "Shizuku 权限已授予，ADB Shell 模式可用", Toast.LENGTH_SHORT).show()
+            } else {
+                shizukuStatusText = "❌ Shizuku 授权被拒绝"
+                rootMode = false  // 权限被拒绝，关闭开关
+                Toast.makeText(context, "Shizuku 权限被拒绝，已关闭高权限模式", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
 
     // ── Android 13 (TIRAMISU, API 33)+ 通知权限运行时申请 Launcher ─────────────
     // Manifest 中已声明 POST_NOTIFICATIONS，但 Android 13+ 还需要运行时动态申请才生效。
@@ -159,7 +231,16 @@ fun MainScreen() {
                         if (envSecretMatch != null) secret = envSecretMatch.groupValues[1]
 
                         val envUuidMatch = Regex("NZ_UUID=([^\\s]+)").find(clipboardInput)
-                        if (envUuidMatch != null) uuid = envUuidMatch.groupValues[1]
+                        if (envUuidMatch != null) {
+                            val parsedUuid = envUuidMatch.groupValues[1].replace(Regex("^['\"]|['\"]$"), "")
+                            if (parsedUuid.isNotBlank() && parsedUuid != "\\") {
+                                uuid = parsedUuid
+                            } else {
+                                uuid = java.util.UUID.randomUUID().toString()
+                            }
+                        } else if (uuid.isBlank() || uuid == "''" || uuid == "\"\"") {
+                            uuid = java.util.UUID.randomUUID().toString()
+                        }
 
                         val envTlsMatch = Regex("NZ_TLS=true").containsMatchIn(clipboardInput)
                         if (envTlsMatch) useTls = true
@@ -200,18 +281,48 @@ fun MainScreen() {
             }
         }
 
-        // 高级权限特性
+        // 高级权限特性（Root / Shizuku 模式）
         Card(shape = RoundedCornerShape(12.dp)) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("高级特性", style = MaterialTheme.typography.titleMedium)
                 Row {
-                    Switch(checked = rootMode, onCheckedChange = { rootMode = it })
+                    Switch(
+                        checked = rootMode,
+                        onCheckedChange = { newValue ->
+                            if (newValue) {
+                                // ── 用户开启高权限模式：检测 Shizuku 可用性并按需请求权限 ──
+                                // 策略：
+                                // 1. 无论是否有 Root，先开启开关（Root 在 RootShell 里自动回退）
+                                // 2. 如果 Shizuku 服务在运行但未授权，主动弹出授权弹窗
+                                //    → 方便用户在没有 Root 的设备上也能使用高权限功能
+                                // 3. 如果 Shizuku 未运行，仍然允许开启（RootShell 会尝试 su）
+                                rootMode = true
+                                tryRequestShizukuPermission(
+                                    context = context,
+                                    requestCode = shizukuRequestCode,
+                                    onStatusUpdate = { status -> shizukuStatusText = status }
+                                )
+                            } else {
+                                rootMode = false
+                                shizukuStatusText = ""
+                            }
+                        }
+                    )
                     Column(modifier = Modifier.padding(start = 12.dp)) {
-                        Text("Root / ADB (Shizuku) 大杀器模式")
+                        Text("Root / Shizuku 模式")
                         Text(
-                            "开启后增强 CPU 与全网 TCP 连接嗅探能力，允许执行系统级高权限 Shell，但仅限高级设备适用。",
+                            "仅限高级设备.请确保你完全了解 Root / Shizuku 的使用...",
                             style = MaterialTheme.typography.bodySmall
                         )
+                        // 显示 Shizuku 状态反馈
+                        if (shizukuStatusText.isNotEmpty()) {
+                            Text(
+                                shizukuStatusText,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (shizukuStatusText.startsWith("✅"))
+                                    Color(0xFF4CAF50) else Color(0xFFFF9800)
+                            )
+                        }
                     }
                 }
             }
@@ -222,6 +333,13 @@ fun MainScreen() {
             Button(
                 onClick = {
                     val p = port.toIntOrNull() ?: 5555
+                    
+                    // Clean up potential invalid UUIDs from user input or bad smart parse
+                    uuid = uuid.trim().replace(Regex("^['\"]|['\"]$"), "")
+                    if (uuid.isBlank() || uuid == "\\") {
+                        uuid = java.util.UUID.randomUUID().toString()
+                    }
+                    
                     // 持久化加密存储密钥以及特权设置
                     ConfigStore.saveConfig(context, server, p, secret, useTls, uuid, rootMode)
 
@@ -350,5 +468,78 @@ fun MainScreen() {
                 }
             }
         }
+    }
+}
+
+/**
+ * 尝试请求 Shizuku 权限。
+ *
+ * ## 逻辑流程
+ * 1. 检查 Shizuku 服务是否存活（`Shizuku.pingBinder()`）
+ *    - 未运行 → 提示用户安装/启动 Shizuku，但不阻断开关操作（可能有 Root）
+ * 2. 检查是否为旧版 Shizuku（`Shizuku.isPreV11()`）
+ *    - 旧版 → 提示不支持
+ * 3. 检查当前权限状态（`Shizuku.checkSelfPermission()`）
+ *    - 已授权 → 直接显示状态
+ *    - 未授权但可弹窗 → 调用 `Shizuku.requestPermission()`
+ *    - "不再询问" → 提示手动授权
+ *
+ * @param context Android Context
+ * @param requestCode Shizuku 权限请求码
+ * @param onStatusUpdate Compose 状态更新回调
+ */
+private fun tryRequestShizukuPermission(
+    context: Context,
+    requestCode: Int,
+    onStatusUpdate: (String) -> Unit
+) {
+    try {
+        // Step 1: 检查 Shizuku 服务是否在运行
+        if (!Shizuku.pingBinder()) {
+            onStatusUpdate("⚠️ Shizuku 未运行（可使用 Root 则忽略此提示）")
+            Toast.makeText(
+                context,
+                "Shizuku 未运行。如设备已 Root 可忽略此提示；\n否则请先安装并启动 Shizuku 应用。",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
+        // Step 2: 检查 Shizuku 版本
+        if (Shizuku.isPreV11()) {
+            onStatusUpdate("⚠️ Shizuku 版本过低，不受支持")
+            Toast.makeText(context, "当前 Shizuku 版本过低，请升级到 v11 以上", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        // Step 3: 检查并申请权限
+        when {
+            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED -> {
+                // 已有权限，无需请求
+                onStatusUpdate("✅ Shizuku 已授权（UID=${Shizuku.getUid()}）")
+            }
+            Shizuku.shouldShowRequestPermissionRationale() -> {
+                // 用户之前选择了"拒绝且不再询问"
+                onStatusUpdate("❌ Shizuku 授权被永久拒绝，请在 Shizuku 应用中手动授权")
+                Toast.makeText(
+                    context,
+                    "Shizuku 权限已被永久拒绝，请打开 Shizuku 应用，在「授权管理」中手动为本应用授权。",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            else -> {
+                // 弹出 Shizuku 权限授权弹窗
+                onStatusUpdate("⏳ 等待 Shizuku 授权...")
+                Shizuku.requestPermission(requestCode)
+            }
+        }
+    } catch (e: Exception) {
+        // Shizuku 未安装时可能抛出异常
+        onStatusUpdate("⚠️ Shizuku 检测异常")
+        Toast.makeText(
+            context,
+            "Shizuku 检测失败：${e.message}\n如设备已 Root 可忽略此提示。",
+            Toast.LENGTH_LONG
+        ).show()
     }
 }
