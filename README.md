@@ -4,7 +4,7 @@
       
 尽量保持原有功能,额外新增功能       
 0高强度流氓后台保活.(谁能告诉我拼多多是怎么保活的？         
-1短信读取,我有时候要读一下验证码.          
+1短信读取,我有时候要读一下验证码.(0.5版本)          
 
 root:   
 <img alt="image" src="https://raw.githubusercontent.com/cancundeyingzi/nezha_agent_apk/refs/heads/main/.github/ec549e16-576d-443a-b590-71a6ef1341fd.png" />
