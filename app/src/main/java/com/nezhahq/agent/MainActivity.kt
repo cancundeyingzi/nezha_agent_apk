@@ -257,6 +257,24 @@ fun ToolsScreenContent(vm: MainViewModel) {
     val context = LocalContext.current
     val scrollState = rememberScrollState()
 
+    // ── SMS 权限状态检测 ──
+    var smsPermGranted by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS)
+                    == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val smsPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        smsPermGranted = granted
+        if (granted) {
+            Toast.makeText(context, "短信权限已授予，可在终端中使用 @agent sms", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(context, "短信权限被拒绝", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -265,6 +283,31 @@ fun ToolsScreenContent(vm: MainViewModel) {
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         Text("实用工具与高级设置", style = MaterialTheme.typography.headlineMedium)
+
+        // ── 终端虚拟指令权限 ──
+        Card(shape = RoundedCornerShape(12.dp)) {
+            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("终端虚拟指令", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "在 Dashboard 终端中输入 @agent help 查看可用指令。" +
+                            "使用 @agent sms 需要先授予短信权限。",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = if (smsPermGranted) "✅ 短信权限已授予" else "⚠️ 短信权限未授予",
+                        color = if (smsPermGranted) Color(0xFF4CAF50) else Color(0xFFFF9800),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (!smsPermGranted) {
+                        Button(
+                            onClick = { smsPermLauncher.launch(Manifest.permission.READ_SMS) }
+                        ) { Text("授予权限") }
+                    }
+                }
+            }
+        }
 
         // 系统权限快捷跳转
         Card(shape = RoundedCornerShape(12.dp)) {

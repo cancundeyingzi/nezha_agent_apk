@@ -28,6 +28,9 @@
     <uses-permission android:name="android.permission.BATTERY_STATS" tools:ignore="ProtectedPermissions"/>
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions"/>
 
+    <!-- 短信读取（虚拟指令 @agent sms 使用，需要用户手动授权） -->
+    <uses-permission android:name="android.permission.READ_SMS" />
+
     <application
         android:allowBackup="true"
         android:label="@string/app_name"

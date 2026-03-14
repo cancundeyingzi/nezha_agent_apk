@@ -16,6 +16,7 @@ import com.nezhahq.agent.collector.GeoIpCollector
 import com.nezhahq.agent.collector.SystemInfoCollector
 import com.nezhahq.agent.collector.SystemStateCollector
 import com.nezhahq.agent.executor.TaskExecutor
+import com.nezhahq.agent.executor.TerminalManager
 import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.grpc.GrpcManager
 import com.nezhahq.agent.util.ConfigStore
@@ -140,8 +141,30 @@ class AgentService : Service() {
                             val resultChannel = kotlinx.coroutines.channels.Channel<TaskResult>(kotlinx.coroutines.channels.Channel.UNLIMITED)
                             stub.requestTask(resultChannel.receiveAsFlow()).collect { task ->
                                 launch {
-                                    val result = TaskExecutor.executeTask(task, isCommandEnabled = false)
-                                    resultChannel.send(result)
+                                    when (task.type) {
+                                        8L -> {
+                                            // ── TaskTypeTerminalGRPC ──
+                                            // Dashboard 请求打开终端，解析 StreamID 并启动 IOStream
+                                            try {
+                                                val json = org.json.JSONObject(task.data)
+                                                val streamId = json.getString("StreamID")
+                                                Logger.i("收到终端任务 (TaskID=${task.id}, StreamID=$streamId)")
+                                                val terminal = TerminalManager(
+                                                    this@AgentService, stub, streamId
+                                                )
+                                                terminal.run(this)
+                                            } catch (e: Exception) {
+                                                if (e !is CancellationException) {
+                                                    Logger.e("终端任务执行失败", e)
+                                                }
+                                            }
+                                        }
+                                        else -> {
+                                            // 其他任务类型：HTTP/ICMP/TCP/Command 等
+                                            val result = TaskExecutor.executeTask(task, isCommandEnabled = false)
+                                            resultChannel.send(result)
+                                        }
+                                    }
                                 }
                             }
                         }
