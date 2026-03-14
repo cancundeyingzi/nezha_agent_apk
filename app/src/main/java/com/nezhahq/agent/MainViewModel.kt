@@ -21,6 +21,7 @@ import com.nezhahq.agent.service.AgentService
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.RootShell
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -294,18 +295,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun runInstantTest() {
         if (isTestRunning) return
         isTestRunning = true
+        // 先显示"正在采样"提示
+        instantTestResult = "⏳ 正在采样网速中..."
         viewModelScope.launch {
             try {
                 val result = withContext(Dispatchers.Default) {
                     val ctx = getApplication<Application>()
                     val collector = SystemStateCollector(ctx)
+
+                    // ── 第 1 次采样：建立差值基准 ──────────────────────────────
+                    // 网络速度和 CPU 使用率均基于差值法（两次采样的变化量 / 时间差），
+                    // 首次调用时无历史基准，差值必然为 0，因此需先"预热"一次。
+                    collector.getState()
+
+                    // ── 等待采样间隔 ──────────────────────────────────────────
+                    // 1.5 秒足以让 /proc/stat 和网络流量产生可测量的变化量，
+                    // 同时对用户体验的等待时间也在可接受范围内。
+                    delay(1500L)
+
+                    // ── 第 2 次采样：获取真实差值数据 ──────────────────────────
                     val state = collector.getState()
                     val hostInfo = com.nezhahq.agent.collector.SystemInfoCollector.getHostInfo(ctx, "test")
+                    // 从 CPU 显示名称中提取真实核心数
+                    // CPU 名称格式为 "{SoC名称} {核心数} {Physical/Virtual} Core"
+                    val cpuDisplayName = hostInfo.cpuList.firstOrNull() ?: "N/A"
+                    val actualCoreCount = Regex("(\\d+)\\s+(?:Physical|Virtual)\\s+Core")
+                        .find(cpuDisplayName)?.groupValues?.get(1) ?: "N/A"
                     buildString {
                         appendLine("═══ 采集结果预览 ═══")
                         appendLine("▸ CPU 使用率: ${"%.1f".format(state.cpu)}%")
-                        appendLine("▸ CPU 核心数: ${hostInfo.cpuCount}")
-                        appendLine("▸ CPU 名称: ${hostInfo.cpuList.firstOrNull() ?: "N/A"}")
+                        appendLine("▸ CPU 核心数: $actualCoreCount")
+                        appendLine("▸ CPU 名称: $cpuDisplayName")
                         appendLine("▸ Load: ${"%.2f".format(state.load1)} / ${"%.2f".format(state.load5)} / ${"%.2f".format(state.load15)}")
                         appendLine("▸ 内存已用: ${state.memUsed / 1024 / 1024} MB")
                         appendLine("▸ Swap 已用: ${state.swapUsed / 1024 / 1024} MB")
