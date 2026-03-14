@@ -16,6 +16,7 @@ import com.nezhahq.agent.collector.GeoIpCollector
 import com.nezhahq.agent.collector.SystemInfoCollector
 import com.nezhahq.agent.collector.SystemStateCollector
 import com.nezhahq.agent.executor.TaskExecutor
+import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.grpc.GrpcManager
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
@@ -100,6 +101,7 @@ class AgentService : Service() {
         scope.launch {
             while (isActive) {
                 try {
+                    GrpcManager.updateState(GrpcConnectionState.CONNECTING)
                     Logger.i("Preparing to handshake and send reports to Dashboard...")
                     val stub = GrpcManager.stub ?: throw Exception("Stub not initialized")
                     
@@ -115,11 +117,17 @@ class AgentService : Service() {
                     
                     // 3. Bidirectional streams (Status & Tasks)
                     Logger.i("Handshake success. Opening Bidirectional streams for SystemState and Tasks...")
+                    GrpcManager.updateState(GrpcConnectionState.CONNECTED)
                     coroutineScope {
                         launch {
                             val stateFlow = flow {
                                 while (currentCoroutineContext().isActive) {
-                                    emit(stateCollector.getState())
+                                    // CPU 密集型的正则匹配和字符串解析切换到
+                                    // Dispatchers.Default 以更好利用多核性能，
+                                    // 避免占用有限的 IO 线程池
+                                    emit(withContext(Dispatchers.Default) {
+                                        stateCollector.getState()
+                                    })
                                     delay(2000) // Report state every 2 seconds
                                 }
                             }
@@ -139,7 +147,15 @@ class AgentService : Service() {
                         }
                     }
                 } catch (e: Exception) {
-                    Logger.e("Agent loop terminated/failed", e)
+                    // 检测认证失败（gRPC UNAUTHENTICATED 状态码）
+                    val isAuthError = e.message?.contains("UNAUTHENTICATED", ignoreCase = true) == true
+                    if (isAuthError) {
+                        GrpcManager.updateState(GrpcConnectionState.AUTH_FAILED)
+                        Logger.e("Agent loop: 认证失败，请检查密钥和 UUID 配置", e)
+                    } else {
+                        GrpcManager.updateState(GrpcConnectionState.RECONNECTING)
+                        Logger.e("Agent loop terminated/failed", e)
+                    }
                     delay(5000) // Reconnect backoff
                     Logger.i("Re-initializing GrpcManager to attempt recovery...")
                     GrpcManager.initialize(this@AgentService)

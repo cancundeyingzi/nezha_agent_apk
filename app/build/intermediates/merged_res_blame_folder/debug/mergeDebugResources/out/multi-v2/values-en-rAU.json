@@ -1,7 +1,7 @@
 {
     "logs": [
         {
-            "outputFile": "com.nezhahq.agent.app-mergeDebugResources-43:/values-en-rAU/values-en-rAU.xml",
+            "outputFile": "com.nezhahq.agent.app-mergeDebugResources-44:/values-en-rAU/values-en-rAU.xml",
             "map": [
                 {
                     "source": "C:\\Users\\17658\\.gradle\\caches\\transforms-4\\056dbe3f38bfc22c48d48c26bea2a679\\transformed\\foundation-release\\res\\values-en-rAU\\values-en-rAU.xml",

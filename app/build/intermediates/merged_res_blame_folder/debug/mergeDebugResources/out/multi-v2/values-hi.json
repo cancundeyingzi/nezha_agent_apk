@@ -1,7 +1,7 @@
 {
     "logs": [
         {
-            "outputFile": "com.nezhahq.agent.app-mergeDebugResources-43:/values-hi/values-hi.xml",
+            "outputFile": "com.nezhahq.agent.app-mergeDebugResources-44:/values-hi/values-hi.xml",
             "map": [
                 {
                     "source": "C:\\Users\\17658\\.gradle\\caches\\transforms-4\\fa7249c7138703e9751c5a7264220b5a\\transformed\\ui-release\\res\\values-hi\\values-hi.xml",

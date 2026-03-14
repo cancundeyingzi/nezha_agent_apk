@@ -77,6 +77,13 @@ class SystemStateCollector(private val context: Context) {
     private var lastCpuIdle  = 0L
 
     // ──────────────────────────────────────────────────────────────────────────
+    // 日志去重标志：对于已知的不可恢复限制，只打印一次警告
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /** /proc/loadavg 读取失败的警告是否已打印（SELinux 拒绝属于永久性限制，无需反复提示） */
+    private var loadAvgWarningLogged = false
+
+    // ──────────────────────────────────────────────────────────────────────────
     // 公开采集入口
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -141,6 +148,9 @@ class SystemStateCollector(private val context: Context) {
             Logger.e("StateCollector: 采集进程/连接数时异常", e)
         }
 
+        // ── 7. 系统负载（1 / 5 / 15 分钟平均值）────────────────────────────────
+        val loadAvg = readLoadAverage(isRootMode)
+
         return State.newBuilder()
             .setCpu(cpuUsage)
             .setMemUsed(memUsed)
@@ -151,9 +161,9 @@ class SystemStateCollector(private val context: Context) {
             .setNetInSpeed(rxSpeed)
             .setNetOutSpeed(txSpeed)
             .setUptime(SystemClock.elapsedRealtime() / 1000)
-            .setLoad1(0.0)
-            .setLoad5(0.0)
-            .setLoad15(0.0)
+            .setLoad1(loadAvg.first)
+            .setLoad5(loadAvg.second)
+            .setLoad15(loadAvg.third)
             .setTcpConnCount(tcpConnCount)
             .setUdpConnCount(udpConnCount)
             .setProcessCount(processCount)
@@ -184,18 +194,12 @@ class SystemStateCollector(private val context: Context) {
                     var tempTx = 0L
                     var hasData = false
                     output.lineSequence().forEach { line ->
-                        if (line.contains(":")) {
-                            val parts = line.substringAfter(":").trim().split(WHITESPACE_RE)
-                            if (parts.size >= 9) {
-                                val iface = line.substringBefore(":").trim()
-                                if (iface != "lo") {
-                                    val r = parts[0].toLongOrNull() ?: 0L
-                                    val t = parts[8].toLongOrNull() ?: 0L
-                                    tempRx += r
-                                    tempTx += t
-                                    if (r > 0 || t > 0) hasData = true
-                                }
-                            }
+                        // 使用零拷贝字符索引解析，避免 split/substring 的临时对象分配
+                        val parsed = parseProcNetDevLine(line)
+                        if (parsed != null) {
+                            tempRx += parsed.first
+                            tempTx += parsed.second
+                            if (parsed.first > 0 || parsed.second > 0) hasData = true
                         }
                     }
                     if (hasData) {
@@ -288,6 +292,71 @@ class SystemStateCollector(private val context: Context) {
         return Pair(rx, tx)
     }
 
+    /**
+     * 零拷贝解析 /proc/net/dev 的单行数据。
+     *
+     * 行格式示例：
+     * ```
+     *   wlan0:  123456  100  0  0  0  0  0  0   654321  50  0  0  0  0  0  0
+     * ```
+     *
+     * 通过纯字符索引定位，提取冒号后的第 1 个字段（接收字节）和第 9 个字段（发送字节），
+     * **无 split()、无 substringAfter()、无临时 List/Array 分配**，
+     * GC 开销为零（仅栈上局部变量）。
+     *
+     * @param line /proc/net/dev 中的一行
+     * @return Pair(rxBytes, txBytes)，不含 lo 接口；若行格式不匹配则返回 null
+     */
+    private fun parseProcNetDevLine(line: String): Pair<Long, Long>? {
+        // 查找冒号，冒号前是接口名
+        val colonIdx = line.indexOf(':')
+        if (colonIdx < 0) return null
+
+        // 检查接口名是否为 lo（跳过环回接口）
+        // 从 colonIdx 向前扫描非空白字符，提取接口名
+        var nameEnd = colonIdx - 1
+        while (nameEnd >= 0 && line[nameEnd] == ' ') nameEnd--
+        if (nameEnd < 0) return null
+        var nameStart = nameEnd
+        while (nameStart > 0 && line[nameStart - 1] != ' ') nameStart--
+        // 比较接口名是否为 "lo"（2 字符精确匹配）
+        val nameLen = nameEnd - nameStart + 1
+        if (nameLen == 2 && line[nameStart] == 'l' && line[nameStart + 1] == 'o') return null
+
+        // 从冒号后开始，逐字段扫描提取第 1 和第 9 个数字字段
+        val len = line.length
+        var pos = colonIdx + 1
+        var fieldIndex = 0
+        var rxBytes = 0L
+        var txBytes = 0L
+
+        while (pos < len && fieldIndex < 9) {
+            // 跳过空白
+            while (pos < len && line[pos] == ' ') pos++
+            if (pos >= len) break
+
+            // 解析当前数字字段
+            var value = 0L
+            val fieldStart = pos
+            while (pos < len && line[pos] in '0'..'9') {
+                value = value * 10 + (line[pos] - '0')
+                pos++
+            }
+            // 若没有实际数字字符，说明格式异常
+            if (pos == fieldStart) break
+
+            when (fieldIndex) {
+                0 -> rxBytes = value   // 第 1 个字段：接收字节
+                8 -> txBytes = value   // 第 9 个字段：发送字节
+            }
+            fieldIndex++
+        }
+
+        // 至少需要解析到第 9 个字段
+        if (fieldIndex < 9) return null
+        return Pair(rxBytes, txBytes)
+    }
+
     // ──────────────────────────────────────────────────────────────────────────
     // CPU 使用率采集（两层策略）
     // ──────────────────────────────────────────────────────────────────────────
@@ -372,6 +441,88 @@ class SystemStateCollector(private val context: Context) {
 
         return ((deltaTotal - deltaIdle).toDouble() / deltaTotal.toDouble() * 100.0)
             .coerceIn(0.0, 100.0)
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 系统负载采集（/proc/loadavg）
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 读取系统负载平均值（1 分钟 / 5 分钟 / 15 分钟）。
+     *
+     * /proc/loadavg 格式示例：`0.34 0.28 0.22 1/345 12345`
+     * 前三个字段分别为 1/5/15 分钟的 CPU 队列平均长度。
+     *
+     * ### 权限策略
+     * - **Root/Shizuku 模式**：通过 [RootShell] 执行 `cat /proc/loadavg`，
+     *   绕过 Android 9+ 的 SELinux 限制，保证数据可用。
+     * - **普通模式**：直接读取 `/proc/loadavg`。
+     *   Android 7~8 的内核通常允许读取此文件；
+     *   Android 9+ 部分 OEM ROM 可能通过 SELinux 策略拒绝读取，
+     *   此时返回 (0.0, 0.0, 0.0) 作为安全默认值。
+     *
+     * @param isRootMode 是否处于 Root/Shizuku 提权模式
+     * @return Triple(load1, load5, load15)，读取失败返回 (0.0, 0.0, 0.0)
+     */
+    private fun readLoadAverage(isRootMode: Boolean): Triple<Double, Double, Double> {
+        val defaultLoad = Triple(0.0, 0.0, 0.0)
+
+        // 获取 /proc/loadavg 的原始内容
+        val content: String? = if (isRootMode) {
+            // Root/Shizuku 模式：通过持久 Shell 读取，绕过 SELinux 限制
+            try {
+                RootShell.executeFirstLine("cat /proc/loadavg")
+            } catch (e: Exception) {
+                Logger.e("StateCollector: Root 模式读取 /proc/loadavg 失败，回退到直接读取", e)
+                // Root Shell 异常时回退到直接读取
+                readLoadAvgDirect()
+            }
+        } else {
+            // 普通模式：直接读取文件
+            readLoadAvgDirect()
+        }
+
+        return parseLoadAvgLine(content) ?: defaultLoad
+    }
+
+    /**
+     * 直接读取 /proc/loadavg 文件内容（普通模式和 Root 模式回退时使用）。
+     *
+     * @return 文件第一行内容，读取失败返回 null
+     */
+    private fun readLoadAvgDirect(): String? {
+        return try {
+            val result = File("/proc/loadavg").bufferedReader().use { it.readLine() }
+            // 如果曾经失败后又变为可读（例如切换了模式），重置标志允许未来再次打印
+            if (result != null) loadAvgWarningLogged = false
+            result
+        } catch (e: Exception) {
+            // Android 9+ SELinux 拒绝属已知的不可恢复限制，只在首次失败时打印一次警告
+            if (!loadAvgWarningLogged) {
+                Logger.i("StateCollector: 普通模式无法读取 /proc/loadavg（SELinux 限制），Load 数据不可用")
+                loadAvgWarningLogged = true
+            }
+            null
+        }
+    }
+
+    /**
+     * 解析 /proc/loadavg 的一行内容，提取前三个浮点数。
+     *
+     * 行格式：`0.34 0.28 0.22 1/345 12345`
+     * 使用纯字符串操作提取，避免正则分配。
+     *
+     * @param line /proc/loadavg 的第一行，null 返回 null
+     * @return Triple(load1, load5, load15)，格式不匹配返回 null
+     */
+    private fun parseLoadAvgLine(line: String?): Triple<Double, Double, Double>? {
+        if (line.isNullOrBlank()) return null
+        val parts = line.trim().split(WHITESPACE_RE)
+        if (parts.size < 3) return null
+        val load1  = parts[0].toDoubleOrNull() ?: return null
+        val load5  = parts[1].toDoubleOrNull() ?: return null
+        val load15 = parts[2].toDoubleOrNull() ?: return null
+        return Triple(load1, load5, load15)
     }
 
     // ──────────────────────────────────────────────────────────────────────────

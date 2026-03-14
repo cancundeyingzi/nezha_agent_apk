@@ -21,3 +21,9 @@
 
 # ── 应用自身的 AIDL 和 Service 类保留 ────────────────────────────────────────
 -keep class com.nezhahq.agent.service.** { *; }
+
+# ── gRPC 连接状态枚举（MVVM 架构中通过 StateFlow 驱动 UI 使用） ──────────────
+-keep enum com.nezhahq.agent.grpc.GrpcConnectionState { *; }
+
+# ── ViewModel（ViewModelProvider 通过反射实例化） ──────────────────────────────
+-keep class com.nezhahq.agent.MainViewModel { *; }
