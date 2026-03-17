@@ -297,7 +297,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
             .verticalScroll(scrollState),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        Text("实用工具与高级设置", style = MaterialTheme.typography.headlineMedium)
+        Text("工具与设置", style = MaterialTheme.typography.headlineMedium)
 
         // ══════════════════════════════════════════════════════════════════
         // 权限状态总览卡片
@@ -309,7 +309,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
             ) {
                 Text("权限状态总览", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    "以下列出探针运行所需的各项权限状态。未授予的权限可能导致部分功能不可用。",
+                    "以下列出探针运行所需的各项权限状态.未授予权限可能导致部分功能不可用.请根据需要自行授予或拒绝.拒绝不影响基础功能.",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(bottom = 8.dp)
                 )
@@ -757,7 +757,7 @@ fun ConfigScreenContent(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("底层调试日志 (LogViewer)", style = MaterialTheme.typography.titleMedium)
+                    Text("日志", style = MaterialTheme.typography.titleMedium)
                     Button(onClick = {
                         val clipboard =
                             context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
