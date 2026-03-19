@@ -92,11 +92,22 @@ object RootShell {
                 w.println("echo $SENTINEL")
                 w.flush()
 
-                // 读取输出直到遇到哨兵行
+                // 读取输出直到遇到哨兵行。
+                // 注意：由于部分 sysfs 文件内容结尾没有换行符（各家设备 ROM 实现存在差异），
+                // 此时 w.println("echo $SENTINEL") 写入的哨兵会直接粘连在最后一行数据后面，
+                // 如 "0-7__NEZHA_CMD_DONE_7F3A__"，导致 line == SENTINEL 永远不成立并死锁！
+                // 必须改用 endsWith 匹配，并剔除残余的哨兵后缀还原真实数据。
                 val sb = StringBuilder()
                 var line: String?
                 while (r.readLine().also { line = it } != null) {
-                    if (line == SENTINEL) break
+                    if (line!!.endsWith(SENTINEL)) {
+                        val realData = line!!.removeSuffix(SENTINEL)
+                        if (realData.isNotEmpty()) {
+                            if (sb.isNotEmpty()) sb.append('\n')
+                            sb.append(realData)
+                        }
+                        break
+                    }
                     if (sb.isNotEmpty()) sb.append('\n')
                     sb.append(line)
                 }
