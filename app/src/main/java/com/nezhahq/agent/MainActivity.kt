@@ -715,10 +715,7 @@ fun ConfigScreenContent(
                     value = vm.uuid, onValueChange = { vm.uuid = it },
                     label = { Text("客户端标识 (UUID)") }, modifier = Modifier.fillMaxWidth()
                 )
-                Row {
-                    Checkbox(checked = vm.useTls, onCheckedChange = { vm.useTls = it })
-                    Text("启用 TLS / SSL 加密传输", modifier = Modifier.padding(top = 12.dp))
-                }
+
             }
         }
 
@@ -912,6 +909,7 @@ private fun GrpcStatusIndicator(state: GrpcConnectionState) {
         GrpcConnectionState.CONNECTED -> "🟢 已连接" to Color(0xFF4CAF50)
         GrpcConnectionState.RECONNECTING -> "🟠 重连中..." to Color(0xFFFF9800)
         GrpcConnectionState.AUTH_FAILED -> "🔴 认证失败" to Color(0xFFF44336)
+        GrpcConnectionState.TLS_FALLBACK -> "🟠 TLS 失败，已降级明文" to Color(0xFFFF5722)
     }
 
     Card(

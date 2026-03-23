@@ -22,6 +22,7 @@ import java.security.cert.X509Certificate
  * 状态转换流程：
  * IDLE → CONNECTING → CONNECTED ⇄ RECONNECTING
  *                   ↘ AUTH_FAILED
+ *                   ↘ TLS_FALLBACK（TLS 失败降级为明文）
  */
 enum class GrpcConnectionState {
     /** 初始/已停止状态 */
@@ -33,14 +34,40 @@ enum class GrpcConnectionState {
     /** 连接断开后正在自动重连 */
     RECONNECTING,
     /** 认证失败（密钥或 UUID 不匹配） */
-    AUTH_FAILED
+    AUTH_FAILED,
+    /** TLS 连接失败已降级为明文传输 */
+    TLS_FALLBACK
 }
 
+/**
+ * gRPC 连接管理器（单例）。
+ *
+ * ## TLS 自动降级机制
+ * 默认始终使用 TLS 加密连接。当 TLS 连接连续失败达到 [MAX_TLS_FAILURES] 次后，
+ * 自动降级为明文（plaintext）连接以保证可用性。每次 Service 重启或
+ * 调用 [resetTlsFallback] 时重置计数器，重新尝试 TLS。
+ *
+ * ## 防闪退保护
+ * TLS 初始化过程中的 SSL Context 创建、证书信任管理器等环节
+ * 均有完整的异常捕获，任何异常仅记录日志并降级为明文，不会导致应用闪退。
+ */
 object GrpcManager {
+
+    /** TLS 最大连续失败次数，超过后降级为明文 */
+    private const val MAX_TLS_FAILURES = 3
 
     private var channel: ManagedChannel? = null
     var stub: NezhaServiceCoroutineStub? = null
         private set
+
+    // ── TLS 降级状态管理 ──────────────────────────────────────────────────
+    /** TLS 连续失败计数（线程安全：仅在 AgentService 单协程循环中访问） */
+    @Volatile
+    private var tlsFailCount = 0
+
+    /** 当前是否已降级为明文传输 */
+    @Volatile
+    private var tlsFallbackActive = false
 
     // ── gRPC 连接状态 StateFlow，供 ViewModel 收集并驱动 UI 变更 ──
     private val _connectionState = MutableStateFlow(GrpcConnectionState.IDLE)
@@ -51,22 +78,75 @@ object GrpcManager {
         _connectionState.value = state
     }
 
+    /**
+     * 记录一次 TLS 连接失败。
+     *
+     * @return true 表示已达到降级阈值，下次 initialize 将使用明文
+     */
+    fun recordTlsFailure(): Boolean {
+        tlsFailCount++
+        Logger.i("GrpcManager: TLS 连接失败计数 $tlsFailCount/$MAX_TLS_FAILURES")
+        if (tlsFailCount >= MAX_TLS_FAILURES) {
+            tlsFallbackActive = true
+            Logger.i("GrpcManager: ⚠️ TLS 连续失败 $MAX_TLS_FAILURES 次，将降级为明文连接")
+            updateState(GrpcConnectionState.TLS_FALLBACK)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * 记录一次连接成功，重置 TLS 失败计数。
+     */
+    fun recordConnectionSuccess() {
+        if (tlsFailCount > 0) {
+            Logger.i("GrpcManager: 连接成功，重置 TLS 失败计数（之前 $tlsFailCount 次）")
+        }
+        tlsFailCount = 0
+        // 注意：不重置 tlsFallbackActive，若当前是明文连接且成功，保持明文直到 Service 重启
+    }
+
+    /**
+     * 重置 TLS 降级状态（通常在 Service 重启时调用）。
+     * 重置后下次 initialize 将重新尝试 TLS 连接。
+     */
+    fun resetTlsFallback() {
+        tlsFailCount = 0
+        tlsFallbackActive = false
+        Logger.i("GrpcManager: TLS 降级状态已重置，下次将重新尝试 TLS 连接")
+    }
+
+    /** 查询当前是否处于 TLS 降级（明文）模式 */
+    fun isTlsFallbackActive(): Boolean = tlsFallbackActive
+
+    /**
+     * 初始化 gRPC 通道和 Stub。
+     *
+     * 根据 TLS 降级状态自动选择加密或明文传输：
+     * - 默认/正常状态：使用 TLS 加密（信任所有证书，兼容自签名部署）
+     * - 降级状态（tlsFallbackActive = true）：使用明文传输
+     *
+     * TLS 初始化异常（SSLContext 创建失败等）会被捕获并自动降级为明文，
+     * 避免因证书 / 安全策略问题导致应用闪退。
+     */
     fun initialize(context: Context) {
         val server = ConfigStore.getServer(context)
         val port = ConfigStore.getPort(context)
         val secret = ConfigStore.getSecret(context)
         val uuid = ConfigStore.getUuid(context)
-        val useTls = ConfigStore.getUseTls(context)
 
         if (server.isEmpty() || secret.isEmpty() || uuid.isEmpty()) return
 
-        shutdown() // Close previous if any
+        shutdown() // 关闭之前的连接（不重置降级状态）
 
-        var builder = OkHttpChannelBuilder.forAddress(server, port)
-        if (useTls) {
-            builder.useTransportSecurity()
-            // Optional: If you need to trust all self-signed certs (not recommended for prod, but often needed for self-hosted dash)
+        val builder = OkHttpChannelBuilder.forAddress(server, port)
+
+        // ── 根据降级状态决定传输安全策略 ──────────────────────────────────
+        if (!tlsFallbackActive) {
+            // 尝试 TLS 加密连接
             try {
+                builder.useTransportSecurity()
+                // 信任所有证书（兼容自签名 Dashboard 部署，非生产推荐）
                 val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
                     override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
                     override fun checkClientTrusted(certs: Array<X509Certificate>, authType: String) {}
@@ -75,14 +155,30 @@ object GrpcManager {
                 val sslContext = SSLContext.getInstance("TLS")
                 sslContext.init(null, trustAllCerts, java.security.SecureRandom())
                 builder.sslSocketFactory(sslContext.socketFactory)
+                Logger.i("GrpcManager: 使用 TLS 加密连接 $server:$port")
             } catch (e: Exception) {
-                e.printStackTrace()
+                // TLS 初始化自身失败（如 SSLContext 创建异常），直接降级为明文
+                Logger.e("GrpcManager: TLS 初始化异常，降级为明文连接", e)
+                tlsFallbackActive = true
+                // 需要重新创建 builder，因为之前已调用 useTransportSecurity
+                val fallbackBuilder = OkHttpChannelBuilder.forAddress(server, port)
+                fallbackBuilder.usePlaintext()
+                Logger.i("GrpcManager: 降级使用明文连接 $server:$port")
+                channel = fallbackBuilder
+                    .keepAliveTime(10, TimeUnit.SECONDS)
+                    .keepAliveTimeout(5, TimeUnit.SECONDS)
+                    .keepAliveWithoutCalls(true)
+                    .intercept(AuthInterceptor(secret, uuid))
+                    .build()
+                stub = NezhaServiceCoroutineStub(channel!!)
+                return
             }
         } else {
+            // 已降级为明文
             builder.usePlaintext()
+            Logger.i("GrpcManager: 当前处于 TLS 降级模式，使用明文连接 $server:$port")
         }
 
-        Logger.i("Connecting to $server:$port via ChannelBuilder...")
         channel = builder
             .keepAliveTime(10, TimeUnit.SECONDS)
             .keepAliveTimeout(5, TimeUnit.SECONDS)
@@ -93,6 +189,10 @@ object GrpcManager {
         stub = NezhaServiceCoroutineStub(channel!!)
     }
 
+    /**
+     * 关闭 gRPC 连接。
+     * 注意：仅关闭通道，不重置 TLS 降级状态（降级状态由 [resetTlsFallback] 管理）。
+     */
     fun shutdown() {
         Logger.i("Closing Grpc connection stub.")
         channel?.shutdownNow()

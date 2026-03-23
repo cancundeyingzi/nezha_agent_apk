@@ -35,7 +35,13 @@ import proto.Nezha.TaskResult
 class AgentService : Service() {
 
     private val job = SupervisorJob()
-    private val scope = CoroutineScope(Dispatchers.IO + job)
+    // ── 全局协程异常兜底处理器 ─────────────────────────────────────────────
+    // 防止任何未被 try-catch 捕获的协程异常（如 gRPC TLS 握手失败）
+    // 传播到线程级别的 UncaughtExceptionHandler 导致应用闪退（FATAL EXCEPTION）。
+    private val exceptionHandler = kotlinx.coroutines.CoroutineExceptionHandler { _, throwable ->
+        Logger.e("AgentService: 协程未捕获异常（已兜底，不闪退）", throwable)
+    }
+    private val scope = CoroutineScope(Dispatchers.IO + job + exceptionHandler)
     
     private var wakeLock: PowerManager.WakeLock? = null
     private val stateCollector by lazy { SystemStateCollector(this) }
@@ -79,6 +85,8 @@ class AgentService : Service() {
         acquireWakeLock()
         
         Logger.i("Service started, configuring Grpc...")
+        // 重置 TLS 降级状态：每次 Service 启动时重新尝试 TLS 连接
+        GrpcManager.resetTlsFallback()
         GrpcManager.initialize(this)
 
         // ── 清理上次可能因 App Crash 遗留的临时上传文件 ───────────────────
@@ -128,8 +136,14 @@ class AgentService : Service() {
                 // Network changed, update geoIP
                 Logger.i("Network dynamically available, polling full GeoIP metadata...")
                 scope.launch {
-                    val geoIp = GeoIpCollector.fetchGeoIP()
-                    if (geoIp != null) GrpcManager.stub?.reportGeoIP(geoIp)
+                    try {
+                        val geoIp = GeoIpCollector.fetchGeoIP()
+                        if (geoIp != null) GrpcManager.stub?.reportGeoIP(geoIp)
+                    } catch (e: Exception) {
+                        // gRPC 调用可能因 TLS 握手失败抛出异常，
+                        // 此处捕获防止未处理异常导致闪退
+                        Logger.e("GeoIP 上报失败（将在下次连接成功后重试）", e)
+                    }
                 }
             }
         })
@@ -156,13 +170,12 @@ class AgentService : Service() {
                     // 3. Bidirectional streams (Status & Tasks)
                     Logger.i("Handshake success. Opening Bidirectional streams for SystemState and Tasks...")
                     GrpcManager.updateState(GrpcConnectionState.CONNECTED)
+                    // 连接握手成功，重置 TLS 失败计数
+                    GrpcManager.recordConnectionSuccess()
                     coroutineScope {
                         launch {
                             val stateFlow = flow {
                                 while (currentCoroutineContext().isActive) {
-                                    // CPU 密集型的正则匹配和字符串解析切换到
-                                    // Dispatchers.Default 以更好利用多核性能，
-                                    // 避免占用有限的 IO 线程池
                                     emit(withContext(Dispatchers.Default) {
                                         stateCollector.getState()
                                     })
@@ -243,9 +256,19 @@ class AgentService : Service() {
                     // 检测认证失败（gRPC UNAUTHENTICATED 状态码）
                     val isAuthError = e.message?.contains("UNAUTHENTICATED", ignoreCase = true) == true
                     if (isAuthError) {
+                        // 认证失败不计入 TLS 失败计数（问题在密钥/UUID，非 TLS）
                         GrpcManager.updateState(GrpcConnectionState.AUTH_FAILED)
                         Logger.e("Agent loop: 认证失败，请检查密钥和 UUID 配置", e)
                     } else {
+                        // ── TLS 自动降级逻辑 ──────────────────────────────────
+                        // 如果当前使用 TLS 且连接失败，记录失败次数
+                        // 达到阈值后自动降级为明文连接
+                        if (!GrpcManager.isTlsFallbackActive()) {
+                            val shouldFallback = GrpcManager.recordTlsFailure()
+                            if (shouldFallback) {
+                                Logger.i("Agent loop: TLS 连续失败已达阈值，下次重连将使用明文传输")
+                            }
+                        }
                         GrpcManager.updateState(GrpcConnectionState.RECONNECTING)
                         Logger.e("Agent loop terminated/failed", e)
                     }

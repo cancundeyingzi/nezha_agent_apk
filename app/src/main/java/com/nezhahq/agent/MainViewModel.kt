@@ -58,8 +58,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var secret by mutableStateOf(ConfigStore.getSecret(application))
     /** 客户端 UUID */
     var uuid by mutableStateOf(ConfigStore.getUuid(application))
-    /** 是否启用 TLS */
-    var useTls by mutableStateOf(ConfigStore.getUseTls(application))
+    /** TLS 始终启用（由 GrpcManager 自动管理降级，用户无需手动控制） */
+    private val useTls = true
     /** Root/Shizuku 高权限模式 */
     var rootMode by mutableStateOf(ConfigStore.getRootMode(application))
     /** 智能解析输入框内容 */
@@ -133,8 +133,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val pMatch = Regex("-p\\s+([^\\s]+)").find(input)
         if (pMatch != null) secret = pMatch.groupValues[1]
 
-        val tlsMatch = Regex("--tls").containsMatchIn(input)
-        if (tlsMatch) useTls = true
+        // TLS 始终启用，解析 --tls 标志但不需要赋值
+        // val tlsMatch = Regex("--tls").containsMatchIn(input)
 
         // New Dashboard Script logic (Environment variable based mapping)
         val envServerMatch = Regex("NZ_SERVER=([^:\\s]+):(\\d+)").find(input)
@@ -157,8 +157,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             uuid = java.util.UUID.randomUUID().toString()
         }
 
-        val envTlsMatch = Regex("NZ_TLS=true").containsMatchIn(input)
-        if (envTlsMatch) useTls = true
+        // TLS 始终启用，解析 NZ_TLS 环境变量但不需要赋值
+        // val envTlsMatch = Regex("NZ_TLS=true").containsMatchIn(input)
 
         Toast.makeText(getApplication(), "配置已解析完成", Toast.LENGTH_SHORT).show()
     }
@@ -176,7 +176,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ConfigStore.getServer(ctx),
             ConfigStore.getPort(ctx),
             ConfigStore.getSecret(ctx),
-            ConfigStore.getUseTls(ctx),
+            ConfigStore.getUseTls(ctx), // TLS 始终为 true，由 GrpcManager 自动降级管理
             ConfigStore.getUuid(ctx),
             ConfigStore.getRootMode(ctx),
             enableKeepAliveAudio
