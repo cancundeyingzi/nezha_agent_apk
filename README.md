@@ -1,5 +1,5 @@
 # Nezha Agent For Android
-### 代码99%由AI生成 
+
 他人magisk地址  https://github.com/castula/magisk_nezha-agent
 
 项目采用尽力而为的方式,根据不同权限,尽力获取更多数据,同时将权限开放至用户,可根据需要自行授权,不授权没有任何恶意限制.    
