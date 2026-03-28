@@ -74,6 +74,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var enableAutoStart by mutableStateOf(ConfigStore.getEnableAutoStart(application))
     /** VPN 流量计量模式（无 Root/Shizuku 且 Android < 12 的兑底方案） */
     var enableVpnTraffic by mutableStateOf(ConfigStore.getEnableVpnTraffic(application))
+    /** [安全修复] 远程命令执行独立开关（与 Root/Shizuku 模式解耦） */
+    var enableRemoteCommand by mutableStateOf(ConfigStore.getEnableRemoteCommand(application))
 
     /** 首次启动自启动授权弹窗 */
     var showAutoStartPrompt by mutableStateOf(false)
@@ -313,6 +315,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleAutoStart(enabled: Boolean) {
         enableAutoStart = enabled
         ConfigStore.setEnableAutoStart(getApplication(), enabled)
+    }
+
+    /**
+     * 切换远程命令执行开关。
+     *
+     * [安全修复] 此开关与 Root/Shizuku 模式完全独立，
+     * 防止用户启用 Root 提权功能时静默授予面板远程命令执行权限。
+     */
+    fun toggleRemoteCommand(enabled: Boolean) {
+        enableRemoteCommand = enabled
+        ConfigStore.setEnableRemoteCommand(getApplication(), enabled)
     }
 
     /**

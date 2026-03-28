@@ -89,6 +89,20 @@ object ConfigStore {
         getEncryptedPrefs(context).edit().putBoolean("enable_vpn_traffic", enable).apply()
     }
 
+    // ── [安全修复] 远程命令执行独立开关 ──────────────────────────────────────
+    // 将命令执行权限从 rootMode 中解耦，防止用户启用 Root/Shizuku
+    // （用于采集器/终端/文件管理器提权）时静默授予面板远程命令执行能力。
+    // 默认 false，需用户在 UI 中显式开启并确认安全警告。
+
+    /** 获取远程命令执行开关状态（默认关闭） */
+    fun getEnableRemoteCommand(context: Context): Boolean =
+        getEncryptedPrefs(context).getBoolean("enable_remote_command", false)
+
+    /** 远程命令执行开关 — 独立保存，不受 saveConfig 全量覆写影响 */
+    fun setEnableRemoteCommand(context: Context, enable: Boolean) {
+        getEncryptedPrefs(context).edit().putBoolean("enable_remote_command", enable).apply()
+    }
+
     fun hasValidConfig(context: Context): Boolean {
         return getServer(context).isNotEmpty() && getSecret(context).isNotEmpty() && getUuid(context).isNotEmpty()
     }

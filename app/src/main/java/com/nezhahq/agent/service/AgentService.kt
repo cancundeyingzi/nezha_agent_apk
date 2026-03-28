@@ -23,15 +23,22 @@ import com.nezhahq.agent.executor.TerminalManager
 import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.grpc.GrpcManager
 import com.nezhahq.agent.util.ConfigStore
+import com.nezhahq.agent.util.FloatWindowManager
+import com.nezhahq.agent.util.KeepAliveAudioPlayer
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
-import com.nezhahq.agent.util.KeepAliveAudioPlayer
-import com.nezhahq.agent.util.FloatWindowManager
+import io.grpc.Status
+import io.grpc.StatusException
+import io.grpc.StatusRuntimeException
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.sync.Semaphore
-import proto.Nezha.Receipt
+import proto.Nezha.Task
 import proto.Nezha.TaskResult
+import proto.NezhaServiceGrpcKt.NezhaServiceCoroutineStub
+import java.security.cert.CertificateException
+import javax.net.ssl.SSLException
 
 class AgentService : Service() {
 
@@ -52,12 +59,25 @@ class AgentService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var connectivityManager: ConnectivityManager? = null
 
-    // ── [修复问题3] 任务并发限制信号量 ──────────────────────────────────────
-    // 限制同时执行的任务协程数量，防止恶意 flood 或慢网场景下协程无界增长
-    private val taskSemaphore = Semaphore(8)
-
     // ── 通知渠道 ID ──────────────────────────────────────────────────────────
     private val notificationChannelId = "nezha_agent_service"
+
+    private companion object {
+        private const val SHORT_TASK_WORKER_COUNT = 8
+        private const val SHORT_TASK_QUEUE_CAPACITY = 64
+        private val TLS_FAILURE_MARKERS = listOf(
+            "ssl",
+            "tls",
+            "handshake",
+            "certificate",
+            "trust anchor",
+            "peer unverified",
+            "hostname",
+            "not an ssl/tls record",
+            "unsupported or unrecognized ssl message",
+            "unable to find valid certification path"
+        )
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -172,8 +192,7 @@ class AgentService : Service() {
         scope.launch {
             while (isActive) {
                 try {
-                    GrpcManager.updateState(GrpcConnectionState.CONNECTING)
-                    updateNotification("正在连接...")
+                    showConnectingStatus()
                     Logger.i("Preparing to handshake and send reports to Dashboard...")
 
                     // [修复问题6] 配置校验：stub 为空时等待重试而非反复抛异常
@@ -198,8 +217,7 @@ class AgentService : Service() {
                     
                     // 3. Bidirectional streams (Status & Tasks)
                     Logger.i("Handshake success. Opening Bidirectional streams for SystemState and Tasks...")
-                    GrpcManager.updateState(GrpcConnectionState.CONNECTED)
-                    updateNotification("已连接到面板")
+                    showConnectedStatus()
                     // 连接握手成功，重置 TLS 失败计数
                     GrpcManager.recordConnectionSuccess()
                     coroutineScope {
@@ -212,98 +230,30 @@ class AgentService : Service() {
                                     delay(2000) // Report state every 2 seconds
                                 }
                             }
-                            stub.reportSystemState(stateFlow).collect { receipt ->
+                            stub.reportSystemState(stateFlow).collect { _ ->
                                 // Optional logic when dashboard acks state stream chunk (ignored typically)
                             }
                         }
                         
                         launch {
-                            // [修复问题3] 使用有界 Channel 防止无界内存增长
-                            // 原实现使用 Channel.UNLIMITED，慢网或恶意 flood 下队列会无界增长
-                            val resultChannel = kotlinx.coroutines.channels.Channel<TaskResult>(64)
-                            stub.requestTask(resultChannel.receiveAsFlow()).collect { task ->
-                                val isRootMode = ConfigStore.getRootMode(this@AgentService)
-                                when (task.type) {
-                                    // ── 长生命周期流式任务：不受 Semaphore 限制 ──────────
-                                    // Terminal/NAT/FileManager 的 run() 会阻塞到会话结束，
-                                    // 若占用 Semaphore 许可，8 个会话同时开启就会饿死所有短探测任务。
-                                    8L -> launch {
-                                        // ── TaskTypeTerminalGRPC ──
-                                        try {
-                                            val json = org.json.JSONObject(task.data)
-                                            val streamId = json.getString("StreamID")
-                                            Logger.i("收到终端任务 (TaskID=${task.id}, StreamID=$streamId)")
-                                            val terminal = TerminalManager(
-                                                this@AgentService, stub, streamId, isRootMode
-                                            )
-                                            terminal.run()
-                                        } catch (e: Exception) {
-                                            if (e !is CancellationException) {
-                                                Logger.e("终端任务执行失败", e)
-                                            }
-                                        }
-                                    }
-                                    9L -> launch {
-                                        // ── TaskTypeNAT（内网穿透/反向代理）──
-                                        try {
-                                            val json = org.json.JSONObject(task.data)
-                                            val streamId = json.getString("StreamID")
-                                            val natHost = json.getString("Host")
-                                            Logger.i("收到 NAT 内网穿透任务 (TaskID=${task.id}, StreamID=$streamId, Host=$natHost)")
-                                            val natManager = NatManager(stub, streamId, natHost)
-                                            natManager.run()
-                                        } catch (e: Exception) {
-                                            if (e !is CancellationException) {
-                                                Logger.e("NAT 内网穿透任务执行失败", e)
-                                            }
-                                        }
-                                    }
-                                    11L -> launch {
-                                        // ── TaskTypeFM（文件管理器）──
-                                        try {
-                                            val json = org.json.JSONObject(task.data)
-                                            val streamId = json.getString("StreamID")
-                                            Logger.i("收到文件管理器任务 (TaskID=${task.id}, StreamID=$streamId)")
-                                            val fileManager = FileManager(this@AgentService, stub, streamId)
-                                            fileManager.run()
-                                        } catch (e: Exception) {
-                                            if (e !is CancellationException) {
-                                                Logger.e("文件管理器任务执行失败", e)
-                                            }
-                                        }
-                                    }
-                                    // ── 短生命周期探测任务：受 Semaphore 背压控制 ─────────
-                                    // HTTP/ICMP/TCP/Command 等快速完成，用 Semaphore 限流防止 flood
-                                    else -> launch {
-                                        taskSemaphore.acquire()
-                                        try {
-                                            val result = TaskExecutor.executeTask(
-                                                task, isCommandEnabled = isRootMode
-                                            )
-                                            resultChannel.send(result)
-                                        } finally {
-                                            taskSemaphore.release()
-                                        }
-                                    }
-                                }
-                            }
+                            handleTaskStream(stub)
                         }
                     }
                 } catch (e: Exception) {
-                    // 检测认证失败（gRPC UNAUTHENTICATED 状态码）
-                    val isAuthError = e.message?.contains("UNAUTHENTICATED", ignoreCase = true) == true
+                    val isAuthError = isAuthenticationFailure(e)
                     if (isAuthError) {
                         // 认证失败不计入 TLS 失败计数（问题在密钥/UUID，非 TLS）
                         GrpcManager.updateState(GrpcConnectionState.AUTH_FAILED)
                         updateNotification("认证失败，请检查密钥和 UUID")
                         Logger.e("Agent loop: 认证失败，请检查密钥和 UUID 配置", e)
                     } else {
-                        // ── TLS 失败记录（仅日志，不降级） ─────────────────────────
-                        if (!GrpcManager.isTlsFallbackActive()) {
-                            GrpcManager.recordTlsFailure()
+                        if (!GrpcManager.isTlsFallbackActive() && isGenuineTlsFailure(e)) {
+                            val shouldFallback = GrpcManager.recordTlsFailure()
+                            if (shouldFallback) {
+                                Logger.i("Agent loop: TLS 连续失败已达阈值，下次重连将使用明文传输")
+                            }
                         }
-                        GrpcManager.updateState(GrpcConnectionState.RECONNECTING)
-                        updateNotification("连接断开，正在重连...")
+                        showReconnectStatus()
                         Logger.e("Agent loop terminated/failed", e)
                     }
                     delay(5000) // Reconnect backoff
@@ -313,6 +263,189 @@ class AgentService : Service() {
             }
         }
     }
+
+    private suspend fun handleTaskStream(stub: NezhaServiceCoroutineStub) = coroutineScope {
+        val resultChannel = Channel<TaskResult>(SHORT_TASK_QUEUE_CAPACITY)
+        // 短任务使用固定 worker + 有界队列。
+        // 队列满时直接拒绝新短任务，避免阻塞 gRPC 入站流并拖住后续 8/9/11 会话任务。
+        val shortTaskQueue = Channel<Task>(SHORT_TASK_QUEUE_CAPACITY)
+
+        val workerJobs = List(SHORT_TASK_WORKER_COUNT) {
+            launch {
+                for (task in shortTaskQueue) {
+                    executeShortTask(task, resultChannel)
+                }
+            }
+        }
+
+        try {
+            stub.requestTask(resultChannel.receiveAsFlow()).collect { task ->
+                when (task.type) {
+                    8L, 9L, 11L -> launchStreamTask(stub, task)
+                    else -> enqueueShortTask(task, shortTaskQueue, resultChannel)
+                }
+            }
+        } finally {
+            workerJobs.forEach { it.cancel() }
+            shortTaskQueue.close()
+        }
+    }
+
+    private fun CoroutineScope.launchStreamTask(
+        stub: NezhaServiceCoroutineStub,
+        task: Task
+    ) {
+        val isRootMode = ConfigStore.getRootMode(this@AgentService)
+        when (task.type) {
+            8L -> launch {
+                try {
+                    val json = org.json.JSONObject(task.data)
+                    val streamId = json.getString("StreamID")
+                    // 注意：终端会话（TaskType 8）始终允许建立连接。
+                    // enableRemoteCommand 开关仅控制 TaskType 4 的静默 sh -c 命令执行，
+                    // 终端是交互式的，安全级别由 rootMode 独立控制（是否能 su/Shizuku 提权）。
+                    Logger.i("收到终端任务 (TaskID=${task.id}, StreamID=$streamId)")
+                    val terminal = TerminalManager(
+                        this@AgentService, stub, streamId, isRootMode
+                    )
+                    terminal.run()
+                } catch (e: Exception) {
+                    if (e !is CancellationException) {
+                        Logger.e("终端任务执行失败", e)
+                    }
+                }
+            }
+            9L -> launch {
+                try {
+                    val json = org.json.JSONObject(task.data)
+                    val streamId = json.getString("StreamID")
+                    val natHost = json.getString("Host")
+                    Logger.i("收到 NAT 内网穿透任务 (TaskID=${task.id}, StreamID=$streamId, Host=$natHost)")
+                    val natManager = NatManager(stub, streamId, natHost)
+                    natManager.run()
+                } catch (e: Exception) {
+                    if (e !is CancellationException) {
+                        Logger.e("NAT 内网穿透任务执行失败", e)
+                    }
+                }
+            }
+            11L -> launch {
+                try {
+                    val json = org.json.JSONObject(task.data)
+                    val streamId = json.getString("StreamID")
+                    Logger.i("收到文件管理器任务 (TaskID=${task.id}, StreamID=$streamId)")
+                    val fileManager = FileManager(this@AgentService, stub, streamId)
+                    fileManager.run()
+                } catch (e: Exception) {
+                    if (e !is CancellationException) {
+                        Logger.e("文件管理器任务执行失败", e)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 将短任务入队到 Worker 队列。
+     *
+     * ## 背压策略
+     * - shortTaskQueue 满 → 构造失败结果并尝试非阻塞发送至 resultChannel
+     * - resultChannel 也满 → 在独立协程中挂起 send()，
+     *   既不阻塞 collect 闭包（保证 8/9/11 流式任务不被拖住），
+     *   又保证面板最终收到该任务的完成状态
+     */
+    private fun CoroutineScope.enqueueShortTask(
+        task: Task,
+        shortTaskQueue: SendChannel<Task>,
+        resultChannel: SendChannel<TaskResult>
+    ) {
+        if (shortTaskQueue.trySend(task).isSuccess) {
+            return
+        }
+
+        Logger.e("AgentService: 短任务队列已满，拒绝任务 TaskID=${task.id}, Type=${task.type}")
+        val droppedResult = TaskResult.newBuilder()
+            .setId(task.id)
+            .setType(task.type)
+            .setSuccessful(false)
+            .setData("Task dropped: local short-task queue is full.")
+            .build()
+        if (!resultChannel.trySend(droppedResult).isSuccess) {
+            // resultChannel 也满：在独立协程中挂起发送，不阻塞 collect 闭包
+            Logger.e("AgentService: 结果通道暂满，异步等待上报被拒任务 TaskID=${task.id}")
+            launch {
+                resultChannel.send(droppedResult)
+            }
+        }
+    }
+
+    private suspend fun executeShortTask(
+        task: Task,
+        resultChannel: SendChannel<TaskResult>
+    ) {
+        val isCommandEnabled = ConfigStore.getEnableRemoteCommand(this@AgentService)
+        val result = TaskExecutor.executeTask(task, isCommandEnabled = isCommandEnabled)
+        resultChannel.send(result)
+    }
+
+    // ── [P3 修复] 连接状态辅助方法 ──────────────────────────────────────────
+    // 降级模式下使用细分状态（TLS_FALLBACK_CONNECTING 等），
+    // 而非统一的 TLS_FALLBACK，让 UI 能区分降级后的实际连接阶段。
+
+    private fun showConnectingStatus() {
+        if (GrpcManager.isTlsFallbackActive()) {
+            GrpcManager.updateState(GrpcConnectionState.TLS_FALLBACK_CONNECTING)
+            updateNotification("TLS 失败，已降级明文，正在连接...")
+        } else {
+            GrpcManager.updateState(GrpcConnectionState.CONNECTING)
+            updateNotification("正在连接...")
+        }
+    }
+
+    private fun showConnectedStatus() {
+        if (GrpcManager.isTlsFallbackActive()) {
+            GrpcManager.updateState(GrpcConnectionState.TLS_FALLBACK_CONNECTED)
+            updateNotification("已连接到面板（明文传输）")
+        } else {
+            GrpcManager.updateState(GrpcConnectionState.CONNECTED)
+            updateNotification("已连接到面板")
+        }
+    }
+
+    private fun showReconnectStatus() {
+        if (GrpcManager.isTlsFallbackActive()) {
+            GrpcManager.updateState(GrpcConnectionState.TLS_FALLBACK_RECONNECTING)
+            updateNotification("TLS 失败，已降级明文，正在重连...")
+        } else {
+            GrpcManager.updateState(GrpcConnectionState.RECONNECTING)
+            updateNotification("连接断开，正在重连...")
+        }
+    }
+
+    private fun isAuthenticationFailure(throwable: Throwable): Boolean {
+        return throwable.causeSequence().any { cause ->
+            when (cause) {
+                is StatusException -> cause.status.code == Status.Code.UNAUTHENTICATED
+                is StatusRuntimeException -> cause.status.code == Status.Code.UNAUTHENTICATED
+                else -> cause.message?.contains("UNAUTHENTICATED", ignoreCase = true) == true
+            }
+        }
+    }
+
+    private fun isGenuineTlsFailure(throwable: Throwable): Boolean {
+        return throwable.causeSequence().any { cause ->
+            cause is SSLException ||
+                cause is CertificateException ||
+                cause.message?.let(::containsTlsFailureMarker) == true
+        }
+    }
+
+    private fun containsTlsFailureMarker(message: String): Boolean {
+        val normalized = message.lowercase()
+        return TLS_FAILURE_MARKERS.any { marker -> marker in normalized }
+    }
+
+    private fun Throwable.causeSequence(): Sequence<Throwable> = generateSequence(this) { it.cause }
 
     // ── [修复问题4] WakeLock 无超时，由 onDestroy 显式释放 ──────────────────
     // 原实现使用 24 小时超时，长期运行的 agent 会在 24 小时后失去保活条件

@@ -1247,6 +1247,28 @@ fun ConfigScreenContent(
                     }
                 }
             }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // ── [安全修复] 远程命令执行独立开关 ──────────────────────────
+            // 将命令执行权限从 rootMode 中解耦，需用户显式开启。
+            EtherToggleRow(
+                checked = vm.enableRemoteCommand,
+                onCheckedChange = { newValue ->
+                    vm.toggleRemoteCommand(newValue)
+                },
+                title = "允许面板远程执行命令",
+                description = "允许面板通过 TaskType 4 在本设备上执行 sh -c 命令（需重启服务生效）"
+            )
+            if (vm.enableRemoteCommand) {
+                Text(
+                    "⚠️ 安全警告：开启此选项后，面板可在本设备上执行任意 Shell 命令。" +
+                            "请确保你完全信任面板管理员，否则可能带来数据泄露或设备损坏风险。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LgError,
+                    modifier = Modifier.padding(start = 52.dp, top = 4.dp)
+                )
+            }
         }
 
         // ── 即时测试按钮 ──
@@ -1428,13 +1450,16 @@ fun ConfigScreenContent(
  */
 @Composable
 private fun GrpcStatusIndicator(state: GrpcConnectionState) {
+    // [P3 修复] TLS 降级后使用细分状态，让用户能区分降级模式下的实际连接阶段
     val (statusText, statusColor) = when (state) {
         GrpcConnectionState.IDLE -> "⚪ 未连接" to Color(0xFF9E9E9E)
         GrpcConnectionState.CONNECTING -> "🔵 连接中..." to Color(0xFF2196F3)
         GrpcConnectionState.CONNECTED -> "🟢 已连接" to LgSuccess
         GrpcConnectionState.RECONNECTING -> "🟠 重连中..." to LgWarning
         GrpcConnectionState.AUTH_FAILED -> "🔴 认证失败" to LgError
-        GrpcConnectionState.TLS_FALLBACK -> "🟠 TLS 失败，已降级明文" to Color(0xFFFF5722)
+        GrpcConnectionState.TLS_FALLBACK_CONNECTING -> "🟠 TLS 降级，明文连接中..." to Color(0xFFFF5722)
+        GrpcConnectionState.TLS_FALLBACK_CONNECTED -> "🟡 TLS 降级，明文已连接" to Color(0xFFFF9800)
+        GrpcConnectionState.TLS_FALLBACK_RECONNECTING -> "🟠 TLS 降级，明文重连中..." to Color(0xFFFF5722)
     }
 
     Row(
