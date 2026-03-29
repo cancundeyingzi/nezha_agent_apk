@@ -43,10 +43,6 @@
 
 
 
-## 💬 交流与反馈
-
-  * **遇到 Bug？** 请提交 [Issues](https://www.google.com/search?q=https://github.com/cancundeyingzi/nezha_agent_apk/issues)。
-  * **功能建议：** 如果你有更好的保活方案（尤其是对拼多多方案有研究的大佬），欢迎交流！
 
 -----
 
