@@ -48,4 +48,4 @@
 
 ### 🌟 如果这个项目对你有帮助，请给一个 Star！
 
-三方项目:**Magisk 模式：** 如果你已获取 Root 权限，推荐使用原版: [castula 制作的 Magisk 模块](https://github.com/castula/magisk_nezha-agent)。
+三方项目**Magisk 模式：** 如果你已获取 Root 权限，也可以使用原版更稳定有保障: [castula 制作的 Magisk 模块](https://github.com/castula/magisk_nezha-agent)。
