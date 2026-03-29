@@ -1,33 +1,55 @@
-# Nezha Agent For Android
 
-他人magisk地址  https://github.com/castula/magisk_nezha-agent
 
-使用好看的UI优雅的在安卓设备上使用nezha探针     
+# 🤖 Nezha Agent for Android
+
+[](https://www.google.com/search?q=https://github.com/cancundeyingzi/nezha_agent_apk)
+[](https://www.google.com/search?q=LICENSE)
+[](https://github.com/castula/magisk_nezha-agent)
+
+**让安卓设备也能优雅地接入哪吒监控。**
+
+本项目旨在通过精美的 UI 界面，在安卓系统（包括实体机、云手机）上完美运行 Nezha 探针。我们秉承“尽力而为”的原则：根据用户授予的权限，深度挖掘并展示系统数据，不强制授权，无恶意限制。
+
+-----
+
+## ✨ 核心特性
+
+### 📊 基础监控（原有功能）
+
+保留了 Nezha Agent 的全部核心监控能力：
+
+  * **硬件信息：** CPU、GPU、内存、虚拟内存、磁盘状态。
+  * **网络数据：** 实时网速、连接数、内网/公网 IP 地址。
+  * **系统状态：** 进程数、系统负载、架构信息、运行时间。
+  * **高级功能：** 内网穿透、文件上传/下载等。
+
+### 🚀 安卓专属增强（Extra）
+
+  * **高强度保活 (v0.1)：** 0 延迟后台保活机制（需手动授权）。*ps: 谁能告诉我拼多多是怎么保活的？在线等挺急的。*
+  * **短信转发 (v0.5)：** 支持读取系统短信，方便在监控面板直接查看验证码。
+  * **VPN 流量捕获 (v0.8)：** 针对安卓 12 以下或权限受限设备（如联通云手机），通过 VPN 模式精准读取网速。
+
+-----
+
+## 📸 界面预览
 ![40bca73fe4114a409ba25bc055dfd97f](https://github.com/user-attachments/assets/731980ce-470f-41e5-aec2-87e09a9149d2)
+### 数据捕获能力
+| 移动云手机 (极致版) | 联通云智手机 | 红米 K50 |
+| :---: | :---: | :---: |
+| <img src="https://github.com/user-attachments/assets/e1c1088e-bef7-40aa-b00e-7ae6e9cc9fe5" width="250"> | <img src="https://github.com/user-attachments/assets/40492107-4487-41ca-a313-d652425adaef" width="250"> | <img src="https://raw.githubusercontent.com/cancundeyingzi/nezha_agent_apk/refs/heads/main/.github/Screenshot_2026-03-14-10-17-18-35_37e81299c436ed5.png" width="250"> |
 
-项目采用尽力而为的方式,根据不同权限,尽力获取更多数据,同时将权限开放至用户,可根据需要自行授权,不授权没有任何恶意限制.    
-
-尽量保持原有功能,额外新增功能     
-原有:cpu gpu,内存,虚拟内存,磁盘,网速,连接数,进程数,负载,架构,IP地址,系统版本,运行时间,内网穿透，文件上传下载.....还有别的吗?         
-额外:0高强度后台保活.(需要手动授权,另外谁能告诉我拼多多是怎么保活的？         
-1短信读取,我有时候要读一下验证码.(0.5版本)          
-2vpn模式读取网速，使用案例：联通云手机（0.8版本）安卓12以下没有权限的可以尝试。安卓12及以上应该有可以直接读取的方案。如果不行请发issues
+-----
 
 
 
 
-移动云手机极致版：  
-<img width="854" height="576" alt="image" src="https://github.com/user-attachments/assets/e1c1088e-bef7-40aa-b00e-7ae6e9cc9fe5" />
+## 💬 交流与反馈
 
-联通云智手机:    
-<img width="2560" height="1919" alt="image" src="https://github.com/user-attachments/assets/40492107-4487-41ca-a313-d652425adaef" />
+  * **遇到 Bug？** 请提交 [Issues](https://www.google.com/search?q=https://github.com/cancundeyingzi/nezha_agent_apk/issues)。
+  * **功能建议：** 如果你有更好的保活方案（尤其是对拼多多方案有研究的大佬），欢迎交流！
 
-红米k50:   
-<img alt="image" src="https://raw.githubusercontent.com/cancundeyingzi/nezha_agent_apk/refs/heads/main/.github/Screenshot_2026-03-14-10-17-18-35_37e81299c436ed5.png" />
+-----
 
+### 🌟 如果这个项目对你有帮助，请给一个 Star！
 
-后续(也是ai)
-
-```
-暂无
-```
+三方项目:**Magisk 模式：** 如果你已获取 Root 权限，推荐使用原版: [castula 制作的 Magisk 模块](https://github.com/castula/magisk_nezha-agent)。
