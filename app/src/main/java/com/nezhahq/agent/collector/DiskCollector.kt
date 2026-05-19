@@ -7,194 +7,384 @@ import com.nezhahq.agent.util.RootShell
 import java.io.File
 
 /**
- * 磁盘容量采集器：支持多分区扫描与去重。
+ * 磁盘容量采集器。
  *
- * ## 架构设计
+ * ## Android 容量语义
  *
- * ```
- * ┌──────────────────────────────────────────────────────────────┐
- * │                      DiskCollector                          │
- * │                                                              │
- * │  ┌─────────────────┐    ┌─────────────────────────────────┐  │
- * │  │  /proc/mounts   │───▶│  解析挂载点 + 文件系统类型过滤  │  │
- * │  └─────────────────┘    └──────────┬──────────────────────┘  │
- * │                                    │                         │
- * │                         ┌──────────▼──────────────────┐      │
- * │                         │  按设备路径(device)去重      │      │
- * │                         │  避免 FUSE/绑定挂载重复计算  │      │
- * │                         └──────────┬──────────────────┘      │
- * │                                    │                         │
- * │                         ┌──────────▼──────────────────┐      │
- * │                         │  StatFs 获取各分区容量       │      │
- * │                         │  累加 total / used           │      │
- * │                         └──────────┬──────────────────┘      │
- * │                                    │                         │
- * │                         ┌──────────▼──────────────────┐      │
- * │                         │  兜底：至少包含 /data 分区   │      │
- * │                         └─────────────────────────────┘      │
- * └──────────────────────────────────────────────────────────────┘
- * ```
+ * Android 设备上的“256GB 存储”主要体现在 `/data` 用户数据分区。`/storage/emulated/0`
+ * 通常只是同一个分区通过 FUSE/sdcardfs 暴露出来的用户视图；`/system`、`/vendor`、
+ * `/product` 等分区虽然也是真实块设备，但它们容量很小且不代表用户可用的整机存储。
  *
- * ## Android 特殊性
+ * 因此采集策略是：
+ * 1. 先用 `StatFs(/data)` 获取内部存储基准，普通 App 权限即可访问。
+ * 2. 再扫描 `/proc/mounts`，只把可确认不是 `/data` 镜像的 SD 卡/USB OTG 等附加存储合并进去。
+ * 3. 如果 `/data` 极端情况下不可读，才使用挂载表中可访问的内部存储视图或其它块设备兜底。
  *
- * 在现代 Android 设备上，`/data` 和 `/storage/emulated/0` 通常是同一物理
- * 分区通过 FUSE/sdcardfs 透传。本采集器通过 **设备路径去重** 避免重复计算。
- *
- * ## 安全审计
- * - `/proc/mounts` 在所有 Android 版本上均可读，无需特殊权限
- * - `StatFs` 是公开 API，无需 Root
- * - Root 模式下使用 `df` 命令获取更精确的数据（可访问系统分区）
- *
- * ## 支持的文件系统类型
- * - ext4 / f2fs：Android 内部存储主流格式
- * - vfat / exfat / ntfs / fuse / sdcardfs：外部 SD 卡和 USB OTG 常见格式
+ * 这样可以避免普通模式只扫到几个系统分区时，把 256GB 设备误报成约 8GB。
  */
 object DiskCollector {
 
     /**
-     * 磁盘容量信息数据类。
-     *
-     * @property totalBytes  所有分区的总容量（字节）
-     * @property usedBytes   所有分区的已用容量（字节）
+     * 磁盘容量信息，单位为字节。
      */
     data class DiskInfo(val totalBytes: Long, val usedBytes: Long)
 
-    /**
-     * 被识别为磁盘的真实文件系统类型集合。
-     *
-     * 排除了 proc / sysfs / tmpfs / devpts / cgroup 等虚拟文件系统，
-     * 只保留承载用户数据的物理/半物理文件系统。
-     *
-     * 包含 sdcardfs 和 fuse：部分 Android 设备将外部存储以这两种方式挂载，
-     * 但通过设备路径去重机制，它们不会与 /data 重复计算。
-     */
-    private val REAL_FS_TYPES = setOf(
-        "ext4", "ext3", "ext2",  // Linux 标准文件系统
-        "f2fs",                   // 闪存友好文件系统（Android 主流）
-        "vfat", "exfat",          // FAT 家族（SD 卡常用）
-        "ntfs", "fuseblk",        // NTFS（USB OTG 常见）
-        "xfs", "btrfs"            // 其他 Linux 文件系统（少见但可能存在）
+    private val MOUNT_FIELD_SEPARATOR = Regex("\\s+")
+
+    private val INTERNAL_FS_TYPES = setOf(
+        "ext4", "ext3", "ext2",
+        "f2fs"
     )
 
-    /**
-     * 已知无法被普通应用访问的挂载点前缀。
-     * 这些分区由 vendor/firmware 使用，StatFs 必定抛出 IllegalArgumentException。
-     * 静默跳过，避免每 2 秒输出 7+ 行日志污染。
-     */
+    private val EXTERNAL_FS_TYPES = setOf(
+        "vfat", "exfat",
+        "ntfs", "fuseblk",
+        "fuse", "sdcardfs"
+    )
+
+    private val FALLBACK_BLOCK_FS_TYPES = INTERNAL_FS_TYPES + EXTERNAL_FS_TYPES + setOf(
+        "xfs", "btrfs"
+    )
+
+    private val SYSTEM_MOUNT_PREFIXES = arrayOf(
+        "/system",
+        "/system_ext",
+        "/vendor",
+        "/product",
+        "/odm",
+        "/oem",
+        "/apex",
+        "/metadata",
+        "/firmware"
+    )
+
     private val SKIP_MOUNT_PREFIXES = arrayOf(
-        "/mnt/vendor/",      // vendor 分区（persist, oplusreserve, qmcs 等）
-        "/vendor/firmware",  // 固件分区
-        "/vendor/bt_",       // 蓝牙固件
-        "/mnt/pass_through/" // FUSE 透传（重复挂载，去重无意义）
+        "/mnt/vendor/",
+        "/vendor/firmware",
+        "/vendor/bt_"
+    )
+
+    private val INTERNAL_VOLUME_IDS = setOf(
+        "emulated",
+        "self",
+        "primary",
+        "obb"
+    )
+
+    private data class MountEntry(
+        val device: String,
+        val mountPoint: String,
+        val fsType: String
+    )
+
+    private data class ScannedPartition(
+        val entry: MountEntry,
+        val info: DiskInfo,
+        val role: PartitionRole
+    )
+
+    private enum class PartitionRole {
+        INTERNAL,
+        EXTERNAL,
+        FALLBACK_BLOCK
+    }
+
+    private data class ScanResult(
+        val internal: DiskInfo = DiskInfo(0L, 0L),
+        val external: DiskInfo = DiskInfo(0L, 0L),
+        val fallbackBlock: DiskInfo = DiskInfo(0L, 0L)
     )
 
     /**
-     * 读取所有真实磁盘分区的容量信息（去重后累加）。
+     * 获取设备磁盘容量。
      *
-     * ## 策略
-     * 1. 解析 `/proc/mounts` 获取全部挂载点
-     * 2. 按文件系统类型过滤，只保留真实磁盘分区
-     * 3. 按底层设备路径（`/dev/block/xxx`）去重，避免 FUSE/绑定挂载导致重复
-     * 4. 对每个唯一分区调用 `StatFs` 获取容量并累加
-     * 5. 兜底：若解析失败或无数据，至少返回 `/data` 分区的容量
-     *
-     * @param isRootMode 是否处于 Root/Shizuku 提权模式（Root 下可读更多挂载点）
-     * @return DiskInfo 包含总量和已用量
+     * @param isRootMode 是否允许通过 Root/Shizuku shell 读取挂载表。即使为 true，也不会
+     *                   通过 shell 执行容量计算，容量仍由公开 API `StatFs` 读取。
      */
     fun getDiskInfo(isRootMode: Boolean): DiskInfo {
-        val seenDevices = mutableSetOf<String>()
-        var totalBytes = 0L
-        var usedBytes = 0L
-
-        val lineProcessor: (String) -> Unit = { line ->
-            if (line.isNotBlank()) {
-                val parts = line.split(' ')
-                if (parts.size >= 3) {
-                    val device = parts[0]
-                    val mountPoint = parts[1]
-                    val fsType = parts[2]
-
-                    if (fsType in REAL_FS_TYPES) {
-                        // 静默跳过已知不可访问的 vendor/firmware 分区
-                        val shouldSkip = SKIP_MOUNT_PREFIXES.any { prefix ->
-                            mountPoint.startsWith(prefix)
-                        }
-                        if (!shouldSkip) {
-                            val deduplicationKey = if (device.startsWith("/dev/")) device else mountPoint
-                            if (seenDevices.add(deduplicationKey)) {
-                                try {
-                                    val sf = StatFs(mountPoint)
-                                    val blockSize = sf.blockSizeLong
-                                    val partTotal = sf.blockCountLong * blockSize
-                                    val partFree = sf.availableBlocksLong * blockSize
-
-                                    if (partTotal > 0) {
-                                        totalBytes += partTotal
-                                        usedBytes += (partTotal - partFree)
-                                    }
-                                } catch (_: Exception) {
-                                    // StatFs 失败的分区静默跳过（通常是权限不足或路径无效）
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        try {
-            if (isRootMode) {
-                try {
-                    val output = RootShell.execute("cat /proc/mounts")
-                    if (!output.isNullOrBlank()) {
-                        output.lineSequence().forEach(lineProcessor)
-                    }
-                } catch (e: Exception) {
-                    Logger.e("DiskCollector: Root 模式读取 /proc/mounts 失败，回退到直接读取", e)
-                    readMountsDirect(lineProcessor)
-                }
-            } else {
-                readMountsDirect(lineProcessor)
-            }
-
-            if (totalBytes > 0) {
-                return DiskInfo(totalBytes, usedBytes)
-            }
+        val dataPartition = getDataPartitionInfo()
+        val mountScan = try {
+            scanMounts(isRootMode)
         } catch (e: Exception) {
-            Logger.e("DiskCollector: 磁盘容量采集异常", e)
+            Logger.e("DiskCollector: 扫描挂载点失败，使用 /data 基准结果", e)
+            ScanResult()
         }
 
-        // 兜底：仅返回 /data 分区（保证不会返回 0）
-        return getDataPartitionInfo()
+        val internal = if (dataPartition.totalBytes > 0L) {
+            dataPartition
+        } else {
+            mountScan.internal
+        }
+
+        val userVisibleStorage = internal + mountScan.external
+        if (userVisibleStorage.totalBytes > 0L) {
+            return userVisibleStorage
+        }
+
+        return mountScan.fallbackBlock
     }
 
-    private fun readMountsDirect(action: (String) -> Unit) {
-        try {
-            File("/proc/mounts").forEachLine(action = action)
+    private fun scanMounts(isRootMode: Boolean): ScanResult {
+        val partitions = readMountEntries(isRootMode).mapNotNull { entry ->
+            val role = classifyMount(entry) ?: return@mapNotNull null
+            val info = statFsOrNull(entry.mountPoint) ?: return@mapNotNull null
+            ScannedPartition(entry, info, role)
+        }
+
+        return ScanResult(
+            internal = mergePartitions(partitions, PartitionRole.INTERNAL),
+            external = mergePartitions(partitions, PartitionRole.EXTERNAL),
+            fallbackBlock = mergePartitions(partitions, PartitionRole.FALLBACK_BLOCK)
+        )
+    }
+
+    private fun readMountEntries(isRootMode: Boolean): List<MountEntry> {
+        val lines = if (isRootMode) {
+            readMountLinesByRoot().ifEmpty { readMountLinesDirect() }
+        } else {
+            readMountLinesDirect()
+        }
+
+        return lines.mapNotNull(::parseMountLine)
+    }
+
+    private fun readMountLinesByRoot(): List<String> {
+        return try {
+            RootShell.execute("cat /proc/mounts")
+                .lineSequence()
+                .filter { it.isNotBlank() }
+                .toList()
+        } catch (e: Exception) {
+            Logger.e("DiskCollector: Root 模式读取 /proc/mounts 失败，回退到普通读取", e)
+            emptyList()
+        }
+    }
+
+    private fun readMountLinesDirect(): List<String> {
+        return try {
+            File("/proc/mounts").useLines { lines ->
+                lines.filter { it.isNotBlank() }.toList()
+            }
         } catch (e: Exception) {
             Logger.e("DiskCollector: 读取 /proc/mounts 失败", e)
+            emptyList()
         }
     }
 
+    private fun parseMountLine(line: String): MountEntry? {
+        val parts = line.trim().split(MOUNT_FIELD_SEPARATOR, limit = 4)
+        if (parts.size < 3) return null
 
+        return MountEntry(
+            device = decodeMountField(parts[0]),
+            mountPoint = decodeMountField(parts[1]),
+            fsType = parts[2].lowercase()
+        )
+    }
+
+    private fun classifyMount(entry: MountEntry): PartitionRole? {
+        val mountPoint = entry.mountPoint
+        val fsType = entry.fsType
+
+        if (fsType !in FALLBACK_BLOCK_FS_TYPES) return null
+        if (shouldSkipMount(mountPoint)) return null
+
+        if (isInternalStorageView(mountPoint)) {
+            return PartitionRole.INTERNAL
+        }
+
+        if (isExternalStorageMount(entry)) {
+            return PartitionRole.EXTERNAL
+        }
+
+        if (fsType in INTERNAL_FS_TYPES && !isSystemMount(mountPoint)) {
+            return PartitionRole.FALLBACK_BLOCK
+        }
+
+        return null
+    }
+
+    private fun isInternalStorageView(mountPoint: String): Boolean {
+        if (isPathAtOrUnder(mountPoint, "/data")) return true
+        if (isPathAtOrUnder(mountPoint, "/sdcard")) return true
+        if (isPathAtOrUnder(mountPoint, "/storage/emulated")) return true
+        if (isPathAtOrUnder(mountPoint, "/storage/self")) return true
+
+        return (mountPoint.startsWith("/mnt/user/") && hasPathSegment(mountPoint, "emulated")) ||
+            (mountPoint.startsWith("/mnt/runtime/") && hasPathSegment(mountPoint, "emulated")) ||
+            (mountPoint.startsWith("/mnt/pass_through/") && hasPathSegment(mountPoint, "emulated"))
+    }
+
+    private fun isExternalStorageMount(entry: MountEntry): Boolean {
+        val mountPoint = entry.mountPoint
+        val fsType = entry.fsType
+
+        if (isSystemMount(mountPoint) || isInternalStorageView(mountPoint)) {
+            return false
+        }
+
+        val volumeId = extractVolumeId(mountPoint)
+        if (volumeId != null && volumeId !in INTERNAL_VOLUME_IDS) {
+            return fsType in EXTERNAL_FS_TYPES || entry.device.startsWith("/dev/")
+        }
+
+        return fsType in EXTERNAL_FS_TYPES &&
+            entry.device.startsWith("/dev/") &&
+            !mountPoint.startsWith("/mnt/vendor/")
+    }
+
+    private fun shouldSkipMount(mountPoint: String): Boolean {
+        return SKIP_MOUNT_PREFIXES.any { prefix -> mountPoint.startsWith(prefix) } ||
+            isSystemMount(mountPoint)
+    }
+
+    private fun isSystemMount(mountPoint: String): Boolean {
+        return SYSTEM_MOUNT_PREFIXES.any { prefix -> isPathAtOrUnder(mountPoint, prefix) }
+    }
+
+    private fun mergePartitions(
+        partitions: List<ScannedPartition>,
+        role: PartitionRole
+    ): DiskInfo {
+        val seenKeys = mutableSetOf<String>()
+        var merged = DiskInfo(0L, 0L)
+
+        partitions
+            .asSequence()
+            .filter { it.role == role }
+            .sortedBy { mountPriority(it.entry.mountPoint) }
+            .forEach { partition ->
+                val keys = deduplicationKeys(partition)
+                if (keys.any { it in seenKeys }) return@forEach
+
+                seenKeys += keys
+                merged += partition.info
+            }
+
+        return merged
+    }
+
+    private fun deduplicationKeys(partition: ScannedPartition): Set<String> {
+        val keys = mutableSetOf<String>()
+        val entry = partition.entry
+        val rolePrefix = partition.role.name.lowercase()
+
+        extractVolumeId(entry.mountPoint)?.let { volumeId ->
+            keys += "$rolePrefix:volume:$volumeId"
+        }
+
+        if (keys.isEmpty() && isUniqueBlockDevice(entry.device)) {
+            keys += "$rolePrefix:device:${entry.device}"
+        }
+
+        if (keys.isEmpty()) {
+            keys += "$rolePrefix:capacity:${partition.info.totalBytes}:${partition.info.usedBytes}"
+        }
+
+        return keys
+    }
+
+    private fun mountPriority(mountPoint: String): Int {
+        return when {
+            mountPoint.startsWith("/mnt/media_rw/") -> 0
+            mountPoint.startsWith("/storage/") -> 1
+            mountPoint.startsWith("/mnt/runtime/") -> 2
+            mountPoint.startsWith("/mnt/user/") -> 3
+            else -> 4
+        }
+    }
+
+    private fun extractVolumeId(mountPoint: String): String? {
+        val segments = mountPoint.trim('/').split('/').filter { it.isNotBlank() }
+        if (segments.isEmpty()) return null
+
+        return when {
+            segments.size >= 2 && segments[0] == "storage" -> segments[1]
+            segments.size >= 3 && segments[0] == "mnt" && segments[1] == "media_rw" -> segments[2]
+            segments.size >= 4 && segments[0] == "mnt" && segments[1] == "runtime" -> segments[3]
+            segments.size >= 4 && segments[0] == "mnt" && segments[1] == "user" -> segments[3]
+            segments.size >= 4 && segments[0] == "mnt" && segments[1] == "pass_through" -> segments[3]
+            segments.size >= 3 && segments[0] == "mnt" && segments[1] == "expand" -> segments[2]
+            else -> null
+        }?.takeIf { it.isNotBlank() }
+    }
+
+    private fun statFsOrNull(path: String): DiskInfo? {
+        return try {
+            val stat = StatFs(path)
+            val blockSize = stat.blockSizeLong
+            val total = safeMultiply(stat.blockCountLong, blockSize)
+            val available = safeMultiply(stat.availableBlocksLong, blockSize)
+            val used = (total - available).coerceIn(0L, total)
+
+            if (total > 0L) DiskInfo(total, used) else null
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     /**
-     * 获取 /data 分区的容量信息（兜底方案）。
-     *
-     * 当 /proc/mounts 解析失败或返回空数据时，
-     * 回退到仅统计 /data 分区，保证至少有基本的磁盘数据。
-     *
-     * @return DiskInfo /data 分区的总量和已用量
+     * 获取 `/data` 分区容量。它是 Android 内部存储容量最可靠的普通权限来源。
      */
     private fun getDataPartitionInfo(): DiskInfo {
-        return try {
-            val sf = StatFs(Environment.getDataDirectory().path)
-            val total = sf.blockCountLong * sf.blockSizeLong
-            val free = sf.availableBlocksLong * sf.blockSizeLong
-            DiskInfo(total, total - free)
-        } catch (e: Exception) {
-            Logger.e("DiskCollector: 读取 /data 分区容量失败", e)
+        return statFsOrNull(Environment.getDataDirectory().path) ?: run {
+            Logger.e("DiskCollector: 读取 /data 分区容量失败")
             DiskInfo(0L, 0L)
         }
+    }
+
+    private fun decodeMountField(value: String): String {
+        if ('\\' !in value) return value
+
+        val decoded = StringBuilder(value.length)
+        var index = 0
+        while (index < value.length) {
+            val char = value[index]
+            val octalEnd = index + 4
+            if (char == '\\' && octalEnd <= value.length) {
+                val octal = value.substring(index + 1, octalEnd)
+                val codePoint = octal.toIntOrNull(radix = 8)
+                if (codePoint != null) {
+                    decoded.append(codePoint.toChar())
+                    index = octalEnd
+                    continue
+                }
+            }
+
+            decoded.append(char)
+            index++
+        }
+
+        return decoded.toString()
+    }
+
+    private fun isUniqueBlockDevice(device: String): Boolean {
+        return device.startsWith("/dev/") &&
+            device != "/dev/fuse" &&
+            device != "/dev/sdcardfs"
+    }
+
+    private fun hasPathSegment(path: String, segment: String): Boolean {
+        return path.trim('/').split('/').any { it == segment }
+    }
+
+    private fun isPathAtOrUnder(path: String, prefix: String): Boolean {
+        return path == prefix || path.startsWith("$prefix/")
+    }
+
+    private operator fun DiskInfo.plus(other: DiskInfo): DiskInfo {
+        return DiskInfo(
+            totalBytes = safeAdd(totalBytes, other.totalBytes),
+            usedBytes = safeAdd(usedBytes, other.usedBytes)
+        )
+    }
+
+    private fun safeAdd(left: Long, right: Long): Long {
+        return if (Long.MAX_VALUE - left < right) Long.MAX_VALUE else left + right
+    }
+
+    private fun safeMultiply(left: Long, right: Long): Long {
+        if (left <= 0L || right <= 0L) return 0L
+        return if (left > Long.MAX_VALUE / right) Long.MAX_VALUE else left * right
     }
 }

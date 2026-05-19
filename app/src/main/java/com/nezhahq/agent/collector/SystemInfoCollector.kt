@@ -40,7 +40,7 @@ object SystemInfoCollector {
 
         val isRootMode = ConfigStore.getRootMode(context)
 
-        // ── 磁盘总量（多分区扫描 + 设备去重）──────────────────────────────
+        // ── 磁盘总量（/data 基准 + 附加存储扫描）────────────────────────────
         val diskTotal = DiskCollector.getDiskInfo(isRootMode).totalBytes
 
         // ── CPU 详细名称 + 核心数 ──────────────────────────────────────────────

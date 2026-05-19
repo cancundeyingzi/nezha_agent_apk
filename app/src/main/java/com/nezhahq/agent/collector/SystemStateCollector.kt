@@ -97,7 +97,7 @@ class SystemStateCollector(private val context: Context) {
         // ── 2. Swap 使用量（/proc/meminfo，普通权限即可）──────────────────────
         val swapUsed = readSwapUsedBytes()
 
-        // ── 3. 磁盘使用量（多分区扫描 + 设备去重）────────────────────────────
+        // ── 3. 磁盘使用量（/data 基准 + 附加存储扫描）────────────────────────
         val diskInfo = DiskCollector.getDiskInfo(isRootMode)
         val diskUsed = diskInfo.usedBytes
 
