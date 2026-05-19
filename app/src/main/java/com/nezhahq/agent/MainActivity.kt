@@ -33,7 +33,6 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
@@ -42,13 +41,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 
 import androidx.compose.ui.draw.*
 
 import androidx.compose.ui.graphics.*
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalContext
@@ -57,7 +54,9 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -66,6 +65,11 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nezhahq.agent.grpc.GrpcConnectionState
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.pow
+import kotlin.math.sin
 import rikka.shizuku.Shizuku
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -112,6 +116,69 @@ private val NekoGlassTabSelected = Color(0xFF1A91E6)
 private val NekoGlassTabSelectedText = Color(0xFF0D7FCF)
 private val NekoGlassTabUnselected = Color(0xFF1A1D21)
 
+private val LgControlRadius = 26.dp
+private val LgPanelPadding = 20.dp
+private val LgConsolePadding = 16.dp
+
+private val LgControlShape = SmoothCornerShape(LgControlRadius)
+private val LgPanelShape = outerSmoothShape(innerRadius = LgControlRadius, inset = LgPanelPadding)
+private val LgConsoleShape = outerSmoothShape(innerRadius = LgControlRadius, inset = LgConsolePadding)
+
+private fun outerSmoothShape(innerRadius: Dp, inset: Dp): SmoothCornerShape {
+    return SmoothCornerShape(innerRadius + inset)
+}
+
+private data class SmoothCornerShape(
+    private val radius: Dp,
+    private val exponent: Double = 2.35
+) : Shape {
+    override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
+        val radiusPx = with(density) { radius.toPx() }
+            .coerceAtMost(size.width / 2f)
+            .coerceAtMost(size.height / 2f)
+
+        val path = Path().apply {
+            moveTo(radiusPx, 0f)
+            lineTo(size.width - radiusPx, 0f)
+            smoothCorner(size.width - radiusPx, radiusPx, radiusPx, -90.0, 0.0, exponent)
+            lineTo(size.width, size.height - radiusPx)
+            smoothCorner(size.width - radiusPx, size.height - radiusPx, radiusPx, 0.0, 90.0, exponent)
+            lineTo(radiusPx, size.height)
+            smoothCorner(radiusPx, size.height - radiusPx, radiusPx, 90.0, 180.0, exponent)
+            lineTo(0f, radiusPx)
+            smoothCorner(radiusPx, radiusPx, radiusPx, 180.0, 270.0, exponent)
+            close()
+        }
+
+        return Outline.Generic(path)
+    }
+}
+
+private fun Path.smoothCorner(
+    centerX: Float,
+    centerY: Float,
+    radius: Float,
+    startDegrees: Double,
+    endDegrees: Double,
+    exponent: Double
+) {
+    val steps = 32
+    val power = 2.0 / exponent
+
+    for (i in 1..steps) {
+        val angle = (startDegrees + (endDegrees - startDegrees) * i / steps) * PI / 180.0
+        val cosine = cos(angle)
+        val sine = sin(angle)
+        val x = centerX + radius * cosine.signedPow(power)
+        val y = centerY + radius * sine.signedPow(power)
+        lineTo(x.toFloat(), y.toFloat())
+    }
+}
+
+private fun Double.signedPow(power: Double): Double {
+    return if (this < 0.0) -abs(this).pow(power) else abs(this).pow(power)
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // 自定义 Modifier — 外部柔光阴影 (Ether Button 效果)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -122,7 +189,7 @@ private val NekoGlassTabUnselected = Color(0xFF1A1D21)
  */
 private fun Modifier.etherShadow(
     elevation: Dp = 6.dp,
-    shape: Shape = RoundedCornerShape(24.dp)
+    shape: Shape = LgControlShape
 ): Modifier = this
     .shadow(elevation = elevation, shape = shape, ambientColor = Color.Black.copy(alpha = 0.06f), spotColor = Color.Black.copy(alpha = 0.06f))
     .border(width = 1.dp, color = Color.White.copy(alpha = 0.5f), shape = shape)
@@ -133,7 +200,7 @@ private fun Modifier.etherShadow(
 
 /**
  * 半透明毛玻璃卡片容器。
- * 取代原先 Material3 `Card`，采用 70 % 白 + 圆角 24dp + 柔光阴影。
+ * 外层圆角等距包裹内层控件：外半径 = 内层控件半径 + 面板内边距。
  */
 @Composable
 private fun EtherCard(
@@ -143,10 +210,10 @@ private fun EtherCard(
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .etherShadow()
-            .clip(RoundedCornerShape(24.dp))
+            .etherShadow(shape = LgPanelShape)
+            .clip(LgPanelShape)
             .background(LgGlassWhite70)
-            .padding(20.dp),
+            .padding(LgPanelPadding),
         content = content
     )
 }
@@ -174,9 +241,9 @@ private fun GlassButtonPrimary(
         onClick = onClick,
         modifier = modifier
             .height(52.dp)
-            .etherShadow(shape = RoundedCornerShape(26.dp)),
+            .etherShadow(shape = LgControlShape),
         enabled = enabled,
-        shape = RoundedCornerShape(26.dp),
+        shape = LgControlShape,
         interactionSource = interactionSource,
         colors = ButtonDefaults.buttonColors(
             containerColor = LgCyan400.copy(alpha = bgAlpha),
@@ -204,8 +271,8 @@ private fun GlassButtonSecondary(
         onClick = onClick,
         modifier = modifier
             .height(52.dp)
-            .etherShadow(shape = RoundedCornerShape(26.dp)),
-        shape = RoundedCornerShape(26.dp),
+            .etherShadow(shape = LgControlShape),
+        shape = LgControlShape,
         colors = ButtonDefaults.outlinedButtonColors(
             containerColor = LgGlassWhite40,
             contentColor = LgOnSurfaceVariant
@@ -240,8 +307,8 @@ private fun EtherTextField(
             label = { Text(label, fontSize = 12.sp, color = LgOnSurfaceVariant) },
             modifier = Modifier
                 .fillMaxWidth()
-                .etherShadow(elevation = 2.dp, shape = RoundedCornerShape(16.dp)),
-            shape = RoundedCornerShape(16.dp),
+                .etherShadow(elevation = 2.dp, shape = LgControlShape),
+            shape = LgControlShape,
             maxLines = maxLines,
             textStyle = TextStyle(
                 fontSize = 14.sp,
@@ -609,7 +676,7 @@ private fun NekogramBottomBar(
         contentAlignment = Alignment.BottomCenter
     ) {
         val containerWidth = (maxWidth - 16.dp).coerceAtMost(344.dp)
-        val containerShape = RoundedCornerShape(28.dp)
+        val containerShape = SmoothCornerShape(28.dp)
         val glassInset = 7.666.dp
 
         Box(
@@ -692,7 +759,7 @@ private fun NekogramBottomBarItem(
     val textColor = lerp(NekoGlassTabUnselected, NekoGlassTabSelectedText, selectionFactor)
     val backgroundScale = 0.6f + 0.4f * selectionFactor
     val interactionSource = remember { MutableInteractionSource() }
-    val selectedShape = RoundedCornerShape(24.dp)
+    val selectedShape = SmoothCornerShape(24.dp)
 
     Box(
         modifier = modifier
@@ -991,7 +1058,7 @@ private fun EtherToggleRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
+            .clip(SmoothCornerShape(16.dp))
             .background(if (checked) LgCyan400.copy(alpha = 0.06f) else Color.Transparent)
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.Top
@@ -1020,7 +1087,7 @@ private fun PermissionStatusRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
+            .clip(SmoothCornerShape(12.dp))
             .background(
                 if (item.granted) LgSuccess.copy(alpha = 0.08f)
                 else LgWarning.copy(alpha = 0.08f)
@@ -1388,15 +1455,15 @@ fun ConfigScreenContent(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(250.dp)
-                    .shadow(16.dp, RoundedCornerShape(24.dp))
-                    .clip(RoundedCornerShape(24.dp))
+                    .shadow(16.dp, LgConsoleShape)
+                    .clip(LgConsoleShape)
                     .background(Color(0xFF1A1F20))
                     .border(
                         width = 1.dp,
                         color = Color.White.copy(alpha = 0.05f),
-                        shape = RoundedCornerShape(24.dp)
+                        shape = LgConsoleShape
                     )
-                    .padding(16.dp)
+                    .padding(LgConsolePadding)
             ) {
                 // 使用 LazyColumn 局部刷新日志列表，避免全量字符串拼接和全量重绘。
                 val lazyListState = rememberLazyListState()
@@ -1465,12 +1532,12 @@ private fun GrpcStatusIndicator(state: GrpcConnectionState) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
+            .clip(SmoothCornerShape(16.dp))
             .background(statusColor.copy(alpha = 0.08f))
             .border(
                 width = 1.dp,
                 color = statusColor.copy(alpha = 0.15f),
-                shape = RoundedCornerShape(16.dp)
+                shape = SmoothCornerShape(16.dp)
             )
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically

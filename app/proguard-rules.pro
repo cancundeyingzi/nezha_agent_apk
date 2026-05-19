@@ -27,3 +27,8 @@
 
 # ── ViewModel（ViewModelProvider 通过反射实例化） ──────────────────────────────
 -keep class com.nezhahq.agent.MainViewModel { *; }
+# 忽略 gRPC 在 Android 上不需要的标准 Java JNDI 类
+-dontwarn javax.naming.**
+
+# 忽略 gRPC 引用的旧版 OkHttp 类
+-dontwarn com.squareup.okhttp.**

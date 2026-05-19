@@ -17,6 +17,11 @@ import android.util.AttributeSet
 import android.view.View
 import android.view.ViewTreeObserver
 import androidx.annotation.RequiresApi
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.pow
+import kotlin.math.sin
 
 @RequiresApi(Build.VERSION_CODES.TIRAMISU)
 class NekogramLiquidGlassBarView @JvmOverloads constructor(
@@ -25,6 +30,7 @@ class NekogramLiquidGlassBarView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     private val clipPath = Path()
+    private val strokePath = Path()
     private val glassRect = RectF()
     private val bitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val topStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -160,12 +166,12 @@ class NekogramLiquidGlassBarView @JvmOverloads constructor(
 
         canvas.save()
         canvas.clipRect(topStrokeClip)
-        canvas.drawRoundRect(glassRect, cornerRadius, cornerRadius, topStrokePaint)
+        canvas.drawPath(strokePath, topStrokePaint)
         canvas.restore()
 
         canvas.save()
         canvas.clipRect(bottomStrokeClip)
-        canvas.drawRoundRect(glassRect, cornerRadius, cornerRadius, bottomStrokePaint)
+        canvas.drawPath(strokePath, bottomStrokePaint)
         canvas.restore()
     }
 
@@ -173,8 +179,9 @@ class NekogramLiquidGlassBarView @JvmOverloads constructor(
     private fun rebuildPath(width: Int, height: Int) {
         glassRect.set(0f, 0f, width.toFloat(), height.toFloat())
         clipPath.rewind()
-        clipPath.addRoundRect(glassRect, cornerRadius, cornerRadius, Path.Direction.CW)
-        clipPath.close()
+        clipPath.addSmoothRect(glassRect, cornerRadius)
+        strokePath.rewind()
+        strokePath.addSmoothRect(glassRect, cornerRadius)
     }
 
     private fun attachSourceListener() {
@@ -193,6 +200,47 @@ class NekogramLiquidGlassBarView @JvmOverloads constructor(
     }
 
     private fun dp(value: Float): Float = value * resources.displayMetrics.density
+}
+
+private fun Path.addSmoothRect(rect: RectF, radius: Float) {
+    val smoothRadius = radius
+        .coerceAtMost(rect.width() / 2f)
+        .coerceAtMost(rect.height() / 2f)
+
+    moveTo(rect.left + smoothRadius, rect.top)
+    lineTo(rect.right - smoothRadius, rect.top)
+    smoothCorner(rect.right - smoothRadius, rect.top + smoothRadius, smoothRadius, -90.0, 0.0)
+    lineTo(rect.right, rect.bottom - smoothRadius)
+    smoothCorner(rect.right - smoothRadius, rect.bottom - smoothRadius, smoothRadius, 0.0, 90.0)
+    lineTo(rect.left + smoothRadius, rect.bottom)
+    smoothCorner(rect.left + smoothRadius, rect.bottom - smoothRadius, smoothRadius, 90.0, 180.0)
+    lineTo(rect.left, rect.top + smoothRadius)
+    smoothCorner(rect.left + smoothRadius, rect.top + smoothRadius, smoothRadius, 180.0, 270.0)
+    close()
+}
+
+private fun Path.smoothCorner(
+    centerX: Float,
+    centerY: Float,
+    radius: Float,
+    startDegrees: Double,
+    endDegrees: Double
+) {
+    val steps = 32
+    val power = 2.0 / 2.35
+
+    for (i in 1..steps) {
+        val angle = (startDegrees + (endDegrees - startDegrees) * i / steps) * PI / 180.0
+        val cosine = cos(angle)
+        val sine = sin(angle)
+        val x = centerX + radius * cosine.signedPow(power)
+        val y = centerY + radius * sine.signedPow(power)
+        lineTo(x.toFloat(), y.toFloat())
+    }
+}
+
+private fun Double.signedPow(power: Double): Double {
+    return if (this < 0.0) -abs(this).pow(power) else abs(this).pow(power)
 }
 
 @RequiresApi(Build.VERSION_CODES.TIRAMISU)
