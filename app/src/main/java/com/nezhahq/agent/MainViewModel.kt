@@ -46,18 +46,43 @@ import rikka.shizuku.Shizuku
  */
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
+    init {
+        android.util.Log.i("LiquidGlass", "====== MainViewModel 开始初始化 ======")
+        android.util.Log.i("LiquidGlass", "  application = $application")
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // 配置字段状态（Compose State，驱动 UI 重组）
     // ══════════════════════════════════════════════════════════════════════════
 
     /** 服务端 IP 或域名 */
-    var server by mutableStateOf(ConfigStore.getServer(application))
+    var server by mutableStateOf(run {
+        android.util.Log.i("LiquidGlass", "  → 读取 server 配置")
+        val value = ConfigStore.getServer(application)
+        android.util.Log.i("LiquidGlass", "  ✓ server = $value")
+        value
+    })
     /** gRPC 端口 */
-    var port by mutableStateOf(ConfigStore.getPort(application).toString())
+    var port by mutableStateOf(run {
+        android.util.Log.i("LiquidGlass", "  → 读取 port 配置")
+        val value = ConfigStore.getPort(application).toString()
+        android.util.Log.i("LiquidGlass", "  ✓ port = $value")
+        value
+    })
     /** 客户端密钥 */
-    var secret by mutableStateOf(ConfigStore.getSecret(application))
+    var secret by mutableStateOf(run {
+        android.util.Log.i("LiquidGlass", "  → 读取 secret 配置")
+        val value = ConfigStore.getSecret(application)
+        android.util.Log.i("LiquidGlass", "  ✓ secret = ${if (value.isEmpty()) "(empty)" else "***"}")
+        value
+    })
     /** 客户端 UUID */
-    var uuid by mutableStateOf(ConfigStore.getUuid(application))
+    var uuid by mutableStateOf(run {
+        android.util.Log.i("LiquidGlass", "  → 读取 uuid 配置")
+        val value = ConfigStore.getUuid(application)
+        android.util.Log.i("LiquidGlass", "  ✓ uuid = $value")
+        value
+    })
     /** TLS 始终启用（由 GrpcManager 自动管理降级，用户无需手动控制） */
     private val useTls = true
     /** Root/Shizuku 高权限模式 */

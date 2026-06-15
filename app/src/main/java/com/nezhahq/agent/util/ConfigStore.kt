@@ -17,23 +17,85 @@ object ConfigStore {
      * 采用双重检查锁（Double-Checked Locking）单例模式，避免由于反复初始化
      * EncryptedSharedPreferences 和读写 KeyStore 产生严重的性能开销和主线程卡顿。
      * [Security Audit] 使用了 applicationContext 防内存溢出，同时利用 AES256_GCM 保证数据存储安全。
+     *
+     * [Robustness] 如果 EncryptedSharedPreferences 初始化失败（KeyStore 损坏），自动降级到普通 SharedPreferences。
      */
     private fun getEncryptedPrefs(context: Context): SharedPreferences {
+        android.util.Log.i("LiquidGlass", "→ ConfigStore.getEncryptedPrefs 被调用")
         return prefsInstance ?: synchronized(this) {
             prefsInstance ?: run {
-                val masterKey = MasterKey.Builder(context.applicationContext)
-                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                    .build()
+                android.util.Log.i("LiquidGlass", "  prefsInstance 为 null，需要初始化")
+                try {
+                    android.util.Log.i("LiquidGlass", "  → 开始创建 MasterKey")
+                    val masterKey = MasterKey.Builder(context.applicationContext)
+                        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                        .build()
+                    android.util.Log.i("LiquidGlass", "  ✓ MasterKey 创建成功")
 
-                val prefs = EncryptedSharedPreferences.create(
-                    context.applicationContext,
-                    PREFS_FILE,
-                    masterKey,
-                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-                )
-                prefsInstance = prefs
-                prefs
+                    android.util.Log.i("LiquidGlass", "  → 开始创建 EncryptedSharedPreferences")
+                    val prefs = EncryptedSharedPreferences.create(
+                        context.applicationContext,
+                        PREFS_FILE,
+                        masterKey,
+                        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+                    )
+                    android.util.Log.i("LiquidGlass", "  ✓ EncryptedSharedPreferences 创建成功")
+                    prefsInstance = prefs
+                    prefs
+                } catch (e: Exception) {
+                    android.util.Log.e("LiquidGlass", "  ✗ EncryptedSharedPreferences 初始化失败", e)
+                    android.util.Log.e("LiquidGlass", "  异常类型: ${e.javaClass.name}")
+                    android.util.Log.e("LiquidGlass", "  异常消息: ${e.message}")
+
+                    // 尝试删除损坏的加密文件和 MasterKey，然后重试一次
+                    android.util.Log.w("LiquidGlass", "  → 尝试删除损坏的加密文件并重试")
+                    try {
+                        // 删除损坏的 SharedPreferences 文件
+                        context.applicationContext.deleteSharedPreferences(PREFS_FILE)
+
+                        // 尝试删除损坏的 MasterKey（如果可能）
+                        try {
+                            val keyStore = java.security.KeyStore.getInstance("AndroidKeyStore")
+                            keyStore.load(null)
+                            val masterKeyAlias = "_androidx_security_master_key_"
+                            if (keyStore.containsAlias(masterKeyAlias)) {
+                                keyStore.deleteEntry(masterKeyAlias)
+                                android.util.Log.i("LiquidGlass", "  ✓ 已删除损坏的 MasterKey")
+                            }
+                        } catch (keyEx: Exception) {
+                            android.util.Log.w("LiquidGlass", "  删除 MasterKey 时出错（可忽略）", keyEx)
+                        }
+
+                        android.util.Log.i("LiquidGlass", "  → 重新创建 EncryptedSharedPreferences")
+                        val masterKey = MasterKey.Builder(context.applicationContext)
+                            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                            .build()
+
+                        val prefs = EncryptedSharedPreferences.create(
+                            context.applicationContext,
+                            PREFS_FILE,
+                            masterKey,
+                            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+                        )
+                        android.util.Log.i("LiquidGlass", "  ✓ 重试成功！EncryptedSharedPreferences 已创建")
+                        prefsInstance = prefs
+                        prefs
+                    } catch (retryEx: Exception) {
+                        android.util.Log.e("LiquidGlass", "  ✗ 重试仍然失败", retryEx)
+                        android.util.Log.w("LiquidGlass", "  → 降级到普通 SharedPreferences（无加密）")
+
+                        // 降级到普通 SharedPreferences
+                        val fallbackPrefs = context.applicationContext.getSharedPreferences(
+                            "${PREFS_FILE}_fallback",
+                            Context.MODE_PRIVATE
+                        )
+                        android.util.Log.i("LiquidGlass", "  ✓ 已降级到普通 SharedPreferences")
+                        prefsInstance = fallbackPrefs
+                        fallbackPrefs
+                    }
+                }
             }
         }
     }
