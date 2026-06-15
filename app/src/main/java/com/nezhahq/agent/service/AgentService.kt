@@ -3,6 +3,7 @@ package com.nezhahq.agent.service
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
@@ -207,7 +208,7 @@ class AgentService : Service() {
                     
                     // 1. Report Host Info
                     Logger.i("Sending Static Host Information (ReportSystemInfo2)...")
-                    val hostInfo = SystemInfoCollector.getHostInfo(this@AgentService, "1.0-android")
+                    val hostInfo = SystemInfoCollector.getHostInfo(this@AgentService, getAppVersionName())
                     stub.reportSystemInfo2(hostInfo)
                     
                     // 2. Report Geo IP
@@ -446,6 +447,24 @@ class AgentService : Service() {
     }
 
     private fun Throwable.causeSequence(): Sequence<Throwable> = generateSequence(this) { it.cause }
+
+    private fun getAppVersionName(): String {
+        return try {
+            val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                packageManager.getPackageInfo(
+                    packageName,
+                    PackageManager.PackageInfoFlags.of(0)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                packageManager.getPackageInfo(packageName, 0)
+            }
+            packageInfo.versionName ?: "unknown"
+        } catch (e: Exception) {
+            Logger.e("AgentService: 读取应用版本号失败", e)
+            "unknown"
+        }
+    }
 
     // ── [修复问题4] WakeLock 无超时，由 onDestroy 显式释放 ──────────────────
     // 原实现使用 24 小时超时，长期运行的 agent 会在 24 小时后失去保活条件
