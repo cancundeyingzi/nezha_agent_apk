@@ -80,11 +80,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var uuid by mutableStateOf(run {
         android.util.Log.i("LiquidGlass", "  → 读取 uuid 配置")
         val value = ConfigStore.getUuid(application)
-        android.util.Log.i("LiquidGlass", "  ✓ uuid = $value")
+        android.util.Log.i("LiquidGlass", "  ✓ uuid = ${redactUuidForLog(value)}")
         value
     })
-    /** TLS 始终启用（由 GrpcManager 自动管理降级，用户无需手动控制） */
-    private val useTls = true
+    /** gRPC 传输层安全开关；默认开启，只有用户显式关闭时才允许明文。 */
+    var useTls by mutableStateOf(ConfigStore.getUseTls(application))
     /** Root/Shizuku 高权限模式 */
     var rootMode by mutableStateOf(ConfigStore.getRootMode(application))
     /** 智能解析输入框内容 */
@@ -160,8 +160,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val pMatch = Regex("-p\\s+([^\\s]+)").find(input)
         if (pMatch != null) secret = pMatch.groupValues[1]
 
-        // TLS 始终启用，解析 --tls 标志但不需要赋值
-        // val tlsMatch = Regex("--tls").containsMatchIn(input)
+        if (Regex("(^|\\s)--tls(\\s|$)").containsMatchIn(input)) {
+            useTls = true
+        }
+        if (Regex("(^|\\s)--(no-tls|disable-tls)(\\s|$)").containsMatchIn(input)) {
+            useTls = false
+        }
 
         // New Dashboard Script logic (Environment variable based mapping)
         val envServerMatch = Regex("NZ_SERVER=([^:\\s]+):(\\d+)").find(input)
@@ -184,8 +188,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             uuid = java.util.UUID.randomUUID().toString()
         }
 
-        // TLS 始终启用，解析 NZ_TLS 环境变量但不需要赋值
-        // val envTlsMatch = Regex("NZ_TLS=true").containsMatchIn(input)
+        val envTlsMatch = Regex("NZ_TLS=([^\\s]+)").find(input)
+        if (envTlsMatch != null) {
+            parseBooleanLike(envTlsMatch.groupValues[1])?.let { useTls = it }
+        }
 
         Toast.makeText(getApplication(), "配置已解析完成", Toast.LENGTH_SHORT).show()
     }
@@ -203,7 +209,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ConfigStore.getServer(ctx),
             ConfigStore.getPort(ctx),
             ConfigStore.getSecret(ctx),
-            ConfigStore.getUseTls(ctx), // TLS 始终为 true，由 GrpcManager 自动降级管理
+            useTls,
             ConfigStore.getUuid(ctx),
             ConfigStore.getRootMode(ctx),
             enableKeepAliveAudio
@@ -311,6 +317,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val intent = Intent(ctx, AgentService::class.java)
         ctx.stopService(intent)
         Toast.makeText(ctx, "后台探针服务已停止", Toast.LENGTH_SHORT).show()
+    }
+
+    fun onUseTlsChanged(enabled: Boolean) {
+        useTls = enabled
     }
 
     /**
@@ -519,4 +529,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ).show()
         }
     }
+
+    private fun parseBooleanLike(rawValue: String): Boolean? {
+        val normalized = rawValue
+            .trim()
+            .trim('\'', '"')
+            .trimEnd(';')
+            .lowercase()
+        return when (normalized) {
+            "true", "1", "yes", "on" -> true
+            "false", "0", "no", "off" -> false
+            else -> null
+        }
+    }
+
+}
+
+internal fun redactUuidForLog(value: String): String {
+    if (value.isBlank()) return "(empty)"
+    return if (value.length <= 8) "***" else "${value.take(4)}...${value.takeLast(4)}"
 }

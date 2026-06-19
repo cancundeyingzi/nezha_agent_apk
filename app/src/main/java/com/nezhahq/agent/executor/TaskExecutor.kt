@@ -39,6 +39,8 @@ object TaskExecutor {
 
     /** 命令执行超时时间：2 小时（毫秒），对齐官方 Go Agent 的 time.Hour * 2 */
     private const val COMMAND_TIMEOUT_MS = 2L * 60 * 60 * 1000
+    private const val MAX_LOGGED_UNSUPPORTED_TYPES = 64
+    private val loggedUnsupportedTypes = LinkedHashSet<Long>()
 
     // ──────────────────────────────────────────────────────────────────────────
     // OkHttpClient：信任所有证书（监控场景需要能连接自签名 HTTPS 站点）
@@ -88,7 +90,7 @@ object TaskExecutor {
         try {
             when (task.type) {
                 // ── TaskType 1：HTTPGet 健康检查 + SSL 证书解析 ──────────────
-                1L -> {
+                TaskTypes.HTTP_GET -> {
                     val params = parseParams(task.data)
                     val url = params.host
                     val start = System.currentTimeMillis()
@@ -116,7 +118,7 @@ object TaskExecutor {
                 }
 
                 // ── TaskType 2：ICMP Ping ────────────────────────────────────
-                2L -> {
+                TaskTypes.ICMP_PING -> {
                     val params = parseParams(task.data)
                     val start = System.currentTimeMillis()
                     val process = ProcessBuilder("ping", "-c", "1", "-w", "5", params.host).start()
@@ -134,7 +136,7 @@ object TaskExecutor {
                 }
 
                 // ── TaskType 3：TCP Ping ─────────────────────────────────────
-                3L -> {
+                TaskTypes.TCP_PING -> {
                     val params = parseParams(task.data)
                     val start = System.currentTimeMillis()
                     val socket = Socket()
@@ -150,7 +152,7 @@ object TaskExecutor {
                 }
 
                 // ── TaskType 4：远程命令执行（带超时保护）─────────────────────
-                4L -> {
+                TaskTypes.COMMAND -> {
                     if (!isCommandEnabled) {
                         resultBuilder.setData("Command execution disabled on Android Agent.\n").setSuccessful(false)
                         return@withContext resultBuilder.build()
@@ -158,8 +160,22 @@ object TaskExecutor {
                     executeCommand(task.data, resultBuilder)
                 }
 
+                TaskTypes.KEEPALIVE -> {
+                    Logger.i("TaskRouter: 收到 Keepalive 任务 (TaskID=${task.id})")
+                    resultBuilder.setSuccessful(true).setData("")
+                }
+
                 else -> {
-                    resultBuilder.setSuccessful(false).setData("Unsupported task type on Android")
+                    val type = task.type
+                    val message = if (TaskTypes.isKnownUnsupportedOnAndroid(type)) {
+                        TaskTypes.unsupportedMessage(task.type)
+                    } else {
+                        "Unknown task type ${task.type} on Android Agent."
+                    }
+                    if (shouldLogUnsupportedType(type)) {
+                        Logger.i("TaskRouter: $message (TaskID=${task.id})")
+                    }
+                    resultBuilder.setSuccessful(false).setData(message)
                 }
             }
         } catch (e: Exception) {
@@ -167,6 +183,21 @@ object TaskExecutor {
         }
 
         return@withContext resultBuilder.build()
+    }
+
+    private fun shouldLogUnsupportedType(type: Long): Boolean {
+        synchronized(loggedUnsupportedTypes) {
+            if (type in loggedUnsupportedTypes) return false
+            if (loggedUnsupportedTypes.size >= MAX_LOGGED_UNSUPPORTED_TYPES) {
+                val iterator = loggedUnsupportedTypes.iterator()
+                if (iterator.hasNext()) {
+                    iterator.next()
+                    iterator.remove()
+                }
+            }
+            loggedUnsupportedTypes.add(type)
+            return true
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────

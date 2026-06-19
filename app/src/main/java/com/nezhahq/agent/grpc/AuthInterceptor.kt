@@ -12,8 +12,7 @@ class AuthInterceptor(private val secret: String, private val uuid: String) : Cl
             next.newCall(method, callOptions)
         ) {
             override fun start(responseListener: Listener<RespT>, headers: Metadata) {
-                headers.put(Metadata.Key.of("client_secret", Metadata.ASCII_STRING_MARSHALLER), secret)
-                headers.put(Metadata.Key.of("client_uuid", Metadata.ASCII_STRING_MARSHALLER), uuid)
+                AuthMetadataWriter.write(headers, secret, uuid)
                 super.start(responseListener, headers)
             }
         }

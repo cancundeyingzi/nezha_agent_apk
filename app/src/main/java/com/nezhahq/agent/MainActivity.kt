@@ -1093,13 +1093,17 @@ private fun EtherToggleRow(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
     title: String,
-    description: String
+    description: String,
+    highlightWhenChecked: Boolean = true
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(SmoothCornerShape(16.dp))
-            .background(if (checked) LgCyan400.copy(alpha = 0.06f) else Color.Transparent)
+            .background(
+                if (checked && highlightWhenChecked) LgCyan400.copy(alpha = 0.06f)
+                else Color.Transparent
+            )
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.Top
     ) {
@@ -1298,7 +1302,7 @@ fun ConfigScreenContent(
             GlassButtonPrimary(
                 onClick = { vm.parseClipboardConfig() },
                 modifier = Modifier.fillMaxWidth()
-            ) { Text("开始智能解析 (Smart Parse)", fontWeight = FontWeight.Bold) }
+            ) { Text("开始智能解析", fontWeight = FontWeight.Bold) }
         }
 
         // ── 连接设置 ──
@@ -1325,6 +1329,22 @@ fun ConfigScreenContent(
                 value = vm.uuid, onValueChange = { vm.uuid = it },
                 label = "客户端标识 (UUID)", modifier = Modifier.fillMaxWidth()
             )
+            Spacer(modifier = Modifier.height(12.dp))
+            EtherToggleRow(
+                checked = vm.useTls,
+                onCheckedChange = { newValue -> vm.onUseTlsChanged(newValue) },
+                title = "使用 TLS 加密连接",
+                description = "关闭后将使用明文传输，仅适用于可信内网部署（需重启服务生效）",
+                highlightWhenChecked = false
+            )
+            if (!vm.useTls) {
+                Text(
+                    "⚠️ 明文模式将暴露密钥、UUID 和所有传输内容，仅在完全可信的内网中使用。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LgError,
+                    modifier = Modifier.padding(start = 52.dp, top = 4.dp)
+                )
+            }
         }
 
         // ── 高级特性（Root / Shizuku） ──
@@ -1557,16 +1577,15 @@ fun ConfigScreenContent(
  */
 @Composable
 private fun GrpcStatusIndicator(state: GrpcConnectionState) {
-    // [P3 修复] TLS 降级后使用细分状态，让用户能区分降级模式下的实际连接阶段
     val (statusText, statusColor) = when (state) {
         GrpcConnectionState.IDLE -> "⚪ 未连接" to Color(0xFF9E9E9E)
         GrpcConnectionState.CONNECTING -> "🔵 连接中..." to Color(0xFF2196F3)
         GrpcConnectionState.CONNECTED -> "🟢 已连接" to LgSuccess
         GrpcConnectionState.RECONNECTING -> "🟠 重连中..." to LgWarning
         GrpcConnectionState.AUTH_FAILED -> "🔴 认证失败" to LgError
-        GrpcConnectionState.TLS_FALLBACK_CONNECTING -> "🟠 TLS 降级，明文连接中..." to Color(0xFFFF5722)
-        GrpcConnectionState.TLS_FALLBACK_CONNECTED -> "🟡 TLS 降级，明文已连接" to Color(0xFFFF9800)
-        GrpcConnectionState.TLS_FALLBACK_RECONNECTING -> "🟠 TLS 降级，明文重连中..." to Color(0xFFFF5722)
+        GrpcConnectionState.PLAINTEXT_CONNECTING -> "🟠 明文模式连接中..." to Color(0xFFFF5722)
+        GrpcConnectionState.PLAINTEXT_CONNECTED -> "🟡 明文模式已连接" to Color(0xFFFF9800)
+        GrpcConnectionState.PLAINTEXT_RECONNECTING -> "🟠 明文模式重连中..." to Color(0xFFFF5722)
     }
 
     Row(

@@ -16,7 +16,6 @@ import rikka.shizuku.Shizuku
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -42,19 +41,16 @@ class FileManager(
 
         const val BUFFER_SIZE = 1024 * 1024
         const val DEFAULT_HOME = "/sdcard/"
+        const val UPLOAD_HEADER_OFFSET = 1
+        const val UPLOAD_SIZE_BYTES = 8
+        const val UPLOAD_PATH_OFFSET = UPLOAD_HEADER_OFFSET + UPLOAD_SIZE_BYTES
+        const val UPLOAD_MIN_REQUEST_BYTES = UPLOAD_PATH_OFFSET
     }
 
     private val outputChannel = Channel<Nezha.IOStreamData>(Channel.BUFFERED)
     private val closed = AtomicBoolean(false)
 
-    // 上传状态变量
-    @Volatile private var uploadStarted = false
-    private var pendingUploadPath = ""
-    private var pendingUploadSize = 0UL
-    private var pendingUploadReceived = 0UL
-    private var pendingUploadStream: FileOutputStream? = null
-    // 上传的离线缓存文件，写入完毕后再移动到最终目录，避开 SELinux
-    private var pendingUploadCacheFile: File? = null
+    @Volatile private var uploadSession: UploadSession? = null
 
     suspend fun run() {
         try {
@@ -72,7 +68,7 @@ class FileManager(
                     val bytes = ioData.data.toByteArray()
                     if (bytes.isEmpty()) return@collect
 
-                    if (uploadStarted) {
+                    if (uploadSession != null) {
                         handleUploadChunk(bytes)
                         return@collect
                     }
@@ -89,29 +85,39 @@ class FileManager(
                             launch(Dispatchers.IO) { download(filePath) }
                         }
                         0x02 -> {
-                            if (bytes.size < 9) {
+                            if (bytes.size < UPLOAD_MIN_REQUEST_BYTES) {
                                 sendError("上传请求数据无效（数据长度不足 9 字节）")
                                 return@collect
                             }
-                            val fileSize = ByteBuffer.wrap(bytes, 1, 8)
-                                .order(ByteOrder.BIG_ENDIAN).long.toULong()
-                            val targetPath = String(bytes, 9, bytes.size - 9, Charsets.UTF_8)
-                            Logger.i("FileManager: 收到上传请求: $targetPath (size=$fileSize) (StreamID=$streamId)")
-                            
-                            uploadStarted = true
-                            pendingUploadPath = targetPath
-                            pendingUploadSize = fileSize
-                            pendingUploadReceived = 0UL
-                            
+                            val fileSize = ByteBuffer.wrap(bytes, UPLOAD_HEADER_OFFSET, UPLOAD_SIZE_BYTES)
+                                .order(ByteOrder.BIG_ENDIAN).long
+                            val targetPath = String(
+                                bytes,
+                                UPLOAD_PATH_OFFSET,
+                                bytes.size - UPLOAD_PATH_OFFSET,
+                                Charsets.UTF_8
+                            )
+                            Logger.i("FileUpload: 收到上传请求: $targetPath (size=$fileSize) (StreamID=$streamId)")
+
                             // 总是使用缓存文件进行传输，解决 Root 路径直接 IO 写失败问题
-                            pendingUploadCacheFile = File(context.cacheDir, "nezha_upload_${System.currentTimeMillis()}.tmp")
-                            try {
-                                pendingUploadStream = withContext(Dispatchers.IO) { 
-                                    FileOutputStream(pendingUploadCacheFile) 
+                            val cacheFile = File(context.cacheDir, "nezha_upload_${System.currentTimeMillis()}.tmp")
+                            val session = try {
+                                withContext(Dispatchers.IO) {
+                                    UploadSession.create(targetPath, fileSize, cacheFile)
                                 }
+                            } catch (e: IllegalArgumentException) {
+                                Logger.e("FileUpload: 上传请求被拒绝: ${e.message}")
+                                sendError(e.message ?: "上传请求无效")
+                                return@collect
                             } catch (e: Exception) {
+                                Logger.e("FileUpload: 无法创建临时缓存文件: $targetPath (StreamID=$streamId)", e)
                                 sendError("无法创建临时缓存文件: ${e.message}")
-                                uploadStarted = false
+                                return@collect
+                            }
+
+                            uploadSession = session
+                            if (session.isComplete) {
+                                completeUpload(session)
                             }
                         }
                     }
@@ -284,48 +290,53 @@ class FileManager(
     }
 
     private suspend fun handleUploadChunk(data: ByteArray) {
-        val stream = pendingUploadStream ?: return
+        val session = uploadSession ?: return
         try {
-            withContext(Dispatchers.IO) {
-                stream.write(data)
-            }
-            pendingUploadReceived += data.size.toULong()
-
-            if (pendingUploadReceived >= pendingUploadSize) {
-                withContext(Dispatchers.IO) {
-                    stream.flush()
-                    stream.close()
+            when (val result = withContext(Dispatchers.IO) { session.writeChunk(data) }) {
+                UploadWriteResult.AwaitingMore -> return
+                UploadWriteResult.Complete -> completeUpload(session)
+                is UploadWriteResult.Rejected -> {
+                    Logger.e("FileUpload: 上传校验失败: ${result.message} (StreamID=$streamId)")
+                    sendError(result.message)
+                    abortUploadSession()
                 }
-                Logger.i("FileManager: 文件传输到缓存完成，正在移动到目标路径: $pendingUploadPath (StreamID=$streamId)")
-                
-                val sourceFile = pendingUploadCacheFile
-                if (sourceFile != null && moveFileToTarget(sourceFile, pendingUploadPath)) {
-                    sendData(COMPLETE_IDENTIFIER)
-                    Logger.i("FileManager: 文件上传完全成功")
-                } else {
-                    sendError("文件保存失败，目标路径权限不足: $pendingUploadPath")
-                    Logger.e("FileManager: 无法将缓存文件移动到目标路径")
-                }
-                resetUploadState()
             }
         } catch (e: Exception) {
-            Logger.e("FileManager: 写入缓存文件失败: $pendingUploadPath (StreamID=$streamId)", e)
+            Logger.e("FileUpload: 写入缓存文件失败: ${session.targetPath} (StreamID=$streamId)", e)
             sendError("写入文件失败: ${e.message}")
-            withContext(Dispatchers.IO) {
-                try { stream.close() } catch (_: Exception) {}
-            }
-            resetUploadState()
+            abortUploadSession()
         }
     }
 
-    private fun resetUploadState() {
-        uploadStarted = false
-        pendingUploadPath = ""
-        pendingUploadSize = 0UL
-        pendingUploadReceived = 0UL
-        pendingUploadStream = null
-        try { pendingUploadCacheFile?.delete() } catch (_: Exception) {}
-        pendingUploadCacheFile = null
+    private suspend fun completeUpload(session: UploadSession) {
+        try {
+            withContext(Dispatchers.IO) {
+                session.close()
+            }
+            Logger.i("FileUpload: 文件传输到缓存完成，正在移动到目标路径: ${session.targetPath} (StreamID=$streamId)")
+            if (moveFileToTarget(session.cacheFile, session.targetPath)) {
+                sendData(COMPLETE_IDENTIFIER)
+                Logger.i("FileUpload: 文件上传完成: ${session.targetPath} (StreamID=$streamId)")
+            } else {
+                sendError("文件保存失败，目标路径权限不足: ${session.targetPath}")
+                Logger.e("FileUpload: 无法将缓存文件移动到目标路径: ${session.targetPath}")
+            }
+        } finally {
+            clearUploadSession(deleteCache = true)
+        }
+    }
+
+    private fun abortUploadSession() {
+        uploadSession?.abort()
+        uploadSession = null
+    }
+
+    private fun clearUploadSession(deleteCache: Boolean) {
+        val session = uploadSession
+        uploadSession = null
+        if (deleteCache) {
+            try { session?.cacheFile?.delete() } catch (_: Exception) {}
+        }
     }
 
     private suspend fun moveFileToTarget(sourceFile: File, targetPath: String): Boolean {
@@ -540,10 +551,7 @@ class FileManager(
     private fun close() {
         if (closed.getAndSet(true)) return
         Logger.i("FileManager: 正在关闭文件管理器会话 (StreamID=$streamId)")
-        try { pendingUploadStream?.close() } catch (_: Exception) {}
-        try { pendingUploadCacheFile?.delete() } catch (_: Exception) {}
-        pendingUploadStream = null
-        pendingUploadCacheFile = null
+        abortUploadSession()
         outputChannel.close()
     }
 

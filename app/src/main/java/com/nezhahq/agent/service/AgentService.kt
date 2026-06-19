@@ -19,10 +19,12 @@ import com.nezhahq.agent.collector.SystemInfoCollector
 import com.nezhahq.agent.collector.SystemStateCollector
 import com.nezhahq.agent.executor.FileManager
 import com.nezhahq.agent.executor.NatManager
+import com.nezhahq.agent.executor.TaskTypes
 import com.nezhahq.agent.executor.TaskExecutor
 import com.nezhahq.agent.executor.TerminalManager
 import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.grpc.GrpcManager
+import com.nezhahq.agent.grpc.GrpcTransportMode
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.FloatWindowManager
 import com.nezhahq.agent.util.KeepAliveAudioPlayer
@@ -118,8 +120,6 @@ class AgentService : Service() {
         acquireWakeLock()
         
         Logger.i("Service started, configuring Grpc...")
-        // 重置 TLS 降级状态：每次 Service 启动时重新尝试 TLS 连接
-        GrpcManager.resetTlsFallback()
         GrpcManager.initialize(this)
 
         // ── 清理上次可能因 App Crash 遗留的临时上传文件 ───────────────────
@@ -199,8 +199,14 @@ class AgentService : Service() {
                     // [修复问题6] 配置校验：stub 为空时等待重试而非反复抛异常
                     val stub = GrpcManager.stub
                     if (stub == null) {
-                        Logger.e("AgentService: GrpcManager.stub 未初始化（配置可能不完整），5秒后重试...")
-                        updateNotification("配置不完整，等待重试")
+                        val hasValidConfig = ConfigStore.hasValidConfig(this@AgentService)
+                        if (hasValidConfig) {
+                            Logger.e("Grpc: 连接通道未初始化，5秒后按当前传输模式重试")
+                            updateNotification("连接初始化失败，等待重试")
+                        } else {
+                            Logger.e("Grpc: 配置不完整，5秒后重试")
+                            updateNotification("配置不完整，等待重试")
+                        }
                         delay(5000)
                         GrpcManager.initialize(this@AgentService)
                         continue
@@ -219,7 +225,6 @@ class AgentService : Service() {
                     // 3. Bidirectional streams (Status & Tasks)
                     Logger.i("Handshake success. Opening Bidirectional streams for SystemState and Tasks...")
                     showConnectedStatus()
-                    // 连接握手成功，重置 TLS 失败计数
                     GrpcManager.recordConnectionSuccess()
                     coroutineScope {
                         launch {
@@ -248,11 +253,10 @@ class AgentService : Service() {
                         updateNotification("认证失败，请检查密钥和 UUID")
                         Logger.e("Agent loop: 认证失败，请检查密钥和 UUID 配置", e)
                     } else {
-                        if (!GrpcManager.isTlsFallbackActive() && isGenuineTlsFailure(e)) {
-                            val shouldFallback = GrpcManager.recordTlsFailure()
-                            if (shouldFallback) {
-                                Logger.i("Agent loop: TLS 连续失败已达阈值，下次重连将使用明文传输")
-                            }
+                        if (GrpcManager.currentTransportMode() == GrpcTransportMode.TLS
+                            && isGenuineTlsFailure(e)
+                        ) {
+                            Logger.e("Grpc: TLS 连接失败，将继续按 TLS 重试，不自动切换明文", e)
                         }
                         showReconnectStatus()
                         Logger.e("Agent loop terminated/failed", e)
@@ -281,9 +285,10 @@ class AgentService : Service() {
 
         try {
             stub.requestTask(resultChannel.receiveAsFlow()).collect { task ->
-                when (task.type) {
-                    8L, 9L, 11L -> launchStreamTask(stub, task)
-                    else -> enqueueShortTask(task, shortTaskQueue, resultChannel)
+                if (task.type in TaskTypes.STREAM_TASKS) {
+                    launchStreamTask(stub, task)
+                } else {
+                    enqueueShortTask(task, shortTaskQueue, resultChannel)
                 }
             }
         } finally {
@@ -298,7 +303,7 @@ class AgentService : Service() {
     ) {
         val isRootMode = ConfigStore.getRootMode(this@AgentService)
         when (task.type) {
-            8L -> launch {
+            TaskTypes.TERMINAL -> launch {
                 try {
                     val json = org.json.JSONObject(task.data)
                     val streamId = json.getString("StreamID")
@@ -316,7 +321,7 @@ class AgentService : Service() {
                     }
                 }
             }
-            9L -> launch {
+            TaskTypes.NAT -> launch {
                 try {
                     val json = org.json.JSONObject(task.data)
                     val streamId = json.getString("StreamID")
@@ -330,7 +335,7 @@ class AgentService : Service() {
                     }
                 }
             }
-            11L -> launch {
+            TaskTypes.FILE_MANAGER -> launch {
                 try {
                     val json = org.json.JSONObject(task.data)
                     val streamId = json.getString("StreamID")
@@ -389,14 +394,10 @@ class AgentService : Service() {
         resultChannel.send(result)
     }
 
-    // ── [P3 修复] 连接状态辅助方法 ──────────────────────────────────────────
-    // 降级模式下使用细分状态（TLS_FALLBACK_CONNECTING 等），
-    // 而非统一的 TLS_FALLBACK，让 UI 能区分降级后的实际连接阶段。
-
     private fun showConnectingStatus() {
-        if (GrpcManager.isTlsFallbackActive()) {
-            GrpcManager.updateState(GrpcConnectionState.TLS_FALLBACK_CONNECTING)
-            updateNotification("TLS 失败，已降级明文，正在连接...")
+        if (GrpcManager.isPlaintextModeActive()) {
+            GrpcManager.updateState(GrpcConnectionState.PLAINTEXT_CONNECTING)
+            updateNotification("明文模式，正在连接...")
         } else {
             GrpcManager.updateState(GrpcConnectionState.CONNECTING)
             updateNotification("正在连接...")
@@ -404,8 +405,8 @@ class AgentService : Service() {
     }
 
     private fun showConnectedStatus() {
-        if (GrpcManager.isTlsFallbackActive()) {
-            GrpcManager.updateState(GrpcConnectionState.TLS_FALLBACK_CONNECTED)
+        if (GrpcManager.isPlaintextModeActive()) {
+            GrpcManager.updateState(GrpcConnectionState.PLAINTEXT_CONNECTED)
             updateNotification("已连接到面板（明文传输）")
         } else {
             GrpcManager.updateState(GrpcConnectionState.CONNECTED)
@@ -414,9 +415,9 @@ class AgentService : Service() {
     }
 
     private fun showReconnectStatus() {
-        if (GrpcManager.isTlsFallbackActive()) {
-            GrpcManager.updateState(GrpcConnectionState.TLS_FALLBACK_RECONNECTING)
-            updateNotification("TLS 失败，已降级明文，正在重连...")
+        if (GrpcManager.isPlaintextModeActive()) {
+            GrpcManager.updateState(GrpcConnectionState.PLAINTEXT_RECONNECTING)
+            updateNotification("明文模式，正在重连...")
         } else {
             GrpcManager.updateState(GrpcConnectionState.RECONNECTING)
             updateNotification("连接断开，正在重连...")
