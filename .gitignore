@@ -2,6 +2,7 @@
 
 # AI Context
 .cobridge
+.claude/
 
 # .traerules
 .traerules
@@ -26,6 +27,8 @@ local.properties
 *.apk
 *.ap_
 *.aab
+*.dm
+app/release/
 
 # IDEA
 .idea/
@@ -41,3 +44,13 @@ local.properties
 
 # Custom test/debug output
 status.txt
+decompiled/
+CRASH_FIX_COMPLETED.md
+DIAGNOSTIC_LOGS_ADDED.md
+DIAGNOSTIC_LOGS_ENHANCED.md
+LEAK_FIX_REPORT.md
+P0_BUG_FIX_REPORT.md
+TLS_TOAST_FIX_REPORT.md
+TRANSPARENT_FIXES_REPORT.md
+USER_IMPACT_ANALYSIS.md
+liquid_glass_demo.html

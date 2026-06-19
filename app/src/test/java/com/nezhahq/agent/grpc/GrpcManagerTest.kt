@@ -17,4 +17,16 @@ class GrpcManagerTest {
         assertTrue(GrpcConnectionState.PLAINTEXT_CONNECTED.isPlaintext)
         assertFalse(GrpcConnectionState.CONNECTED.isPlaintext)
     }
+
+    @Test
+    fun shutdownCanPreserveReconnectState() {
+        GrpcManager.updateState(GrpcConnectionState.RECONNECTING)
+
+        GrpcManager.shutdown(preserveConnectionState = true)
+
+        assertEquals(GrpcConnectionState.RECONNECTING, GrpcManager.connectionState.value)
+
+        GrpcManager.shutdown()
+        assertEquals(GrpcConnectionState.IDLE, GrpcManager.connectionState.value)
+    }
 }

@@ -48,7 +48,12 @@ enum class GrpcTransportMode {
  * TLS 握手或证书失败必须继续按 TLS 重试，禁止携带鉴权 metadata 自动降级。
  */
 object GrpcManager {
+    private val lifecycleLock = Any()
+
+    @Volatile
     private var channel: ManagedChannel? = null
+
+    @Volatile
     var stub: NezhaServiceCoroutineStub? = null
         private set
 
@@ -80,39 +85,43 @@ object GrpcManager {
         val port = ConfigStore.getPort(context)
         val secret = ConfigStore.getSecret(context)
         val uuid = ConfigStore.getUuid(context)
+        val transportMode = resolveTransportMode(ConfigStore.getUseTls(context))
 
-        if (server.isEmpty() || secret.isEmpty() || uuid.isEmpty()) {
-            Logger.e("Grpc: 配置不完整，跳过通道初始化")
-            shutdown()
-            return
-        }
+        synchronized(lifecycleLock) {
+            if (server.isEmpty() || secret.isEmpty() || uuid.isEmpty()) {
+                Logger.e("Grpc: 配置不完整，跳过通道初始化")
+                shutdownLocked(preserveConnectionState = false)
+                return
+            }
 
-        currentTransportMode = resolveTransportMode(ConfigStore.getUseTls(context))
-        shutdown(preserveConnectionState = true)
+            currentTransportMode = transportMode
+            shutdownLocked(preserveConnectionState = true)
 
-        val builder = OkHttpChannelBuilder.forAddress(server, port)
-        when (currentTransportMode) {
-            GrpcTransportMode.TLS -> {
-                if (!configureTls(builder)) {
-                    stub = null
-                    return
+            val builder = OkHttpChannelBuilder.forAddress(server, port)
+            when (transportMode) {
+                GrpcTransportMode.TLS -> {
+                    if (!configureTls(builder)) {
+                        stub = null
+                        return
+                    }
+                    Logger.i("Grpc: 使用 TLS 加密连接 $server:$port")
                 }
-                Logger.i("Grpc: 使用 TLS 加密连接 $server:$port")
+                GrpcTransportMode.PLAINTEXT -> {
+                    builder.usePlaintext()
+                    Logger.i("Grpc: 使用显式明文连接 $server:$port")
+                }
             }
-            GrpcTransportMode.PLAINTEXT -> {
-                builder.usePlaintext()
-                Logger.i("Grpc: 使用显式明文连接 $server:$port")
-            }
+
+            val newChannel = builder
+                .keepAliveTime(10, TimeUnit.SECONDS)
+                .keepAliveTimeout(5, TimeUnit.SECONDS)
+                .keepAliveWithoutCalls(true)
+                .intercept(AuthInterceptor(secret, uuid))
+                .build()
+
+            channel = newChannel
+            stub = NezhaServiceCoroutineStub(newChannel)
         }
-
-        channel = builder
-            .keepAliveTime(10, TimeUnit.SECONDS)
-            .keepAliveTimeout(5, TimeUnit.SECONDS)
-            .keepAliveWithoutCalls(true)
-            .intercept(AuthInterceptor(secret, uuid))
-            .build()
-
-        stub = NezhaServiceCoroutineStub(channel!!)
     }
 
     private fun configureTls(builder: OkHttpChannelBuilder): Boolean {
@@ -134,6 +143,12 @@ object GrpcManager {
     }
 
     fun shutdown(preserveConnectionState: Boolean = false) {
+        synchronized(lifecycleLock) {
+            shutdownLocked(preserveConnectionState)
+        }
+    }
+
+    private fun shutdownLocked(preserveConnectionState: Boolean = false) {
         Logger.i("Grpc: Closing connection stub.")
         channel?.shutdownNow()
         channel = null

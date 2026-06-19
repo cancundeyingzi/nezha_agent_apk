@@ -41,6 +41,7 @@ import proto.Nezha.Task
 import proto.Nezha.TaskResult
 import proto.NezhaServiceGrpcKt.NezhaServiceCoroutineStub
 import java.security.cert.CertificateException
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLException
 
 class AgentService : Service() {
@@ -176,7 +177,15 @@ class AgentService : Service() {
                 scope.launch {
                     try {
                         val geoIp = GeoIpCollector.fetchGeoIP()
-                        if (geoIp != null) GrpcManager.stub?.reportGeoIP(geoIp)
+                        val stub = GrpcManager.stub
+                        if (geoIp != null && stub != null) {
+                            DashboardSessionWatchdog.callWithin(
+                                DashboardSessionWatchdog.HANDSHAKE_TIMEOUT_MS,
+                                "NetworkCallback ReportGeoIP"
+                            ) {
+                                stub.reportGeoIP(geoIp)
+                            }
+                        }
                     } catch (e: Exception) {
                         // gRPC 调用可能因 TLS 握手失败抛出异常，
                         // 此处捕获防止未处理异常导致闪退
@@ -207,65 +216,81 @@ class AgentService : Service() {
                             Logger.e("Grpc: 配置不完整，5秒后重试")
                             updateNotification("配置不完整，等待重试")
                         }
-                        delay(5000)
+                        delay(DashboardSessionWatchdog.RECONNECT_BACKOFF_MS)
                         GrpcManager.initialize(this@AgentService)
                         continue
                     }
-                    
-                    // 1. Report Host Info
-                    Logger.i("Sending Static Host Information (ReportSystemInfo2)...")
-                    val hostInfo = SystemInfoCollector.getHostInfo(this@AgentService, getAppVersionName())
-                    stub.reportSystemInfo2(hostInfo)
-                    
-                    // 2. Report Geo IP
-                    Logger.i("Sending GeoIP Information...")
-                    val geoIp = GeoIpCollector.fetchGeoIP()
-                    if (geoIp != null) stub.reportGeoIP(geoIp)
-                    
-                    // 3. Bidirectional streams (Status & Tasks)
+
+                    reportInitialDashboardInfo(stub)
+
+                    // 3. Bidirectional streams (Status & Tasks). 只有收到面板回执后才显示已连接。
                     Logger.i("Handshake success. Opening Bidirectional streams for SystemState and Tasks...")
-                    showConnectedStatus()
-                    GrpcManager.recordConnectionSuccess()
+                    val connectionMarked = AtomicBoolean(false)
                     coroutineScope {
                         launch {
-                            val stateFlow = flow {
-                                while (currentCoroutineContext().isActive) {
-                                    emit(withContext(Dispatchers.Default) {
-                                        stateCollector.getState()
-                                    })
-                                    delay(2000) // Report state every 2 seconds
-                                }
-                            }
-                            stub.reportSystemState(stateFlow).collect { _ ->
-                                // Optional logic when dashboard acks state stream chunk (ignored typically)
-                            }
+                            handleSystemStateStream(stub, connectionMarked)
                         }
                         
                         launch {
                             handleTaskStream(stub)
                         }
                     }
+                } catch (e: CancellationException) {
+                    Logger.i("Agent loop cancelled, propagating...")
+                    throw e
                 } catch (e: Exception) {
-                    val isAuthError = isAuthenticationFailure(e)
-                    if (isAuthError) {
-                        // 认证失败不计入 TLS 失败计数（问题在密钥/UUID，非 TLS）
-                        GrpcManager.updateState(GrpcConnectionState.AUTH_FAILED)
-                        updateNotification("认证失败，请检查密钥和 UUID")
-                        Logger.e("Agent loop: 认证失败，请检查密钥和 UUID 配置", e)
-                    } else {
-                        if (GrpcManager.currentTransportMode() == GrpcTransportMode.TLS
-                            && isGenuineTlsFailure(e)
-                        ) {
-                            Logger.e("Grpc: TLS 连接失败，将继续按 TLS 重试，不自动切换明文", e)
-                        }
-                        showReconnectStatus()
-                        Logger.e("Agent loop terminated/failed", e)
-                    }
-                    delay(5000) // Reconnect backoff
-                    Logger.i("Re-initializing GrpcManager to attempt recovery...")
-                    GrpcManager.initialize(this@AgentService)
+                    handleAgentLoopFailure(e)
                 }
             }
+        }
+    }
+
+    private suspend fun reportInitialDashboardInfo(stub: NezhaServiceCoroutineStub) {
+        Logger.i("Sending Static Host Information (ReportSystemInfo2)...")
+        val hostInfo = SystemInfoCollector.getHostInfo(this@AgentService, getAppVersionName())
+        DashboardSessionWatchdog.callWithin(
+            DashboardSessionWatchdog.HANDSHAKE_TIMEOUT_MS,
+            "ReportSystemInfo2"
+        ) {
+            stub.reportSystemInfo2(hostInfo)
+        }
+
+        Logger.i("Sending GeoIP Information...")
+        val geoIp = GeoIpCollector.fetchGeoIP()
+        if (geoIp != null) {
+            DashboardSessionWatchdog.callWithin(
+                DashboardSessionWatchdog.HANDSHAKE_TIMEOUT_MS,
+                "ReportGeoIP"
+            ) {
+                stub.reportGeoIP(geoIp)
+            }
+        }
+    }
+
+    private suspend fun handleSystemStateStream(
+        stub: NezhaServiceCoroutineStub,
+        connectionMarked: AtomicBoolean
+    ) = coroutineScope {
+        val stateFlow = flow {
+            while (currentCoroutineContext().isActive) {
+                emit(withContext(Dispatchers.Default) {
+                    stateCollector.getState()
+                })
+                delay(DashboardSessionWatchdog.STATE_REPORT_INTERVAL_MS)
+            }
+        }
+        val receiptChannel = stub.reportSystemState(stateFlow).produceIn(this)
+        try {
+            while (isActive) {
+                DashboardSessionWatchdog.receiveWithin(
+                    receiptChannel,
+                    DashboardSessionWatchdog.STATE_RECEIPT_TIMEOUT_MS,
+                    "ReportSystemState receipt"
+                )
+                showConnectedStatusIfNeeded(connectionMarked)
+            }
+        } finally {
+            receiptChannel.cancel()
         }
     }
 
@@ -284,16 +309,36 @@ class AgentService : Service() {
         }
 
         try {
-            stub.requestTask(resultChannel.receiveAsFlow()).collect { task ->
-                if (task.type in TaskTypes.STREAM_TASKS) {
-                    launchStreamTask(stub, task)
-                } else {
-                    enqueueShortTask(task, shortTaskQueue, resultChannel)
+            val taskChannel = stub.requestTask(resultChannel.receiveAsFlow()).produceIn(this)
+            try {
+                while (isActive) {
+                    val task = DashboardSessionWatchdog.receiveWithin(
+                        taskChannel,
+                        DashboardSessionWatchdog.TASK_IDLE_TIMEOUT_MS,
+                        "RequestTask stream"
+                    )
+                    routeIncomingTask(stub, task, shortTaskQueue, resultChannel)
                 }
+            } finally {
+                taskChannel.cancel()
             }
         } finally {
             workerJobs.forEach { it.cancel() }
             shortTaskQueue.close()
+            resultChannel.close()
+        }
+    }
+
+    private fun CoroutineScope.routeIncomingTask(
+        stub: NezhaServiceCoroutineStub,
+        task: Task,
+        shortTaskQueue: SendChannel<Task>,
+        resultChannel: SendChannel<TaskResult>
+    ) {
+        if (task.type in TaskTypes.STREAM_TASKS) {
+            launchStreamTask(stub, task)
+        } else {
+            enqueueShortTask(task, shortTaskQueue, resultChannel)
         }
     }
 
@@ -414,6 +459,13 @@ class AgentService : Service() {
         }
     }
 
+    private fun showConnectedStatusIfNeeded(connectionMarked: AtomicBoolean) {
+        if (connectionMarked.compareAndSet(false, true)) {
+            showConnectedStatus()
+            GrpcManager.recordConnectionSuccess()
+        }
+    }
+
     private fun showReconnectStatus() {
         if (GrpcManager.isPlaintextModeActive()) {
             GrpcManager.updateState(GrpcConnectionState.PLAINTEXT_RECONNECTING)
@@ -422,6 +474,28 @@ class AgentService : Service() {
             GrpcManager.updateState(GrpcConnectionState.RECONNECTING)
             updateNotification("连接断开，正在重连...")
         }
+    }
+
+    private suspend fun handleAgentLoopFailure(e: Exception) {
+        val isAuthError = isAuthenticationFailure(e)
+        if (isAuthError) {
+            // 认证失败不计入 TLS 失败计数（问题在密钥/UUID，非 TLS）
+            GrpcManager.updateState(GrpcConnectionState.AUTH_FAILED)
+            updateNotification("认证失败，请检查密钥和 UUID")
+            Logger.e("Agent loop: 认证失败，请检查密钥和 UUID 配置", e)
+        } else {
+            if (GrpcManager.currentTransportMode() == GrpcTransportMode.TLS
+                && isGenuineTlsFailure(e)
+            ) {
+                Logger.e("Grpc: TLS 连接失败，将继续按 TLS 重试，不自动切换明文", e)
+            }
+            showReconnectStatus()
+            Logger.e("Agent loop terminated/failed; closing channel before reconnect", e)
+        }
+        GrpcManager.shutdown(preserveConnectionState = true)
+        delay(DashboardSessionWatchdog.RECONNECT_BACKOFF_MS)
+        Logger.i("Re-initializing GrpcManager to attempt recovery...")
+        GrpcManager.initialize(this@AgentService)
     }
 
     private fun isAuthenticationFailure(throwable: Throwable): Boolean {

@@ -1,0 +1,79 @@
+package com.nezhahq.agent.service
+
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class DashboardSessionWatchdogTest {
+    @Test
+    fun officialTimeoutDefaultsArePreserved() {
+        assertEquals(5_000L, DashboardSessionWatchdog.HANDSHAKE_TIMEOUT_MS)
+        assertEquals(10_000L, DashboardSessionWatchdog.STATE_RECEIPT_TIMEOUT_MS)
+        assertEquals(30_000L, DashboardSessionWatchdog.TASK_IDLE_TIMEOUT_MS)
+        assertEquals(5_000L, DashboardSessionWatchdog.RECONNECT_BACKOFF_MS)
+        assertEquals(2_000L, DashboardSessionWatchdog.STATE_REPORT_INTERVAL_MS)
+    }
+
+    @Test
+    fun receiveWithinReturnsMessageBeforeDeadline() = runBlocking {
+        val channel = Channel<String>()
+        try {
+            launch {
+                delay(10)
+                channel.send("alive")
+            }
+
+            val value = DashboardSessionWatchdog.receiveWithin(
+                channel,
+                timeoutMs = 1_000,
+                streamName = "RequestTask stream"
+            )
+
+            assertEquals("alive", value)
+        } finally {
+            channel.close()
+        }
+    }
+
+    @Test
+    fun receiveWithinThrowsClearTimeoutWhenStreamIsIdle() {
+        val channel = Channel<String>()
+        try {
+            val error = assertThrows(DashboardSessionTimeoutException::class.java) {
+                runBlocking {
+                    DashboardSessionWatchdog.receiveWithin(
+                        channel,
+                        timeoutMs = 1,
+                        streamName = "RequestTask stream"
+                    )
+                }
+            }
+
+            assertTrue(error.message?.contains("RequestTask stream") == true)
+        } finally {
+            channel.close()
+        }
+    }
+
+    @Test
+    fun callWithinWrapsSlowOperationsAsDashboardTimeouts() {
+        val error = assertThrows(DashboardSessionTimeoutException::class.java) {
+            runBlocking {
+                DashboardSessionWatchdog.callWithin<String>(
+                    timeoutMs = 1,
+                    operationName = "ReportSystemInfo2"
+                ) {
+                    delay(50)
+                    "late"
+                }
+            }
+        }
+
+        assertTrue(error.message?.contains("ReportSystemInfo2") == true)
+    }
+}
