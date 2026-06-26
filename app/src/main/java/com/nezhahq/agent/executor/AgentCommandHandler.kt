@@ -5,12 +5,19 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.database.Cursor
 import android.net.Uri
+import android.os.Environment
 import android.provider.Telephony
 import androidx.core.content.ContextCompat
+import com.nezhahq.agent.service.KeepAliveAccessibilityService
+import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
+import com.nezhahq.agent.util.RootShell
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * 虚拟指令处理器（Virtual Command Handler）。
@@ -21,8 +28,8 @@ import java.util.Locale
  *
  * ## 安全设计
  * - 短信读取前先检查 `READ_SMS` 运行时权限，未授权则返回友好提示
- * - 所有数据仅在内存中处理，**绝不写入磁盘或 Logcat**
- * - 查询结果通过 ContentResolver 获取后直接格式化，不做任何持久化
+ * - 短信查询结果仅在内存中处理，**绝不写入磁盘或 Logcat**
+ * - 截图指令只写入用户指定路径，默认 `/sdcard`，并优先使用已授权的无障碍服务
  *
  * ## 扩展性
  * 新增指令只需在 [execute] 的 `when` 分支中添加即可，
@@ -38,11 +45,17 @@ class AgentCommandHandler(private val context: Context) {
      * @param subcommand `@agent` 后的子指令（已 trim），例如 "sms"、"help"
      * @return 终端输出文本，包含换行符
      */
-    fun execute(subcommand: String): String {
-        return when (subcommand.lowercase(Locale.ROOT)) {
+    suspend fun execute(subcommand: String): String {
+        val normalized = subcommand.trim()
+        val commandToken = normalized.substringBefore(' ', normalized)
+        val command = commandToken.lowercase(Locale.ROOT)
+        val args = normalized.drop(commandToken.length).trim()
+
+        return when (command) {
             "" , "help" -> executeHelp()
             "sms" -> executeSms()
-            else -> "❌ 未知指令: @agent $subcommand\r\n输入 @agent help 查看可用指令列表。\r\n"
+            "screenshot", "screencap", "screen", "截图", "截屏" -> executeScreenshot(args)
+            else -> "❌ 未知指令: @agent $normalized\r\n输入 @agent help 查看可用指令列表。\r\n"
         }
     }
 
@@ -56,13 +69,15 @@ class AgentCommandHandler(private val context: Context) {
     private fun executeHelp(): String {
         return buildString {
             append("\r\n")
-            append("╔══════════════════════════════════════╗\r\n")
+            append("╔═════════════════════════════════════╗\r\n")
             append("║     @agent 虚拟指令系统 v1.0        ║\r\n")
-            append("╠══════════════════════════════════════╣\r\n")
+            append("╠═════════════════════════════════════╣\r\n")
             append("║  @agent help   显示此帮助信息       ║\r\n")
             append("║  @agent sms    查看最近 5 条短信    ║\r\n")
-            append("╚══════════════════════════════════════╝\r\n")
+            append("║  @agent screenshot [路径] 保存截图  ║\r\n")
+            append("╚═════════════════════════════════════╝\r\n")
             append("\r\n")
+            append("截图默认保存到 /sdcard，例如 /sdcard/nezha_screenshot_20260626_120000.png\r\n")
             append("提示: 所有其他输入将作为标准 Shell 命令执行。\r\n")
             append("\r\n")
         }
@@ -152,5 +167,156 @@ class AgentCommandHandler(private val context: Context) {
             Logger.e("AgentCommandHandler: 短信查询失败", e)
             "❌ 短信查询失败: ${e.message}\r\n"
         }
+    }
+
+    /**
+     * 保存当前屏幕截图，默认落盘到 /sdcard。
+     *
+     * 优先使用 Android 11+ 无障碍截图 API；当无障碍不可用时，如果用户已开启
+     * Root/Shizuku 高权限模式，则回退到系统 screencap 命令。
+     */
+    private suspend fun executeScreenshot(pathArg: String): String {
+        val targetPath = normalizeScreenshotPath(pathArg)
+
+        when (val result = KeepAliveAccessibilityService.saveScreenshot(targetPath)) {
+            is KeepAliveAccessibilityService.ScreenshotSaveResult.Success -> {
+                Logger.i("AgentCommandHandler: 无障碍截图已保存: ${result.path}")
+                return formatScreenshotSuccess(result.path, result.bytes, "无障碍服务")
+            }
+            is KeepAliveAccessibilityService.ScreenshotSaveResult.Failure -> {
+                Logger.i("AgentCommandHandler: 无障碍截图不可用，准备尝试高权限兜底: ${result.reason}")
+                val rootMode = ConfigStore.getRootMode(context)
+                if (!rootMode) {
+                    return buildString {
+                        append("\r\n")
+                        append("❌ 截图保存失败\r\n")
+                        append("目标路径: $targetPath\r\n")
+                        append("原因: ${result.reason}\r\n")
+                        append("\r\n")
+                        append("请确认无障碍服务已启用、所有文件访问可写，或开启 Root/Shizuku 高权限模式后重试。\r\n")
+                        append("\r\n")
+                    }
+                }
+
+                return when (val shellResult = captureScreenshotViaShell(targetPath)) {
+                    is ShellScreenshotResult.Success -> {
+                        Logger.i("AgentCommandHandler: screencap 截图已保存: ${shellResult.path}")
+                        formatScreenshotSuccess(shellResult.path, shellResult.bytes, "Root/Shizuku screencap")
+                    }
+                    is ShellScreenshotResult.Failure -> buildString {
+                        append("\r\n")
+                        append("❌ 截图保存失败\r\n")
+                        append("目标路径: $targetPath\r\n")
+                        append("无障碍: ${result.reason}\r\n")
+                        append("高权限: ${shellResult.reason}\r\n")
+                        append("\r\n")
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun captureScreenshotViaShell(targetPath: String): ShellScreenshotResult =
+        withContext(Dispatchers.IO) {
+            val parent = File(targetPath).parent?.takeIf { it.isNotBlank() } ?: defaultScreenshotDir()
+            val escapedParent = shellEscape(parent)
+            val escapedTarget = shellEscape(targetPath)
+            val command = """
+                mkdir -p $escapedParent 2>&1
+                screencap -p $escapedTarget 2>&1
+                status=${'$'}?
+                if [ "${'$'}status" -eq 0 ] && [ -s $escapedTarget ]; then
+                    chmod 666 $escapedTarget 2>/dev/null
+                    bytes=${'$'}(wc -c < $escapedTarget 2>/dev/null | tr -d ' ')
+                    echo "$SHELL_SUCCESS_MARKER${'$'}bytes"
+                else
+                    echo "$SHELL_FAILURE_MARKER${'$'}status"
+                fi
+            """.trimIndent()
+
+            val output = RootShell.execute(command)
+            if (output.isBlank()) {
+                return@withContext ShellScreenshotResult.Failure("Root/Shizuku shell 不可用或无输出")
+            }
+
+            val lines = output.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+            val successLine = lines.lastOrNull { it.startsWith(SHELL_SUCCESS_MARKER) }
+            if (successLine != null) {
+                val bytes = successLine.removePrefix(SHELL_SUCCESS_MARKER).toLongOrNull() ?: 0L
+                if (bytes > 0L) {
+                    return@withContext ShellScreenshotResult.Success(targetPath, bytes)
+                }
+                return@withContext ShellScreenshotResult.Failure("screencap 已返回成功，但文件为空")
+            }
+
+            val failureLine = lines.lastOrNull { it.startsWith(SHELL_FAILURE_MARKER) }
+            val exitCode = failureLine?.removePrefix(SHELL_FAILURE_MARKER)?.ifBlank { "未知" } ?: "未知"
+            val detail = lines
+                .filterNot {
+                    it.startsWith(SHELL_SUCCESS_MARKER) || it.startsWith(SHELL_FAILURE_MARKER)
+                }
+                .joinToString("\n")
+                .ifBlank { "无详细错误输出" }
+
+            ShellScreenshotResult.Failure("screencap 退出码 $exitCode: $detail")
+        }
+
+    private fun normalizeScreenshotPath(pathArg: String): String {
+        val rawPath = pathArg.stripWrappingQuotes()
+        val generatedName = "nezha_screenshot_${screenshotDateFormat.format(Date())}.png"
+        val defaultDir = defaultScreenshotDir()
+        if (rawPath.isBlank()) return "$defaultDir/$generatedName"
+
+        val normalized = rawPath.replace('\\', '/')
+        if (normalized.endsWith("/")) return normalized + generatedName
+
+        return if (File(normalized).isAbsolute) {
+            normalized
+        } else {
+            "$defaultDir/$normalized"
+        }
+    }
+
+    private fun defaultScreenshotDir(): String {
+        return Environment.getExternalStorageDirectory().absolutePath
+    }
+
+    private fun formatScreenshotSuccess(path: String, bytes: Long, method: String): String {
+        return buildString {
+            append("\r\n")
+            append("✅ 截图已保存\r\n")
+            append("路径: $path\r\n")
+            append("大小: $bytes bytes\r\n")
+            append("方式: $method\r\n")
+            append("\r\n")
+        }
+    }
+
+    private fun String.stripWrappingQuotes(): String {
+        val value = trim()
+        if (value.length < 2) return value
+        val first = value.first()
+        val last = value.last()
+        return if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            value.substring(1, value.length - 1).trim()
+        } else {
+            value
+        }
+    }
+
+    private fun shellEscape(input: String): String {
+        return "'" + input.replace("'", "'\\''") + "'"
+    }
+
+    private sealed class ShellScreenshotResult {
+        data class Success(val path: String, val bytes: Long) : ShellScreenshotResult()
+        data class Failure(val reason: String) : ShellScreenshotResult()
+    }
+
+    private companion object {
+        const val SHELL_SUCCESS_MARKER = "__NEZHA_SCREENSHOT_OK__:"
+        const val SHELL_FAILURE_MARKER = "__NEZHA_SCREENSHOT_FAIL__:"
+
+        val screenshotDateFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
     }
 }
