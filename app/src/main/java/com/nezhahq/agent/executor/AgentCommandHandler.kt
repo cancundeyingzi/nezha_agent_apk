@@ -38,6 +38,7 @@ import kotlinx.coroutines.withContext
  * @param context Android 上下文，用于 ContentResolver 和权限检查
  */
 class AgentCommandHandler(private val context: Context) {
+    private val appListQuery = AppListQuery(context)
 
     /**
      * 执行虚拟指令并返回格式化的终端输出文本。
@@ -54,6 +55,7 @@ class AgentCommandHandler(private val context: Context) {
         return when (command) {
             "" , "help" -> executeHelp()
             "sms" -> executeSms()
+            "apps", "app", "应用" -> executeApps(args)
             "screenshot", "screencap", "screen", "截图", "截屏" -> executeScreenshot(args)
             else -> "❌ 未知指令: @agent $normalized\r\n输入 @agent help 查看可用指令列表。\r\n"
         }
@@ -74,11 +76,119 @@ class AgentCommandHandler(private val context: Context) {
             append("╠═════════════════════════════════════╣\r\n")
             append("║  @agent help   显示此帮助信息       ║\r\n")
             append("║  @agent sms    查看最近 5 条短信    ║\r\n")
+            append("║  @agent apps installed 用户应用列表 ║\r\n")
+            append("║  @agent apps processes 应用进程列表 ║\r\n")
             append("║  @agent screenshot [路径] 保存截图  ║\r\n")
             append("╚═════════════════════════════════════╝\r\n")
             append("\r\n")
             append("截图默认保存到 /sdcard，例如 /sdcard/nezha_screenshot_20260626_120000.png\r\n")
             append("提示: 所有其他输入将作为标准 Shell 命令执行。\r\n")
+            append("\r\n")
+        }
+    }
+
+    /**
+     * 查询用户应用列表或用户应用进程。
+     */
+    private suspend fun executeApps(args: String): String {
+        val trimmed = args.trim()
+        val action = trimmed.substringBefore(' ', trimmed).lowercase(Locale.ROOT)
+
+        return when (action) {
+            "", "help" -> executeAppsHelp()
+            "installed", "install", "list", "ls", "已安装", "安装", "列表" -> {
+                formatInstalledApps(appListQuery.getInstalledUserApps())
+            }
+            "processes", "process", "ps", "running", "run", "cached", "cache",
+            "进程", "运行", "缓存" -> executeAppProcesses()
+            else -> buildString {
+                append("❌ 未知应用指令: @agent apps $trimmed\r\n")
+                append(executeAppsHelp())
+            }
+        }
+    }
+
+    private fun executeAppsHelp(): String {
+        return buildString {
+            append("\r\n")
+            append("📦 用户应用查询\r\n")
+            append("═══════════════════════════════════════\r\n")
+            append("@agent apps installed    已安装用户应用\r\n")
+            append("@agent apps processes    运行中/缓存中用户应用\r\n")
+            append("\r\n")
+            append("别名: app / 应用；processes 也可写作 running / 进程 / 运行。\r\n")
+            append("\r\n")
+        }
+    }
+
+    private fun formatInstalledApps(apps: List<AppListQuery.InstalledApp>): String {
+        if (apps.isEmpty()) {
+            return "\r\n📦 未找到已安装用户应用。\r\n\r\n"
+        }
+
+        return buildString {
+            append("\r\n")
+            append("📦 已安装用户应用\r\n")
+            append("═══════════════════════════════════════\r\n")
+            apps.forEachIndexed { index, app ->
+                append("[${index + 1}] ${app.label}\r\n")
+                append("    包名: ${app.packageName}\r\n")
+                append("    版本: ${app.versionName}\r\n")
+                append("    UID : ${app.uid}\r\n")
+                append("    应用: ${formatBytes(app.appBytes)}\r\n")
+                append("    数据: ${formatBytes(app.dataBytes)}\r\n")
+                append("───────────────────────────────────────\r\n")
+            }
+            append("共 ${apps.size} 个用户应用\r\n")
+            append("\r\n")
+        }
+    }
+
+    private suspend fun executeAppProcesses(): String {
+        if (!ConfigStore.getRootMode(context)) {
+            Logger.i("AgentCommandHandler: 跳过用户应用进程查询，Root/Shizuku 模式未开启")
+            return buildString {
+                append("\r\n")
+                append("⚠️ 应用进程查询需要 Root/Shizuku 模式\r\n")
+                append("请在设置中开启 Root / Shizuku 模式并确认授权后重试。\r\n")
+                append("\r\n")
+            }
+        }
+
+        return when (val result = appListQuery.getUserAppProcesses()) {
+            is AppListQuery.ProcessQueryResult.Success -> formatAppProcesses(result.processes)
+            is AppListQuery.ProcessQueryResult.Failure -> buildString {
+                append("\r\n")
+                append("❌ 应用进程查询失败\r\n")
+                append("原因: ${result.reason}\r\n")
+                append("请确认 Root/Shizuku Shell 可用后重试。\r\n")
+                append("\r\n")
+            }
+        }
+    }
+
+    private fun formatAppProcesses(processes: List<AppListQuery.UserAppProcess>): String {
+        if (processes.isEmpty()) {
+            return "\r\n📦 当前未找到运行中或缓存中的用户应用。\r\n\r\n"
+        }
+
+        val runningCount = processes.count { it.state == AppListQuery.ProcessState.RUNNING }
+        val cachedCount = processes.size - runningCount
+
+        return buildString {
+            append("\r\n")
+            append("📦 用户应用进程\r\n")
+            append("═══════════════════════════════════════\r\n")
+            processes.forEachIndexed { index, process ->
+                val app = process.app
+                append("[${index + 1}] [${process.state.label}] ${app.label}\r\n")
+                append("    包名: ${app.packageName}\r\n")
+                append("    版本: ${app.versionName}\r\n")
+                append("    UID : ${app.uid}\r\n")
+                append("    进程内存(PSS): ${formatGigabytes(process.memoryBytes)}\r\n")
+                append("───────────────────────────────────────\r\n")
+            }
+            append("运行中 $runningCount 个，缓存中 $cachedCount 个，共 ${processes.size} 个用户应用\r\n")
             append("\r\n")
         }
     }
@@ -308,6 +418,23 @@ class AgentCommandHandler(private val context: Context) {
         return "'" + input.replace("'", "'\\''") + "'"
     }
 
+    private fun formatBytes(bytes: Long?): String {
+        bytes ?: return "未知"
+        val safeBytes = bytes.coerceAtLeast(0L)
+        val unit = 1024.0
+        return when {
+            safeBytes >= GIB -> String.format(Locale.US, "%.2f GB", safeBytes / unit / unit / unit)
+            safeBytes >= MIB -> String.format(Locale.US, "%.2f MB", safeBytes / unit / unit)
+            safeBytes >= KIB -> String.format(Locale.US, "%.2f KB", safeBytes / unit)
+            else -> "$safeBytes B"
+        }
+    }
+
+    private fun formatGigabytes(bytes: Long?): String {
+        bytes ?: return "未知"
+        return String.format(Locale.US, "%.3f GB", bytes.coerceAtLeast(0L).toDouble() / GIB)
+    }
+
     private sealed class ShellScreenshotResult {
         data class Success(val path: String, val bytes: Long) : ShellScreenshotResult()
         data class Failure(val reason: String) : ShellScreenshotResult()
@@ -316,6 +443,9 @@ class AgentCommandHandler(private val context: Context) {
     private companion object {
         const val SHELL_SUCCESS_MARKER = "__NEZHA_SCREENSHOT_OK__:"
         const val SHELL_FAILURE_MARKER = "__NEZHA_SCREENSHOT_FAIL__:"
+        const val KIB = 1024L
+        const val MIB = 1024L * KIB
+        const val GIB = 1024L * MIB
 
         val screenshotDateFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
     }

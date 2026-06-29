@@ -35,6 +35,10 @@
     <uses-permission android:name="android.permission.BATTERY_STATS" tools:ignore="ProtectedPermissions"/>
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions"/>
 
+    <!-- 查询已安装用户应用（虚拟指令 @agent apps 使用，Android 11+ 受包可见性限制） -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
     <!-- 短信读取（虚拟指令 @agent sms 使用，需要用户手动授权） -->
     <uses-permission android:name="android.permission.READ_SMS" />
 

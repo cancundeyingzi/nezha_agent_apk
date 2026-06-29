@@ -1465,7 +1465,7 @@ fun ConfigScreenContent(
                     )
                 },
                 modifier = Modifier.weight(1f)
-            ) { Text("▶ 启动探针", fontWeight = FontWeight.Bold) }
+            ) { Text("启动探针", fontWeight = FontWeight.Bold) }
 
             GlassButtonSecondary(
                 onClick = { vm.stopAgent() },
