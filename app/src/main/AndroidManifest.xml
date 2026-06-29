@@ -8,6 +8,9 @@
         Shizuku Provider 库本身已支持 minSdk=23。
     -->
     <uses-sdk tools:overrideLibrary="rikka.shizuku.api" />
+    <uses-feature
+        android:name="android.hardware.telephony"
+        android:required="false" />
 
     <!-- 网络访问 -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -43,7 +46,8 @@
     <uses-permission android:name="android.permission.READ_SMS" />
 
     <!-- VPN 流量计量（本地透传 VPN，仅计量不拦截，作为网络统计的最后降级策略） -->
-    <uses-permission android:name="android.permission.BIND_VPN_SERVICE" />
+    <uses-permission android:name="android.permission.BIND_VPN_SERVICE"
+        tools:ignore="ProtectedPermissions" />
 
     <!--
         文件管理器完整访问权限（TaskType 11 / 文件浏览/下载/上传）。
