@@ -18,11 +18,17 @@ import com.nezhahq.agent.collector.SystemStateCollector
 import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.grpc.GrpcManager
 import com.nezhahq.agent.service.AgentService
+import com.nezhahq.agent.simulator.GrpcSimulatedDeviceReporter
+import com.nezhahq.agent.simulator.SimulatedDeviceConfig
+import com.nezhahq.agent.simulator.SimulatedDeviceLoop
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.RootShell
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
@@ -101,6 +107,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var enableVpnTraffic by mutableStateOf(ConfigStore.getEnableVpnTraffic(application))
     /** [安全修复] 远程命令执行独立开关（与 Root/Shizuku 模式解耦） */
     var enableRemoteCommand by mutableStateOf(ConfigStore.getEnableRemoteCommand(application))
+
+    // ── 娱乐模拟设备上报 ──
+    var simulatorServer by mutableStateOf(ConfigStore.getSimulatorServer(application))
+    var simulatorPort by mutableStateOf(ConfigStore.getSimulatorPort(application).toString())
+    var simulatorSecret by mutableStateOf(ConfigStore.getSimulatorSecret(application))
+    var simulatorUseTls by mutableStateOf(ConfigStore.getSimulatorUseTls(application))
+    var simulatorThreadCount by mutableStateOf(ConfigStore.getSimulatorThreadCount(application).toString())
+
+    var simulatorRunning by mutableStateOf(false)
+        private set
+    var simulatorSuccessCount by mutableStateOf(0)
+        private set
+    var simulatorFailureCount by mutableStateOf(0)
+        private set
+    var simulatorActiveThreadCount by mutableStateOf(0)
+        private set
+    var simulatorLastStatus by mutableStateOf("未启动")
+        private set
+
+    private var simulatorJob: Job? = null
+    private val simulatorLoop = SimulatedDeviceLoop(GrpcSimulatedDeviceReporter())
 
     /** 首次启动自启动授权弹窗 */
     var showAutoStartPrompt by mutableStateOf(false)
@@ -317,6 +344,95 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val intent = Intent(ctx, AgentService::class.java)
         ctx.stopService(intent)
         Toast.makeText(ctx, "后台探针服务已停止", Toast.LENGTH_SHORT).show()
+    }
+
+    fun startSimulator() {
+        if (simulatorRunning) return
+
+        val ctx = getApplication<Application>()
+        val trimmedServer = simulatorServer.trim()
+        val trimmedSecret = simulatorSecret.trim()
+        val validationError = SimulatedDeviceConfig.validationError(
+            server = trimmedServer,
+            portText = simulatorPort,
+            secret = trimmedSecret,
+            threadCountText = simulatorThreadCount
+        )
+        if (validationError != null) {
+            Toast.makeText(ctx, validationError, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val parsedPort = simulatorPort.trim().toInt()
+        val parsedThreadCount = simulatorThreadCount.trim().toInt()
+        simulatorServer = trimmedServer
+        simulatorPort = parsedPort.toString()
+        simulatorSecret = trimmedSecret
+        simulatorThreadCount = parsedThreadCount.toString()
+        ConfigStore.saveSimulatorConfig(
+            ctx,
+            server = trimmedServer,
+            port = parsedPort,
+            secret = trimmedSecret,
+            useTls = simulatorUseTls,
+            threadCount = parsedThreadCount
+        )
+
+        val config = SimulatedDeviceConfig(
+            server = trimmedServer,
+            port = parsedPort,
+            secret = trimmedSecret,
+            useTls = simulatorUseTls,
+            threadCount = parsedThreadCount
+        )
+        simulatorRunning = true
+        simulatorSuccessCount = 0
+        simulatorFailureCount = 0
+        simulatorActiveThreadCount = parsedThreadCount
+        simulatorLastStatus = "模拟器已开启，$parsedThreadCount 个并发线程正在上报随机设备..."
+        simulatorJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                simulatorLoop.run(
+                    config = config,
+                    shouldContinue = { isActive },
+                    onSuccess = {
+                        withContext(Dispatchers.Main) {
+                            simulatorSuccessCount += 1
+                            simulatorLastStatus =
+                                "上次成功：第 $simulatorSuccessCount 台设备已收到状态回执"
+                        }
+                    },
+                    onFailure = { throwable ->
+                        withContext(Dispatchers.Main) {
+                            simulatorFailureCount += 1
+                            simulatorLastStatus =
+                                "上次失败：${throwable.toSimulatorMessage()}"
+                        }
+                    }
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (throwable: Throwable) {
+                withContext(Dispatchers.Main) {
+                    simulatorRunning = false
+                    simulatorLastStatus = "模拟器异常停止：${throwable.toSimulatorMessage()}"
+                }
+            }
+        }
+        Toast.makeText(ctx, "娱乐模拟设备已开启", Toast.LENGTH_SHORT).show()
+    }
+
+    fun stopSimulator() {
+        if (!simulatorRunning && simulatorJob == null) {
+            Toast.makeText(getApplication(), "娱乐模拟设备未开启", Toast.LENGTH_SHORT).show()
+            return
+        }
+        simulatorJob?.cancel()
+        simulatorJob = null
+        simulatorRunning = false
+        simulatorLastStatus =
+            "模拟器已停止，本次会话成功 $simulatorSuccessCount 台，失败 $simulatorFailureCount 台"
+        Toast.makeText(getApplication(), "娱乐模拟设备已关闭", Toast.LENGTH_SHORT).show()
     }
 
     fun onUseTlsChanged(enabled: Boolean) {
@@ -543,9 +659,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    override fun onCleared() {
+        simulatorJob?.cancel()
+        simulatorJob = null
+        super.onCleared()
+    }
+
 }
 
 internal fun redactUuidForLog(value: String): String {
     if (value.isBlank()) return "(empty)"
     return if (value.length <= 8) "***" else "${value.take(4)}...${value.takeLast(4)}"
+}
+
+private fun Throwable.toSimulatorMessage(): String {
+    val message = generateSequence(this) { it.cause }
+        .mapNotNull { it.message?.takeIf(String::isNotBlank) }
+        .firstOrNull()
+        ?: this::class.java.simpleName
+    return message.replace('\n', ' ').take(120)
 }

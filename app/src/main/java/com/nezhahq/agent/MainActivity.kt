@@ -33,6 +33,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
@@ -53,6 +54,7 @@ import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
@@ -65,6 +67,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nezhahq.agent.grpc.GrpcConnectionState
+import com.nezhahq.agent.simulator.SimulatedDeviceConfig
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -297,7 +300,8 @@ private fun EtherTextField(
     onValueChange: (String) -> Unit,
     label: String,
     modifier: Modifier = Modifier,
-    maxLines: Int = 1
+    maxLines: Int = 1,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default
 ) {
     Column(modifier = modifier) {
         // 输入容器（保留 label 语义以支持 TalkBack 无障碍朗读）
@@ -310,6 +314,7 @@ private fun EtherTextField(
                 .etherShadow(elevation = 2.dp, shape = LgControlShape),
             shape = LgControlShape,
             maxLines = maxLines,
+            keyboardOptions = keyboardOptions,
             textStyle = TextStyle(
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Medium,
@@ -895,6 +900,113 @@ fun ToolsScreenContent(vm: MainViewModel) {
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         Text("工具与设置", style = MaterialTheme.typography.headlineMedium)
+
+        // ══════════════════════════════════════════════════════════════════
+        // 娱乐模拟设备
+        // ══════════════════════════════════════════════════════════════════
+        EtherCard {
+            Text("娱乐模拟设备", style = MaterialTheme.typography.titleMedium)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                "每个线程每秒上报一台随机设备，收到状态回执后立即断开。",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+
+            EtherTextField(
+                value = vm.simulatorServer,
+                onValueChange = { vm.simulatorServer = it },
+                label = "模拟器服务端 IP 或域名",
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            EtherTextField(
+                value = vm.simulatorPort,
+                onValueChange = { vm.simulatorPort = it },
+                label = "模拟器 gRPC 端口",
+                modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            EtherTextField(
+                value = vm.simulatorSecret,
+                onValueChange = { vm.simulatorSecret = it },
+                label = "模拟器客户端密钥 (Secret)",
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            EtherTextField(
+                value = vm.simulatorThreadCount,
+                onValueChange = { vm.simulatorThreadCount = it },
+                label = "模拟器并发线程数 (1-${SimulatedDeviceConfig.MAX_THREAD_COUNT})",
+                modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            EtherToggleRow(
+                checked = vm.simulatorUseTls,
+                onCheckedChange = { vm.simulatorUseTls = it },
+                title = "使用 TLS 加密连接",
+                description = "仅影响娱乐模拟设备，不会修改真实探针连接配置",
+                highlightWhenChecked = false
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(SmoothCornerShape(16.dp))
+                    .background(
+                        if (vm.simulatorRunning) LgSuccess.copy(alpha = 0.08f)
+                        else LgSurfaceContainerLow.copy(alpha = 0.7f)
+                    )
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+            ) {
+                val displayedThreadCount = if (vm.simulatorRunning && vm.simulatorActiveThreadCount > 0) {
+                    vm.simulatorActiveThreadCount
+                } else {
+                    vm.simulatorThreadCount
+                        .trim()
+                        .toIntOrNull()
+                        ?.coerceIn(1, SimulatedDeviceConfig.MAX_THREAD_COUNT)
+                        ?: SimulatedDeviceConfig.DEFAULT_THREAD_COUNT
+                }
+                Text(
+                    text = if (vm.simulatorRunning) {
+                        "运行中 · 并发 $displayedThreadCount · " +
+                                "成功 ${vm.simulatorSuccessCount} 台 · " +
+                                "失败 ${vm.simulatorFailureCount} 台"
+                    } else {
+                        "未运行 · 配置并发 $displayedThreadCount · " +
+                                "成功 ${vm.simulatorSuccessCount} 台 · " +
+                                "失败 ${vm.simulatorFailureCount} 台"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = if (vm.simulatorRunning) LgSuccess else LgOnSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = vm.simulatorLastStatus,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LgOnSurfaceVariant
+                )
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                GlassButtonPrimary(
+                    onClick = { vm.startSimulator() },
+                    modifier = Modifier.weight(1f),
+                    enabled = !vm.simulatorRunning
+                ) { Text("开启", fontWeight = FontWeight.Bold) }
+                GlassButtonSecondary(
+                    onClick = { vm.stopSimulator() },
+                    modifier = Modifier.weight(1f)
+                ) { Text("关闭", fontWeight = FontWeight.Bold) }
+            }
+        }
 
         // ══════════════════════════════════════════════════════════════════
         // 权限状态总览卡片

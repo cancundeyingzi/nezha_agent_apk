@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import com.nezhahq.agent.simulator.SimulatedDeviceConfig
 
 object ConfigStore {
 
@@ -132,6 +133,51 @@ object ConfigStore {
     fun getEnableVpnTraffic(context: Context): Boolean = getEncryptedPrefs(context).getBoolean("enable_vpn_traffic", false)
     fun getEnableAutoStart(context: Context): Boolean = getEncryptedPrefs(context).getBoolean("enable_auto_start", false)
     fun getHasShownAutoStartPrompt(context: Context): Boolean = getEncryptedPrefs(context).getBoolean("has_shown_auto_start_prompt", false)
+    fun hasSimulatorConfig(context: Context): Boolean =
+        getEncryptedPrefs(context).contains("simulator_server")
+
+    fun getSimulatorServer(context: Context): String {
+        val prefs = getEncryptedPrefs(context)
+        return if (prefs.contains("simulator_server")) {
+            prefs.getString("simulator_server", "") ?: ""
+        } else {
+            getServer(context)
+        }
+    }
+
+    fun getSimulatorPort(context: Context): Int {
+        val prefs = getEncryptedPrefs(context)
+        return if (prefs.contains("simulator_port")) {
+            prefs.getInt("simulator_port", 5555)
+        } else {
+            getPort(context)
+        }
+    }
+
+    fun getSimulatorSecret(context: Context): String {
+        val prefs = getEncryptedPrefs(context)
+        return if (prefs.contains("simulator_secret")) {
+            prefs.getString("simulator_secret", "") ?: ""
+        } else {
+            getSecret(context)
+        }
+    }
+
+    fun getSimulatorUseTls(context: Context): Boolean {
+        val prefs = getEncryptedPrefs(context)
+        return if (prefs.contains("simulator_use_tls")) {
+            prefs.getBoolean("simulator_use_tls", true)
+        } else {
+            getUseTls(context)
+        }
+    }
+
+    fun getSimulatorThreadCount(context: Context): Int {
+        val prefs = getEncryptedPrefs(context)
+        return prefs
+            .getInt("simulator_thread_count", SimulatedDeviceConfig.DEFAULT_THREAD_COUNT)
+            .coerceIn(1, SimulatedDeviceConfig.MAX_THREAD_COUNT)
+    }
 
     fun setEnableAutoStart(context: Context, enable: Boolean) {
         getEncryptedPrefs(context).edit().putBoolean("enable_auto_start", enable).apply()
@@ -139,6 +185,27 @@ object ConfigStore {
 
     fun setHasShownAutoStartPrompt(context: Context, shown: Boolean) {
         getEncryptedPrefs(context).edit().putBoolean("has_shown_auto_start_prompt", shown).apply()
+    }
+
+    fun saveSimulatorConfig(
+        context: Context,
+        server: String,
+        port: Int,
+        secret: String,
+        useTls: Boolean,
+        threadCount: Int
+    ) {
+        getEncryptedPrefs(context).edit().apply {
+            putString("simulator_server", server)
+            putInt("simulator_port", port)
+            putString("simulator_secret", secret)
+            putBoolean("simulator_use_tls", useTls)
+            putInt(
+                "simulator_thread_count",
+                threadCount.coerceIn(1, SimulatedDeviceConfig.MAX_THREAD_COUNT)
+            )
+            apply()
+        }
     }
 
     /** 悬浮窗开关 — 独立保存，不受 saveConfig 全量覆写影响 */

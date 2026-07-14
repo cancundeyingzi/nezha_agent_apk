@@ -4,17 +4,10 @@ import android.content.Context
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
 import io.grpc.ManagedChannel
-import io.grpc.okhttp.OkHttpChannelBuilder
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import proto.NezhaServiceGrpcKt.NezhaServiceCoroutineStub
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
-import java.util.concurrent.TimeUnit
-import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
 
 /**
  * gRPC 连接状态，用于驱动 UI 和前台服务通知。
@@ -97,48 +90,29 @@ object GrpcManager {
             currentTransportMode = transportMode
             shutdownLocked(preserveConnectionState = true)
 
-            val builder = OkHttpChannelBuilder.forAddress(server, port)
             when (transportMode) {
                 GrpcTransportMode.TLS -> {
-                    if (!configureTls(builder)) {
-                        stub = null
-                        return
-                    }
                     Logger.i("Grpc: 使用 TLS 加密连接 $server:$port")
                 }
                 GrpcTransportMode.PLAINTEXT -> {
-                    builder.usePlaintext()
                     Logger.i("Grpc: 使用显式明文连接 $server:$port")
                 }
             }
 
-            val newChannel = builder
-                .keepAliveTime(10, TimeUnit.SECONDS)
-                .keepAliveTimeout(5, TimeUnit.SECONDS)
-                .keepAliveWithoutCalls(true)
-                .intercept(AuthInterceptor(secret, uuid))
-                .build()
+            val newChannel = try {
+                GrpcChannelFactory.create(server, port, secret, uuid, transportMode)
+            } catch (e: Exception) {
+                if (transportMode == GrpcTransportMode.TLS) {
+                    Logger.e("Grpc: TLS 初始化失败，将保持 TLS 模式重试，禁止自动明文降级", e)
+                } else {
+                    Logger.e("Grpc: 明文通道初始化失败", e)
+                }
+                stub = null
+                return
+            }
 
             channel = newChannel
             stub = NezhaServiceCoroutineStub(newChannel)
-        }
-    }
-
-    private fun configureTls(builder: OkHttpChannelBuilder): Boolean {
-        return try {
-            builder.useTransportSecurity()
-            val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
-                override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
-                override fun checkClientTrusted(certs: Array<X509Certificate>, authType: String) {}
-                override fun checkServerTrusted(certs: Array<X509Certificate>, authType: String) {}
-            })
-            val sslContext = SSLContext.getInstance("TLS")
-            sslContext.init(null, trustAllCerts, SecureRandom())
-            builder.sslSocketFactory(sslContext.socketFactory)
-            true
-        } catch (e: Exception) {
-            Logger.e("Grpc: TLS 初始化失败，将保持 TLS 模式重试，禁止自动明文降级", e)
-            false
         }
     }
 
