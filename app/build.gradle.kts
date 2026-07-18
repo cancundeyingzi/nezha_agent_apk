@@ -12,8 +12,8 @@ android {
         applicationId = "com.nezhahq.agent"
         minSdk = 23
         targetSdk = 34
-        versionCode = 376
-        versionName = "A0.9.11"
+        versionCode = 378
+        versionName = "A0.9.12"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -72,7 +72,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     
-    // Security for EncryptedSharedPreferences
+    // Read-only migration from the legacy EncryptedSharedPreferences store.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     // OKHTTP for Trace and Tasks

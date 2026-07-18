@@ -1011,7 +1011,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 GlassButtonPrimary(
                     onClick = { vm.startSimulator() },
                     modifier = Modifier.weight(1f),
-                    enabled = !vm.simulatorRunning && vm.isSecureStorageAvailable &&
+                    enabled = !vm.simulatorRunning && vm.isConfigStorageAvailable &&
                         !vm.isConfigWriteInProgress
                 ) { Text("开启", fontWeight = FontWeight.Bold) }
                 GlassButtonSecondary(
@@ -1038,7 +1038,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 PermissionStatusRow(
                     item = item,
                     actionEnabled = item.key != "auto_start" ||
-                        (vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress),
+                        (vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress),
                     onAction = {
                         // 根据权限类型执行不同的授权动作
                         when (item.key) {
@@ -1125,7 +1125,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 onCheckedChange = vm::setKeepAliveAudio,
                 title = "允许后台播放微弱音频",
                 description = "发送极其微弱的次声波骗过部分系统的静音检测，防止杀后台（需重启服务生效）",
-                enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
+                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
             )
 
             // 悬浮窗
@@ -1134,7 +1134,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 onCheckedChange = vm::setFloatWindow,
                 title = "开启像素级透明悬浮窗",
                 description = "创建一个1x1不可见的悬浮窗来拉高进程优先级（需授予悬浮窗权限并重启服务生效）",
-                enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
+                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
             )
 
             // 开机自启动
@@ -1145,7 +1145,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 },
                 title = "开机自启动",
                 description = "设备重启后自动恢复探针后台服务，建议开启以防失联",
-                enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
+                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
             )
         }
 
@@ -1168,7 +1168,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 Row(verticalAlignment = Alignment.Top) {
                     EtherSwitch(
                         checked = vm.enableVpnTraffic,
-                        enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress,
+                        enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress,
                         onCheckedChange = { newValue ->
                             if (newValue) {
                                 val prepareIntent = VpnService.prepare(vpnContext)
@@ -1380,7 +1380,7 @@ fun ConfigScreenContent(
             )
         }
 
-        if (!vm.isSecureStorageAvailable) {
+        if (!vm.isConfigStorageAvailable) {
             EtherCard(
                 modifier = Modifier.border(
                     width = 2.dp,
@@ -1389,24 +1389,24 @@ fun ConfigScreenContent(
                 )
             ) {
                 Text(
-                    "安全配置存储不可用",
+                    "配置存储不可用",
                     style = MaterialTheme.typography.titleMedium,
                     color = LgError
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     vm.storageErrorMessage
-                        ?: "安全配置存储不可用，凭据不会写入；请重置安全配置",
+                        ?: "配置存储不可用，连接信息不会写入；请重置配置存储",
                     style = MaterialTheme.typography.bodyMedium,
                     color = LgError
                 )
                 Spacer(modifier = Modifier.height(12.dp))
                 GlassButtonPrimary(
-                    onClick = { vm.resetSecureStorage() },
+                    onClick = { vm.resetConfigurationStorage() },
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = !vm.isResettingSecureStorage
+                    enabled = !vm.isResettingConfigStorage
                 ) {
-                    if (vm.isResettingSecureStorage) {
+                    if (vm.isResettingConfigStorage) {
                         CircularProgressIndicator(
                             modifier = Modifier.size(16.dp),
                             strokeWidth = 2.dp,
@@ -1415,11 +1415,11 @@ fun ConfigScreenContent(
                         Spacer(modifier = Modifier.width(8.dp))
                         Text("正在重置...", fontWeight = FontWeight.Bold)
                     } else {
-                        Text("重置安全配置", fontWeight = FontWeight.Bold)
+                        Text("重置配置存储", fontWeight = FontWeight.Bold)
                     }
                 }
             }
-        } else if (vm.storageStatus == StorageStatus.RECOVERED) {
+        } else if (vm.storageStatus == StorageStatus.LEGACY_UNREADABLE) {
             EtherCard(
                 modifier = Modifier.border(
                     width = 1.dp,
@@ -1428,7 +1428,7 @@ fun ConfigScreenContent(
                 )
             ) {
                 Text(
-                    "安全配置存储已自动修复，请核对并重新保存连接配置。",
+                    "旧加密配置无法读取，已改用明文兼容存储。请核对并保存连接配置；此后重启不再依赖系统密钥库。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = LgWarning
                 )
@@ -1520,7 +1520,7 @@ fun ConfigScreenContent(
                         )
                     },
                     modifier = Modifier.weight(1f),
-                    enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
+                    enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
                 ) {
                     Text("启动探针", fontWeight = FontWeight.Bold)
                 }
@@ -1537,6 +1537,12 @@ fun ConfigScreenContent(
         // ── 连接设置 ──
         EtherCard {
             Text("连接设置", style = MaterialTheme.typography.titleMedium)
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                "连接信息按原版兼容方式明文保存在应用私有目录；Root 或同等高权限程序可以读取密钥。",
+                style = MaterialTheme.typography.bodySmall,
+                color = LgWarning
+            )
             Spacer(modifier = Modifier.height(12.dp))
 
             EtherTextField(
@@ -1621,7 +1627,7 @@ fun ConfigScreenContent(
                 },
                 title = "允许面板远程执行命令",
                 description = "允许面板通过 TaskType 4 在本设备上执行 sh -c 命令（需重启服务生效）",
-                enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
+                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
             )
             if (vm.enableRemoteCommand) {
                 Text(

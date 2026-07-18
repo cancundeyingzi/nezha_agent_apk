@@ -88,12 +88,12 @@ class AgentService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        // Enter foreground before any potentially slow KeyStore/EncryptedSharedPreferences IO.
-        // This notification-only step does not start agent business work.
-        startAgentForeground("正在验证安全配置...")
+        // Enter foreground before configuration IO. This notification-only step does not start
+        // agent business work.
+        startAgentForeground("正在读取连接配置...")
         val storageStatus = ConfigStore.initialize(this)
         if (storageStatus == StorageStatus.UNAVAILABLE) {
-            val reason = "安全配置存储不可用，探针服务已停止"
+            val reason = "配置存储不可用，探针服务已停止"
             updateNotification(reason)
             Logger.e("AgentService: $reason；未启动音频、悬浮窗、网络、gRPC 或 VPN")
             stopSelf()
@@ -104,7 +104,7 @@ class AgentService : Service() {
         val floatWindowEnabled = ConfigStore.getEnableFloatWindow(this)
         val vpnEnabled = ConfigStore.getEnableVpnTraffic(this)
         if (ConfigStore.initialize(this) == StorageStatus.UNAVAILABLE) {
-            val reason = "读取安全配置失败，探针服务已停止"
+            val reason = "读取连接配置失败，探针服务已停止"
             updateNotification(reason)
             Logger.e("AgentService: $reason；未启动音频、悬浮窗、网络、gRPC 或 VPN")
             stopSelf()
@@ -115,9 +115,9 @@ class AgentService : Service() {
         Logger.i("Service started, configuring Grpc...")
         GrpcManager.initialize(this)
         if (ConfigStore.initialize(this) == StorageStatus.UNAVAILABLE) {
-            Logger.e("AgentService: gRPC 初始化期间安全配置失效，停止服务且不启动保活或网络任务")
+            Logger.e("AgentService: gRPC 初始化期间配置存储失效，停止服务且不启动保活或网络任务")
             GrpcManager.shutdown()
-            updateNotification("安全配置读取失败，服务已停止")
+            updateNotification("连接配置读取失败，服务已停止")
             stopSelf()
             return
         }

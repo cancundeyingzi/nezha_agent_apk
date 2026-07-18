@@ -76,7 +76,7 @@ object GrpcManager {
 
     fun initialize(context: Context) {
         if (ConfigStore.initialize(context) == StorageStatus.UNAVAILABLE) {
-            Logger.e("Grpc: 安全配置存储不可用，拒绝初始化连接通道")
+            Logger.e("Grpc: 配置存储不可用，拒绝初始化连接通道")
             shutdown()
             return
         }
@@ -87,7 +87,7 @@ object GrpcManager {
         val transportMode = resolveTransportMode(ConfigStore.getUseTls(context))
 
         if (ConfigStore.initialize(context) == StorageStatus.UNAVAILABLE) {
-            Logger.e("Grpc: 读取安全配置失败，拒绝初始化连接通道")
+            Logger.e("Grpc: 读取连接配置失败，拒绝初始化连接通道")
             shutdown()
             return
         }

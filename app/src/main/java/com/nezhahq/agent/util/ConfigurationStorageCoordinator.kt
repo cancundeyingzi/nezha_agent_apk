@@ -2,31 +2,43 @@ package com.nezhahq.agent.util
 
 import java.io.File
 
-/** Current availability of the encrypted configuration store. */
+/** Current availability of the app-private, plaintext configuration store. */
 enum class StorageStatus {
     READY,
-    RECOVERED,
+
+    /**
+     * Plaintext storage is usable, but the one-time import from the old encrypted store could not
+     * be read. Existing plaintext fallback values remain available and no legacy data is deleted.
+     */
+    LEGACY_UNREADABLE,
     UNAVAILABLE
 }
 
-/**
- * Platform operations used by [SecureStorageCoordinator].
- *
- * Keeping the lifecycle policy here, rather than in Android framework calls, makes the exact
- * recovery/reset behavior deterministic and unit-testable.
- */
-internal interface SecureStorageOperations<T> {
-    fun createEncryptedStorage(): T
-    fun clearEncryptedStorage(): Boolean
-    fun clearLegacyFallback(): Boolean
-    fun clearMasterKey(): Boolean
-    fun migrateLegacyFallback(storage: T): Boolean
-    fun isStorageEmpty(storage: T): Boolean
+internal enum class LegacyImportResult {
+    COMPLETED,
+    UNREADABLE,
+    FAILED
 }
 
-/** Thread-safe, single-attempt lifecycle and fail-closed access policy for secure storage. */
-internal class SecureStorageCoordinator<T>(
-    private val operations: SecureStorageOperations<T>
+/** Platform operations used by [ConfigurationStorageCoordinator]. */
+internal interface ConfigurationStorageOperations<T> {
+    fun openPlainStorage(): T
+    fun isMigrationComplete(storage: T): Boolean
+    fun importLegacyEncryptedStorage(storage: T): LegacyImportResult
+    fun resetPlainStorage(): T
+    fun isResetStorage(storage: T): Boolean
+}
+
+/**
+ * Thread-safe lifecycle for the traditional app-private configuration store.
+ *
+ * The old encrypted preferences are treated only as a non-destructive migration source. If the
+ * Android Keystore cannot decrypt them, the live plaintext store is still exposed and the source
+ * is left untouched. This avoids the old recovery cycle that deleted ciphertext before it could
+ * know whether any configuration had survived elsewhere.
+ */
+internal class ConfigurationStorageCoordinator<T>(
+    private val operations: ConfigurationStorageOperations<T>
 ) {
     private val lock = Any()
     private var status: StorageStatus? = null
@@ -35,21 +47,32 @@ internal class SecureStorageCoordinator<T>(
     fun initialize(): StorageStatus = synchronized(lock) {
         status?.let { return@synchronized it }
 
-        val initialStorage = createStorageOrNull()
-        if (initialStorage != null) {
-            return@synchronized finishInitialization(initialStorage, StorageStatus.READY)
-        }
-
-        // A failed first creation gets one, and only one, automatic repair attempt.
-        val encryptedCleared = safely { operations.clearEncryptedStorage() }
-        val masterKeyCleared = safely { operations.clearMasterKey() }
-        if (!encryptedCleared || !masterKeyCleared) {
+        val plainStorage = try {
+            operations.openPlainStorage()
+        } catch (_: Exception) {
             return@synchronized becomeUnavailable()
         }
 
-        val recoveredStorage = createStorageOrNull()
-            ?: return@synchronized becomeUnavailable()
-        finishInitialization(recoveredStorage, StorageStatus.RECOVERED)
+        val migrationComplete = try {
+            operations.isMigrationComplete(plainStorage)
+        } catch (_: Exception) {
+            return@synchronized becomeUnavailable()
+        }
+
+        if (migrationComplete) {
+            return@synchronized activate(plainStorage, StorageStatus.READY)
+        }
+
+        when (try {
+            operations.importLegacyEncryptedStorage(plainStorage)
+        } catch (_: Exception) {
+            LegacyImportResult.FAILED
+        }) {
+            LegacyImportResult.COMPLETED -> activate(plainStorage, StorageStatus.READY)
+            LegacyImportResult.UNREADABLE ->
+                activate(plainStorage, StorageStatus.LEGACY_UNREADABLE)
+            LegacyImportResult.FAILED -> becomeUnavailable()
+        }
     }
 
     fun currentStatus(): StorageStatus = synchronized(lock) {
@@ -73,59 +96,46 @@ internal class SecureStorageCoordinator<T>(
         } catch (_: Exception) {
             false
         }
-        if (!persisted) becomeUnavailable()
+        if (persisted) {
+            // Every live write also records the migration marker, so an unreadable legacy source
+            // is never retried after the user has saved authoritative plaintext configuration.
+            status = StorageStatus.READY
+        } else {
+            becomeUnavailable()
+        }
         persisted
     }
 
-    /**
-     * Removes every historical storage source and creates a new, verified-empty encrypted store.
-     * Every cleanup operation runs even if another one fails, so a later user retry has the best
-     * chance of succeeding.
-     */
+    /** Deletes live configuration and recreates a verified-empty plaintext store. */
     fun reset(): Boolean = synchronized(lock) {
         becomeUnavailable()
 
-        val encryptedCleared = safely { operations.clearEncryptedStorage() }
-        val fallbackCleared = safely { operations.clearLegacyFallback() }
-        val masterKeyCleared = safely { operations.clearMasterKey() }
-        if (!encryptedCleared || !fallbackCleared || !masterKeyCleared) {
+        val newStorage = try {
+            operations.resetPlainStorage()
+        } catch (_: Exception) {
             return@synchronized false
         }
+        val resetVerified = try {
+            operations.isResetStorage(newStorage)
+        } catch (_: Exception) {
+            false
+        }
+        if (!resetVerified) return@synchronized false
 
-        val newStorage = createStorageOrNull() ?: return@synchronized false
-        val isEmpty = safely { operations.isStorageEmpty(newStorage) }
-        if (!isEmpty) return@synchronized false
-
-        storage = newStorage
-        status = StorageStatus.READY
+        activate(newStorage, StorageStatus.READY)
         true
     }
 
-    private fun finishInitialization(candidate: T, successStatus: StorageStatus): StorageStatus {
-        if (!safely { operations.migrateLegacyFallback(candidate) }) {
-            return becomeUnavailable()
-        }
+    private fun activate(candidate: T, newStatus: StorageStatus): StorageStatus {
         storage = candidate
-        status = successStatus
-        return successStatus
-    }
-
-    private fun createStorageOrNull(): T? = try {
-        operations.createEncryptedStorage()
-    } catch (_: Exception) {
-        null
+        status = newStatus
+        return newStatus
     }
 
     private fun becomeUnavailable(): StorageStatus {
         storage = null
         status = StorageStatus.UNAVAILABLE
         return StorageStatus.UNAVAILABLE
-    }
-
-    private inline fun safely(block: () -> Boolean): Boolean = try {
-        block()
-    } catch (_: Exception) {
-        false
     }
 }
 
@@ -139,27 +149,20 @@ internal interface PreferenceValueEditor {
     fun commit(): Boolean
 }
 
-internal interface LegacyPreferenceOperations {
-    fun legacyStorageExists(): Boolean
-    fun readLegacyValues(): Map<String, Any?>
-    fun encryptedContains(key: String): Boolean
-    fun encryptedEditor(): PreferenceValueEditor
-    fun clearLegacyValues(): Boolean
-    fun deleteLegacyStorage(): Boolean
+internal interface PreferenceImportOperations {
+    fun targetContains(key: String): Boolean
+    fun targetEditor(): PreferenceValueEditor
 }
 
-/** Copies legacy values in one encrypted commit, then removes the plaintext source. */
-internal class LegacyPreferencesMigrator(
-    private val operations: LegacyPreferenceOperations
+/** Copies supported values without overwriting values already saved in the plaintext target. */
+internal class PreferenceValuesImporter(
+    private val operations: PreferenceImportOperations
 ) {
-    fun migrate(): Boolean {
+    fun importMissing(values: Map<String, Any?>): Boolean {
         return try {
-            if (!operations.legacyStorageExists()) return true
-
-            val values = operations.readLegacyValues()
-            val editor = operations.encryptedEditor()
+            val editor = operations.targetEditor()
             for ((key, value) in values) {
-                if (operations.encryptedContains(key)) continue
+                if (operations.targetContains(key)) continue
                 when (value) {
                     is String -> editor.putString(key, value)
                     is Int -> editor.putInt(key, value)
@@ -174,10 +177,7 @@ internal class LegacyPreferencesMigrator(
                     else -> return false
                 }
             }
-
-            if (!editor.commit()) return false
-            if (!operations.clearLegacyValues()) return false
-            operations.deleteLegacyStorage()
+            editor.commit()
         } catch (_: Exception) {
             false
         }

@@ -36,7 +36,7 @@ class BootReceiver : BroadcastReceiver() {
         ) return
 
         if (ConfigStore.initialize(context) == StorageStatus.UNAVAILABLE) {
-            Logger.e("BootReceiver: 收到 $action，但安全配置存储不可用，拒绝自动启动。")
+            Logger.e("BootReceiver: 收到 $action，但配置存储不可用，拒绝自动启动。")
             return
         }
 

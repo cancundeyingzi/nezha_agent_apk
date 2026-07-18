@@ -8,30 +8,32 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.nezhahq.agent.simulator.SimulatedDeviceConfig
 import java.io.File
-import java.security.KeyStore
 
-/** Encrypted, fail-closed configuration storage. */
+/**
+ * Traditional app-private configuration storage.
+ *
+ * Values intentionally use ordinary [SharedPreferences], matching the upstream agent's plaintext
+ * configuration model. Android sandbox permissions still protect the file on non-rooted devices,
+ * but a root-capable process can read secrets from it.
+ */
 object ConfigStore {
-    private const val PREFS_FILE = "nezha_secure_prefs"
-    private const val LEGACY_FALLBACK_FILE = "${PREFS_FILE}_fallback"
-    private const val MASTER_KEY_ALIAS = "_androidx_security_master_key_"
+    // Keep the historical fallback filename so devices that previously entered fallback mode use
+    // those values directly instead of creating another empty preferences file.
+    private const val PREFS_FILE = "nezha_secure_prefs_fallback"
+    private const val LEGACY_ENCRYPTED_PREFS_FILE = "nezha_secure_prefs"
+    private const val PLAINTEXT_MIGRATION_COMPLETE = "__plaintext_config_v1"
 
     private val runtimeLock = Any()
 
     @Volatile
     private var runtime: Runtime? = null
 
-    /**
-     * Initializes encrypted storage once per process. A failed first creation is repaired and
-     * retried once; no plaintext store is ever returned as live configuration storage.
-     */
+    /** Opens plaintext storage and non-destructively imports readable legacy encrypted values. */
     fun initialize(context: Context): StorageStatus = runtimeFor(context).coordinator.initialize()
 
-    /**
-     * Deletes encrypted preferences, the historical plaintext fallback, and the AndroidKeyStore
-     * master key before creating a verified-empty encrypted store.
-     */
-    fun resetSecureStorage(context: Context): Boolean = runtimeFor(context).coordinator.reset()
+    /** Clears live configuration and recreates a verified-empty plaintext store. */
+    fun resetConfigurationStorage(context: Context): Boolean =
+        runtimeFor(context).coordinator.reset()
 
     fun saveConfig(
         context: Context,
@@ -232,80 +234,104 @@ object ConfigStore {
         return currentRuntime.coordinator.write { prefs ->
             val editor = prefs.edit()
             changes(editor)
+            editor.putBoolean(PLAINTEXT_MIGRATION_COMPLETE, true)
             editor.commit()
         }
     }
 
     private class Runtime(context: Context) {
-        val coordinator = SecureStorageCoordinator(AndroidSecureStorageOperations(context))
+        val coordinator = ConfigurationStorageCoordinator(
+            AndroidConfigurationStorageOperations(context)
+        )
     }
 
-    private class AndroidSecureStorageOperations(
+    private class AndroidConfigurationStorageOperations(
         private val context: Context
-    ) : SecureStorageOperations<SharedPreferences> {
-        override fun createEncryptedStorage(): SharedPreferences {
+    ) : ConfigurationStorageOperations<SharedPreferences> {
+        private val legacyEncryptedFiles =
+            preferencesFiles(context, LEGACY_ENCRYPTED_PREFS_FILE)
+
+        override fun openPlainStorage(): SharedPreferences =
+            context.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
+
+        override fun isMigrationComplete(storage: SharedPreferences): Boolean =
+            storage.getBoolean(PLAINTEXT_MIGRATION_COMPLETE, false)
+
+        override fun importLegacyEncryptedStorage(
+            storage: SharedPreferences
+        ): LegacyImportResult {
+            if (!legacyEncryptedFiles.exists()) {
+                return if (markMigrationComplete(storage)) {
+                    LegacyImportResult.COMPLETED
+                } else {
+                    LegacyImportResult.FAILED
+                }
+            }
+
+            val legacyValues = try {
+                createLegacyEncryptedStorage().all
+            } catch (error: Exception) {
+                Logger.e(
+                    "ConfigStore: 旧加密配置无法读取，保留原文件并改用明文兼容存储",
+                    error
+                )
+                return LegacyImportResult.UNREADABLE
+            }
+
+            val imported = PreferenceValuesImporter(
+                AndroidPreferenceImportOperations(storage)
+            ).importMissing(legacyValues)
+            if (!imported) return LegacyImportResult.FAILED
+
+            return if (markMigrationComplete(storage)) {
+                Logger.i("ConfigStore: 已将旧加密配置迁移到明文兼容存储")
+                LegacyImportResult.COMPLETED
+            } else {
+                LegacyImportResult.FAILED
+            }
+        }
+
+        override fun resetPlainStorage(): SharedPreferences {
+            check(deletePreferencesCompat(context, PREFS_FILE)) {
+                "Unable to delete plaintext configuration"
+            }
+            val storage = openPlainStorage()
+            check(markMigrationComplete(storage)) {
+                "Unable to initialize empty plaintext configuration"
+            }
+            return storage
+        }
+
+        override fun isResetStorage(storage: SharedPreferences): Boolean {
+            return storage.getBoolean(PLAINTEXT_MIGRATION_COMPLETE, false) &&
+                storage.all.keys == setOf(PLAINTEXT_MIGRATION_COMPLETE)
+        }
+
+        private fun createLegacyEncryptedStorage(): SharedPreferences {
             val masterKey = MasterKey.Builder(context)
                 .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
                 .build()
             return EncryptedSharedPreferences.create(
                 context,
-                PREFS_FILE,
+                LEGACY_ENCRYPTED_PREFS_FILE,
                 masterKey,
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
             )
         }
 
-        override fun clearEncryptedStorage(): Boolean =
-            deletePreferencesCompat(context, PREFS_FILE)
-
-        override fun clearLegacyFallback(): Boolean =
-            deletePreferencesCompat(context, LEGACY_FALLBACK_FILE)
-
-        override fun clearMasterKey(): Boolean = try {
-            val keyStore = KeyStore.getInstance("AndroidKeyStore")
-            keyStore.load(null)
-            if (keyStore.containsAlias(MASTER_KEY_ALIAS)) {
-                keyStore.deleteEntry(MASTER_KEY_ALIAS)
-            }
-            !keyStore.containsAlias(MASTER_KEY_ALIAS)
-        } catch (_: Exception) {
-            false
-        }
-
-        override fun migrateLegacyFallback(storage: SharedPreferences): Boolean {
-            return LegacyPreferencesMigrator(
-                AndroidLegacyPreferenceOperations(context, storage)
-            ).migrate()
-        }
-
-        override fun isStorageEmpty(storage: SharedPreferences): Boolean = storage.all.isEmpty()
+        @SuppressLint("ApplySharedPref")
+        private fun markMigrationComplete(storage: SharedPreferences): Boolean =
+            storage.edit().putBoolean(PLAINTEXT_MIGRATION_COMPLETE, true).commit()
     }
 
-    private class AndroidLegacyPreferenceOperations(
-        private val context: Context,
-        private val encryptedPreferences: SharedPreferences
-    ) : LegacyPreferenceOperations {
-        private val legacyFiles = preferencesFiles(context, LEGACY_FALLBACK_FILE)
-        private val legacyPreferences by lazy {
-            context.getSharedPreferences(LEGACY_FALLBACK_FILE, Context.MODE_PRIVATE)
-        }
+    private class AndroidPreferenceImportOperations(
+        private val targetPreferences: SharedPreferences
+    ) : PreferenceImportOperations {
+        override fun targetContains(key: String): Boolean = targetPreferences.contains(key)
 
-        override fun legacyStorageExists(): Boolean = legacyFiles.exists()
-
-        override fun readLegacyValues(): Map<String, Any?> = legacyPreferences.all
-
-        override fun encryptedContains(key: String): Boolean =
-            encryptedPreferences.contains(key)
-
-        override fun encryptedEditor(): PreferenceValueEditor =
-            SharedPreferencesValueEditor(encryptedPreferences.edit())
-
-        @SuppressLint("ApplySharedPref")
-        override fun clearLegacyValues(): Boolean = legacyPreferences.edit().clear().commit()
-
-        override fun deleteLegacyStorage(): Boolean =
-            deletePreferencesCompat(context, LEGACY_FALLBACK_FILE)
+        override fun targetEditor(): PreferenceValueEditor =
+            SharedPreferencesValueEditor(targetPreferences.edit())
     }
 
     private class SharedPreferencesValueEditor(

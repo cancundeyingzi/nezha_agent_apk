@@ -58,14 +58,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var storageStatus by mutableStateOf(ConfigStore.initialize(application))
         private set
 
-    val isSecureStorageAvailable: Boolean
+    val isConfigStorageAvailable: Boolean
         get() = storageStatus != StorageStatus.UNAVAILABLE
 
-    var isResettingSecureStorage by mutableStateOf(false)
+    var isResettingConfigStorage by mutableStateOf(false)
         private set
 
     var storageErrorMessage by mutableStateOf(
-        if (storageStatus == StorageStatus.UNAVAILABLE) SECURE_STORAGE_UNAVAILABLE_MESSAGE else null
+        if (storageStatus == StorageStatus.UNAVAILABLE) CONFIG_STORAGE_UNAVAILABLE_MESSAGE else null
     )
         private set
 
@@ -146,10 +146,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var simulatorThreadCount by mutableStateOf(ConfigStore.getSimulatorThreadCount(application).toString())
 
     init {
-        // A decrypt/read failure also closes the store; reflect that after loading every field.
+        // A malformed/read-failed preferences file closes the store; reflect that after loading.
         storageStatus = ConfigStore.initialize(application)
-        if (!isSecureStorageAvailable) {
-            storageErrorMessage = SECURE_STORAGE_UNAVAILABLE_MESSAGE
+        if (!isConfigStorageAvailable) {
+            storageErrorMessage = CONFIG_STORAGE_UNAVAILABLE_MESSAGE
         }
     }
 
@@ -321,7 +321,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         requestNotificationPerm: (() -> Unit) -> Unit
     ) {
         val ctx = getApplication<Application>()
-        if (!requireSecureStorage("启动探针")) return
+        if (!requireConfigStorage("启动探针")) return
         val p = port.toIntOrNull()
 
         // [修复问题6] 启动前配置校验，防止配置不完整时启动服务
@@ -432,7 +432,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (simulatorRunning) return
 
         val ctx = getApplication<Application>()
-        if (!requireSecureStorage("启动模拟器")) return
+        if (!requireConfigStorage("启动模拟器")) return
         val trimmedServer = simulatorServer.trim()
         val trimmedSecret = simulatorSecret.trim()
         val validationError = SimulatedDeviceConfig.validationError(
@@ -539,11 +539,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun checkAndShowAutoStartPrompt() {
         val ctx = getApplication<Application>()
-        if (!isSecureStorageAvailable) return
+        if (!isConfigStorageAvailable) return
         val hasShownAutoStartPrompt = ConfigStore.getHasShownAutoStartPrompt(ctx)
         storageStatus = ConfigStore.initialize(ctx)
-        if (!isSecureStorageAvailable) {
-            storageErrorMessage = SECURE_STORAGE_UNAVAILABLE_MESSAGE
+        if (!isConfigStorageAvailable) {
+            storageErrorMessage = CONFIG_STORAGE_UNAVAILABLE_MESSAGE
             showAutoStartPrompt = false
             return
         }
@@ -598,35 +598,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    /** Clears all credential storage on an IO thread and refreshes the UI with safe defaults. */
-    fun resetSecureStorage() {
-        if (isResettingSecureStorage) return
+    /** Clears all configuration on an IO thread and refreshes the UI with defaults. */
+    fun resetConfigurationStorage() {
+        if (isResettingConfigStorage) return
         val ctx = getApplication<Application>()
-        isResettingSecureStorage = true
+        isResettingConfigStorage = true
         simulatorJob?.cancel()
         simulatorJob = null
         simulatorRunning = false
         ctx.stopService(Intent(ctx, AgentService::class.java))
         viewModelScope.launch {
             val resetSucceeded = withContext(Dispatchers.IO) {
-                ConfigStore.resetSecureStorage(ctx)
+                ConfigStore.resetConfigurationStorage(ctx)
             }
-            isResettingSecureStorage = false
+            isResettingConfigStorage = false
             storageStatus = ConfigStore.initialize(ctx)
-            if (!resetSucceeded || !isSecureStorageAvailable) {
-                storageErrorMessage = "安全配置重置失败，加密存储仍不可用，请稍后重试"
+            if (!resetSucceeded || !isConfigStorageAvailable) {
+                storageErrorMessage = "配置存储重置失败，请稍后重试"
                 Toast.makeText(ctx, storageErrorMessage, Toast.LENGTH_LONG).show()
                 return@launch
             }
-            refreshConfigurationFromSecureStorage()
+            refreshConfigurationFromStorage()
             storageStatus = ConfigStore.initialize(ctx)
-            if (!isSecureStorageAvailable) {
-                storageErrorMessage = "安全配置重置后读取失败，加密存储仍不可用，请稍后重试"
+            if (!isConfigStorageAvailable) {
+                storageErrorMessage = "配置存储重置后读取失败，请稍后重试"
                 Toast.makeText(ctx, storageErrorMessage, Toast.LENGTH_LONG).show()
                 return@launch
             }
             storageErrorMessage = null
-            Toast.makeText(ctx, "安全配置已重置，请重新填写连接信息", Toast.LENGTH_LONG).show()
+            Toast.makeText(ctx, "配置已重置，请重新填写连接信息", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -811,13 +811,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun requireSecureStorage(action: String): Boolean {
+    private fun requireConfigStorage(action: String): Boolean {
         storageStatus = ConfigStore.initialize(getApplication())
-        if (isSecureStorageAvailable) return true
-        storageErrorMessage = SECURE_STORAGE_UNAVAILABLE_MESSAGE
+        if (isConfigStorageAvailable) return true
+        storageErrorMessage = CONFIG_STORAGE_UNAVAILABLE_MESSAGE
         Toast.makeText(
             getApplication(),
-            "$action 已拒绝：$SECURE_STORAGE_UNAVAILABLE_MESSAGE",
+            "$action 已拒绝：$CONFIG_STORAGE_UNAVAILABLE_MESSAGE",
             Toast.LENGTH_LONG
         ).show()
         return false
@@ -832,10 +832,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         if (isConfigWriteInProgress) {
             onFailure()
-            Toast.makeText(getApplication(), "安全配置正在保存，请稍候", Toast.LENGTH_SHORT).show()
+            Toast.makeText(getApplication(), "配置正在保存，请稍候", Toast.LENGTH_SHORT).show()
             return
         }
-        if (!requireSecureStorage(action)) {
+        if (!requireConfigStorage(action)) {
             onFailure()
             return
         }
@@ -851,6 +851,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             isConfigWriteInProgress = false
             if (persisted) {
+                storageStatus = ConfigStore.initialize(getApplication())
+                storageErrorMessage = null
                 onSuccess()
             } else {
                 onFailure()
@@ -904,11 +906,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun reportStorageWriteFailure(message: String) {
         storageStatus = ConfigStore.initialize(getApplication())
-        storageErrorMessage = "$message；安全配置存储不可用，请重置安全配置"
+        storageErrorMessage = "$message；配置存储不可用，请重置配置存储"
         Toast.makeText(getApplication(), storageErrorMessage, Toast.LENGTH_LONG).show()
     }
 
-    private fun refreshConfigurationFromSecureStorage() {
+    private fun refreshConfigurationFromStorage() {
         val ctx = getApplication<Application>()
         server = ConfigStore.getServer(ctx)
         port = ConfigStore.getPort(ctx).toString()
@@ -944,8 +946,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
 }
 
-private const val SECURE_STORAGE_UNAVAILABLE_MESSAGE =
-    "安全配置存储不可用，凭据不会写入；请重置安全配置"
+private const val CONFIG_STORAGE_UNAVAILABLE_MESSAGE =
+    "配置存储不可用，连接信息不会写入；请重置配置存储"
 
 internal fun redactUuidForLog(value: String): String {
     if (value.isBlank()) return "(empty)"
