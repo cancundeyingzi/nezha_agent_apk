@@ -30,6 +30,7 @@ import com.nezhahq.agent.util.FloatWindowManager
 import com.nezhahq.agent.util.KeepAliveAudioPlayer
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
+import com.nezhahq.agent.util.StorageStatus
 import io.grpc.Status
 import io.grpc.StatusException
 import io.grpc.StatusRuntimeException
@@ -87,41 +88,49 @@ class AgentService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        if (ConfigStore.getEnableKeepAliveAudio(this)) {
+        // Enter foreground before any potentially slow KeyStore/EncryptedSharedPreferences IO.
+        // This notification-only step does not start agent business work.
+        startAgentForeground("正在验证安全配置...")
+        val storageStatus = ConfigStore.initialize(this)
+        if (storageStatus == StorageStatus.UNAVAILABLE) {
+            val reason = "安全配置存储不可用，探针服务已停止"
+            updateNotification(reason)
+            Logger.e("AgentService: $reason；未启动音频、悬浮窗、网络、gRPC 或 VPN")
+            stopSelf()
+            return
+        }
+
+        val audioEnabled = ConfigStore.getEnableKeepAliveAudio(this)
+        val floatWindowEnabled = ConfigStore.getEnableFloatWindow(this)
+        val vpnEnabled = ConfigStore.getEnableVpnTraffic(this)
+        if (ConfigStore.initialize(this) == StorageStatus.UNAVAILABLE) {
+            val reason = "读取安全配置失败，探针服务已停止"
+            updateNotification(reason)
+            Logger.e("AgentService: $reason；未启动音频、悬浮窗、网络、gRPC 或 VPN")
+            stopSelf()
+            return
+        }
+        updateNotification("正在连接...")
+
+        Logger.i("Service started, configuring Grpc...")
+        GrpcManager.initialize(this)
+        if (ConfigStore.initialize(this) == StorageStatus.UNAVAILABLE) {
+            Logger.e("AgentService: gRPC 初始化期间安全配置失效，停止服务且不启动保活或网络任务")
+            GrpcManager.shutdown()
+            updateNotification("安全配置读取失败，服务已停止")
+            stopSelf()
+            return
+        }
+
+        if (audioEnabled) {
             Logger.i("AgentService: 启用无声音频保活机制")
             audioPlayer.start()
         }
-        if (ConfigStore.getEnableFloatWindow(this)) {
+        if (floatWindowEnabled) {
             Logger.i("AgentService: 启用悬浮窗保活机制")
             FloatWindowManager.show(this)
         }
-        // ── 前台服务 startForeground 类型适配 ─────────────────────────────────
-        // Android Q (10, API 29)+ 要求在调用时传入与 Manifest 声明一致的 serviceType。
-        // Android 14 (API 34)+ 对 dataSync 的审查更严格（需真实数据同步活动），
-        // 改用 FOREGROUND_SERVICE_TYPE_SPECIAL_USE 对长期系统监控进程保活效果更佳，
-        // 且 Manifest 中已声明对应权限 FOREGROUND_SERVICE_SPECIAL_USE 与用途说明。
-        when {
-            Build.VERSION.SDK_INT >= 34 -> {
-                @Suppress("InlinedApi")
-                startForeground(
-                    1001,
-                    createNotification("正在连接..."),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                )
-            }
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
-                startForeground(
-                    1001,
-                    createNotification("正在连接..."),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                )
-            }
-            else -> startForeground(1001, createNotification("正在连接..."))
-        }
         acquireWakeLock()
-        
-        Logger.i("Service started, configuring Grpc...")
-        GrpcManager.initialize(this)
 
         // ── 清理上次可能因 App Crash 遗留的临时上传文件 ───────────────────
         // FileManager 上传时使用 cacheDir/nezha_upload_{time}.tmp 作为中转，
@@ -136,33 +145,53 @@ class AgentService : Service() {
                 }
             } catch (_: Exception) {}
         }
-        
+
         Logger.i("Initializing network listeners and daemon coroutines...")
         setupNetworkListener()
         startWorkLoop()
 
-        // ── VPN 流量计量服务 ──────────────────────────────────────────────────
-        val vpnEnabled = ConfigStore.getEnableVpnTraffic(this)
-        Logger.i("AgentService: VPN 流量计量配置 = $vpnEnabled")
+        // ── VPN 流量兼容服务 ──────────────────────────────────────────────────
+        Logger.i("AgentService: VPN 流量兼容配置 = $vpnEnabled")
         if (vpnEnabled) {
-            // [修复问题7] 添加 Android 版本检查，VPN 流量计量仅适用于 Android 12 以下
+            // 占位 VPN 兼容行为仅保留在 Android 12 以下。
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                Logger.i("AgentService: Android 12+ 设备不需要 VPN 流量计量（系统已有精确统计 API），跳过启动")
+                Logger.i("AgentService: VPN 流量兼容模式仅适用于 Android 12 以下，跳过启动")
             } else {
                 try {
                     val prepareIntent = VpnService.prepare(this)
                     if (prepareIntent == null) {
-                        // VPN 已被用户授权，直接启动计量服务
+                        // VPN 已被用户授权，直接启动兼容服务
                         val vpnIntent = Intent(this, TrafficVpnService::class.java)
                         startService(vpnIntent)
-                        Logger.i("AgentService: VPN 流量计量服务已启动")
+                        Logger.i("AgentService: VPN 流量兼容服务已启动")
                     } else {
-                        Logger.i("AgentService: VPN 流量计量已启用但 VPN 权限未授权（需在工具页重新开启开关以触发授权），跳过启动")
+                        Logger.i("AgentService: VPN 流量兼容已启用但权限未授权（需在工具页重新开启开关以触发授权），跳过启动")
                     }
                 } catch (e: Exception) {
-                    Logger.e("AgentService: VPN 流量计量服务启动异常", e)
+                    Logger.e("AgentService: VPN 流量兼容服务启动异常", e)
                 }
             }
+        }
+    }
+
+    private fun startAgentForeground(statusText: String) {
+        when {
+            Build.VERSION.SDK_INT >= 34 -> {
+                @Suppress("InlinedApi")
+                startForeground(
+                    1001,
+                    createNotification(statusText),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            }
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
+                startForeground(
+                    1001,
+                    createNotification(statusText),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            }
+            else -> startForeground(1001, createNotification(statusText))
         }
     }
 
@@ -615,7 +644,7 @@ class AgentService : Service() {
         // 关闭持久化 Root Shell 会话，释放后台 su 进程资源，防止进程泄漏
         RootShell.shutdown()
         Logger.i("RootShell persistent session closed.")
-        // 停止 VPN 流量计量服务（若正在运行）
+        // 停止 VPN 流量兼容服务（若正在运行）
         try {
             stopService(Intent(this, TrafficVpnService::class.java))
         } catch (_: Exception) {}

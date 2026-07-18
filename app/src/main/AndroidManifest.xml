@@ -45,7 +45,7 @@
     <!-- 短信读取（虚拟指令 @agent sms 使用，需要用户手动授权） -->
     <uses-permission android:name="android.permission.READ_SMS" />
 
-    <!-- VPN 流量计量（本地透传 VPN，仅计量不拦截，作为网络统计的最后降级策略） -->
+    <!-- Android 11 及以下的占位 VPN 流量兼容模式，不代理数据包 -->
     <uses-permission android:name="android.permission.BIND_VPN_SERVICE"
         tools:ignore="ProtectedPermissions" />
 
@@ -64,7 +64,7 @@
         tools:ignore="ScopedStorage" />
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.NezhaAgent"
@@ -133,9 +133,8 @@
         </receiver>
 
         <!--
-            VPN 流量计量服务：在无 Root/Shizuku 且 Android < 12 的设备上，
-            通过本地 VPN 隧道透传所有流量并统计 rx/tx 字节数。
-            仅计量不拦截、不修改任何数据包内容。用户可在工具页手动开关。
+            VPN 流量兼容服务：部分无 Root/Shizuku 的 Android < 12 ROM 需要
+            占位 VPN 才能读取系统流量。仅建立 /32 路由，不代理数据包、不修改 DNS。
         -->
         <service
             android:name=".service.TrafficVpnService"

@@ -3,6 +3,7 @@ package com.nezhahq.agent.grpc
 import android.content.Context
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
+import com.nezhahq.agent.util.StorageStatus
 import io.grpc.ManagedChannel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -74,11 +75,22 @@ object GrpcManager {
     }
 
     fun initialize(context: Context) {
+        if (ConfigStore.initialize(context) == StorageStatus.UNAVAILABLE) {
+            Logger.e("Grpc: 安全配置存储不可用，拒绝初始化连接通道")
+            shutdown()
+            return
+        }
         val server = ConfigStore.getServer(context)
         val port = ConfigStore.getPort(context)
         val secret = ConfigStore.getSecret(context)
         val uuid = ConfigStore.getUuid(context)
         val transportMode = resolveTransportMode(ConfigStore.getUseTls(context))
+
+        if (ConfigStore.initialize(context) == StorageStatus.UNAVAILABLE) {
+            Logger.e("Grpc: 读取安全配置失败，拒绝初始化连接通道")
+            shutdown()
+            return
+        }
 
         synchronized(lifecycleLock) {
             if (server.isEmpty() || secret.isEmpty() || uuid.isEmpty()) {

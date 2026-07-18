@@ -1,190 +1,151 @@
 package com.nezhahq.agent.util
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.nezhahq.agent.simulator.SimulatedDeviceConfig
+import java.io.File
+import java.security.KeyStore
 
+/** Encrypted, fail-closed configuration storage. */
 object ConfigStore {
-
     private const val PREFS_FILE = "nezha_secure_prefs"
+    private const val LEGACY_FALLBACK_FILE = "${PREFS_FILE}_fallback"
+    private const val MASTER_KEY_ALIAS = "_androidx_security_master_key_"
+
+    private val runtimeLock = Any()
 
     @Volatile
-    private var prefsInstance: SharedPreferences? = null
+    private var runtime: Runtime? = null
 
     /**
-     * 获取加密的 SharedPreferences 实例。
-     * 采用双重检查锁（Double-Checked Locking）单例模式，避免由于反复初始化
-     * EncryptedSharedPreferences 和读写 KeyStore 产生严重的性能开销和主线程卡顿。
-     * [Security Audit] 使用了 applicationContext 防内存溢出，同时利用 AES256_GCM 保证数据存储安全。
-     *
-     * [Robustness] 如果 EncryptedSharedPreferences 初始化失败（KeyStore 损坏），自动降级到普通 SharedPreferences。
+     * Initializes encrypted storage once per process. A failed first creation is repaired and
+     * retried once; no plaintext store is ever returned as live configuration storage.
      */
-    private fun getEncryptedPrefs(context: Context): SharedPreferences {
-        android.util.Log.i("LiquidGlass", "→ ConfigStore.getEncryptedPrefs 被调用")
-        return prefsInstance ?: synchronized(this) {
-            prefsInstance ?: run {
-                android.util.Log.i("LiquidGlass", "  prefsInstance 为 null，需要初始化")
-                try {
-                    android.util.Log.i("LiquidGlass", "  → 开始创建 MasterKey")
-                    val masterKey = MasterKey.Builder(context.applicationContext)
-                        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                        .build()
-                    android.util.Log.i("LiquidGlass", "  ✓ MasterKey 创建成功")
-
-                    android.util.Log.i("LiquidGlass", "  → 开始创建 EncryptedSharedPreferences")
-                    val prefs = EncryptedSharedPreferences.create(
-                        context.applicationContext,
-                        PREFS_FILE,
-                        masterKey,
-                        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-                    )
-                    android.util.Log.i("LiquidGlass", "  ✓ EncryptedSharedPreferences 创建成功")
-                    prefsInstance = prefs
-                    prefs
-                } catch (e: Exception) {
-                    android.util.Log.e("LiquidGlass", "  ✗ EncryptedSharedPreferences 初始化失败", e)
-                    android.util.Log.e("LiquidGlass", "  异常类型: ${e.javaClass.name}")
-                    android.util.Log.e("LiquidGlass", "  异常消息: ${e.message}")
-
-                    // 尝试删除损坏的加密文件和 MasterKey，然后重试一次
-                    android.util.Log.w("LiquidGlass", "  → 尝试删除损坏的加密文件并重试")
-                    try {
-                        // 删除损坏的 SharedPreferences 文件
-                        context.applicationContext.deleteSharedPreferences(PREFS_FILE)
-
-                        // 尝试删除损坏的 MasterKey（如果可能）
-                        try {
-                            val keyStore = java.security.KeyStore.getInstance("AndroidKeyStore")
-                            keyStore.load(null)
-                            val masterKeyAlias = "_androidx_security_master_key_"
-                            if (keyStore.containsAlias(masterKeyAlias)) {
-                                keyStore.deleteEntry(masterKeyAlias)
-                                android.util.Log.i("LiquidGlass", "  ✓ 已删除损坏的 MasterKey")
-                            }
-                        } catch (keyEx: Exception) {
-                            android.util.Log.w("LiquidGlass", "  删除 MasterKey 时出错（可忽略）", keyEx)
-                        }
-
-                        android.util.Log.i("LiquidGlass", "  → 重新创建 EncryptedSharedPreferences")
-                        val masterKey = MasterKey.Builder(context.applicationContext)
-                            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                            .build()
-
-                        val prefs = EncryptedSharedPreferences.create(
-                            context.applicationContext,
-                            PREFS_FILE,
-                            masterKey,
-                            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-                        )
-                        android.util.Log.i("LiquidGlass", "  ✓ 重试成功！EncryptedSharedPreferences 已创建")
-                        prefsInstance = prefs
-                        prefs
-                    } catch (retryEx: Exception) {
-                        android.util.Log.e("LiquidGlass", "  ✗ 重试仍然失败", retryEx)
-                        android.util.Log.w("LiquidGlass", "  → 降级到普通 SharedPreferences（无加密）")
-
-                        // 降级到普通 SharedPreferences
-                        val fallbackPrefs = context.applicationContext.getSharedPreferences(
-                            "${PREFS_FILE}_fallback",
-                            Context.MODE_PRIVATE
-                        )
-                        android.util.Log.i("LiquidGlass", "  ✓ 已降级到普通 SharedPreferences")
-                        prefsInstance = fallbackPrefs
-                        fallbackPrefs
-                    }
-                }
-            }
-        }
-    }
+    fun initialize(context: Context): StorageStatus = runtimeFor(context).coordinator.initialize()
 
     /**
-     * 保存连接配置和基础工具设置。
-     *
-     * 注意：enable_vpn_traffic 由 [setEnableVpnTraffic] 独立管理，
-     * 不在此方法中写入，防止全量覆写导致设置被重置。
+     * Deletes encrypted preferences, the historical plaintext fallback, and the AndroidKeyStore
+     * master key before creating a verified-empty encrypted store.
      */
-    fun saveConfig(context: Context, server: String, port: Int, secret: String, useTLS: Boolean = true, uuid: String = "", rootMode: Boolean = false, enableKeepAliveAudio: Boolean = false) {
-        getEncryptedPrefs(context).edit().apply {
-            putString("server", server)
-            putInt("port", port)
-            putString("secret", secret)
-            putBoolean("use_tls", useTLS)
-            putString("uuid", uuid)
-            putBoolean("root_mode", rootMode)
-            putBoolean("enable_keep_alive_audio", enableKeepAliveAudio)
-            // enable_float_window 由 setEnableFloatWindow() 独立管理
-            // enable_vpn_traffic 由 setEnableVpnTraffic() 独立管理
-            apply()
-        }
+    fun resetSecureStorage(context: Context): Boolean = runtimeFor(context).coordinator.reset()
+
+    fun saveConfig(
+        context: Context,
+        server: String,
+        port: Int,
+        secret: String,
+        useTLS: Boolean = true,
+        uuid: String = "",
+        rootMode: Boolean = false,
+        enableKeepAliveAudio: Boolean = false
+    ): Boolean = commit(context) { editor ->
+        editor.putString("server", server)
+        editor.putInt("port", port)
+        editor.putString("secret", secret)
+        editor.putBoolean("use_tls", useTLS)
+        editor.putString("uuid", uuid)
+        editor.putBoolean("root_mode", rootMode)
+        editor.putBoolean("enable_keep_alive_audio", enableKeepAliveAudio)
     }
 
-    fun getServer(context: Context): String = getEncryptedPrefs(context).getString("server", "") ?: ""
-    fun getPort(context: Context): Int = getEncryptedPrefs(context).getInt("port", 5555)
-    fun getSecret(context: Context): String = getEncryptedPrefs(context).getString("secret", "") ?: ""
-    fun getUuid(context: Context): String = getEncryptedPrefs(context).getString("uuid", "") ?: ""
-    fun getUseTls(context: Context): Boolean = getEncryptedPrefs(context).getBoolean("use_tls", true)
-    fun getRootMode(context: Context): Boolean = getEncryptedPrefs(context).getBoolean("root_mode", false)
-    fun getEnableKeepAliveAudio(context: Context): Boolean = getEncryptedPrefs(context).getBoolean("enable_keep_alive_audio", false)
-    fun getEnableFloatWindow(context: Context): Boolean = getEncryptedPrefs(context).getBoolean("enable_float_window", false)
-    fun getEnableVpnTraffic(context: Context): Boolean = getEncryptedPrefs(context).getBoolean("enable_vpn_traffic", false)
-    fun getEnableAutoStart(context: Context): Boolean = getEncryptedPrefs(context).getBoolean("enable_auto_start", false)
-    fun getHasShownAutoStartPrompt(context: Context): Boolean = getEncryptedPrefs(context).getBoolean("has_shown_auto_start_prompt", false)
-    fun hasSimulatorConfig(context: Context): Boolean =
-        getEncryptedPrefs(context).contains("simulator_server")
+    fun getServer(context: Context): String = read(context, "") {
+        it.getString("server", "") ?: ""
+    }
 
-    fun getSimulatorServer(context: Context): String {
-        val prefs = getEncryptedPrefs(context)
-        return if (prefs.contains("simulator_server")) {
+    fun getPort(context: Context): Int = read(context, 5555) { it.getInt("port", 5555) }
+
+    fun getSecret(context: Context): String = read(context, "") {
+        it.getString("secret", "") ?: ""
+    }
+
+    fun getUuid(context: Context): String = read(context, "") {
+        it.getString("uuid", "") ?: ""
+    }
+
+    fun getUseTls(context: Context): Boolean = read(context, true) {
+        it.getBoolean("use_tls", true)
+    }
+
+    fun getRootMode(context: Context): Boolean = read(context, false) {
+        it.getBoolean("root_mode", false)
+    }
+
+    fun getEnableKeepAliveAudio(context: Context): Boolean = read(context, false) {
+        it.getBoolean("enable_keep_alive_audio", false)
+    }
+
+    fun getEnableFloatWindow(context: Context): Boolean = read(context, false) {
+        it.getBoolean("enable_float_window", false)
+    }
+
+    fun getEnableVpnTraffic(context: Context): Boolean = read(context, false) {
+        it.getBoolean("enable_vpn_traffic", false)
+    }
+
+    fun getEnableAutoStart(context: Context): Boolean = read(context, false) {
+        it.getBoolean("enable_auto_start", false)
+    }
+
+    fun getHasShownAutoStartPrompt(context: Context): Boolean = read(context, false) {
+        it.getBoolean("has_shown_auto_start_prompt", false)
+    }
+
+    fun getEnableRemoteCommand(context: Context): Boolean = read(context, false) {
+        it.getBoolean("enable_remote_command", false)
+    }
+
+    fun hasSimulatorConfig(context: Context): Boolean = read(context, false) {
+        it.contains("simulator_server")
+    }
+
+    fun getSimulatorServer(context: Context): String = read(context, "") { prefs ->
+        if (prefs.contains("simulator_server")) {
             prefs.getString("simulator_server", "") ?: ""
         } else {
-            getServer(context)
+            prefs.getString("server", "") ?: ""
         }
     }
 
-    fun getSimulatorPort(context: Context): Int {
-        val prefs = getEncryptedPrefs(context)
-        return if (prefs.contains("simulator_port")) {
+    fun getSimulatorPort(context: Context): Int = read(context, 5555) { prefs ->
+        if (prefs.contains("simulator_port")) {
             prefs.getInt("simulator_port", 5555)
         } else {
-            getPort(context)
+            prefs.getInt("port", 5555)
         }
     }
 
-    fun getSimulatorSecret(context: Context): String {
-        val prefs = getEncryptedPrefs(context)
-        return if (prefs.contains("simulator_secret")) {
+    fun getSimulatorSecret(context: Context): String = read(context, "") { prefs ->
+        if (prefs.contains("simulator_secret")) {
             prefs.getString("simulator_secret", "") ?: ""
         } else {
-            getSecret(context)
+            prefs.getString("secret", "") ?: ""
         }
     }
 
-    fun getSimulatorUseTls(context: Context): Boolean {
-        val prefs = getEncryptedPrefs(context)
-        return if (prefs.contains("simulator_use_tls")) {
+    fun getSimulatorUseTls(context: Context): Boolean = read(context, true) { prefs ->
+        if (prefs.contains("simulator_use_tls")) {
             prefs.getBoolean("simulator_use_tls", true)
         } else {
-            getUseTls(context)
+            prefs.getBoolean("use_tls", true)
         }
     }
 
-    fun getSimulatorThreadCount(context: Context): Int {
-        val prefs = getEncryptedPrefs(context)
-        return prefs
-            .getInt("simulator_thread_count", SimulatedDeviceConfig.DEFAULT_THREAD_COUNT)
-            .coerceIn(1, SimulatedDeviceConfig.MAX_THREAD_COUNT)
+    fun getSimulatorThreadCount(context: Context): Int =
+        read(context, SimulatedDeviceConfig.DEFAULT_THREAD_COUNT) { prefs ->
+            prefs.getInt("simulator_thread_count", SimulatedDeviceConfig.DEFAULT_THREAD_COUNT)
+                .coerceIn(1, SimulatedDeviceConfig.MAX_THREAD_COUNT)
+        }
+
+    fun setEnableAutoStart(context: Context, enable: Boolean): Boolean = commit(context) {
+        it.putBoolean("enable_auto_start", enable)
     }
 
-    fun setEnableAutoStart(context: Context, enable: Boolean) {
-        getEncryptedPrefs(context).edit().putBoolean("enable_auto_start", enable).apply()
-    }
-
-    fun setHasShownAutoStartPrompt(context: Context, shown: Boolean) {
-        getEncryptedPrefs(context).edit().putBoolean("has_shown_auto_start_prompt", shown).apply()
+    fun setHasShownAutoStartPrompt(context: Context, shown: Boolean): Boolean = commit(context) {
+        it.putBoolean("has_shown_auto_start_prompt", shown)
     }
 
     fun saveSimulatorConfig(
@@ -194,45 +155,225 @@ object ConfigStore {
         secret: String,
         useTls: Boolean,
         threadCount: Int
-    ) {
-        getEncryptedPrefs(context).edit().apply {
-            putString("simulator_server", server)
-            putInt("simulator_port", port)
-            putString("simulator_secret", secret)
-            putBoolean("simulator_use_tls", useTls)
-            putInt(
-                "simulator_thread_count",
-                threadCount.coerceIn(1, SimulatedDeviceConfig.MAX_THREAD_COUNT)
-            )
-            apply()
+    ): Boolean = commit(context) { editor ->
+        editor.putString("simulator_server", server)
+        editor.putInt("simulator_port", port)
+        editor.putString("simulator_secret", secret)
+        editor.putBoolean("simulator_use_tls", useTls)
+        editor.putInt(
+            "simulator_thread_count",
+            threadCount.coerceIn(1, SimulatedDeviceConfig.MAX_THREAD_COUNT)
+        )
+    }
+
+    fun setEnableFloatWindow(context: Context, enable: Boolean): Boolean = commit(context) {
+        it.putBoolean("enable_float_window", enable)
+    }
+
+    fun setEnableKeepAliveAudio(context: Context, enable: Boolean): Boolean = commit(context) {
+        it.putBoolean("enable_keep_alive_audio", enable)
+    }
+
+    fun setEnableVpnTraffic(context: Context, enable: Boolean): Boolean = commit(context) {
+        it.putBoolean("enable_vpn_traffic", enable)
+    }
+
+    fun setEnableRemoteCommand(context: Context, enable: Boolean): Boolean = commit(context) {
+        it.putBoolean("enable_remote_command", enable)
+    }
+
+    fun saveToolSettings(
+        context: Context,
+        enableKeepAliveAudio: Boolean,
+        enableFloatWindow: Boolean,
+        enableVpnTraffic: Boolean
+    ): Boolean = commit(context) { editor ->
+        editor.putBoolean("enable_keep_alive_audio", enableKeepAliveAudio)
+        editor.putBoolean("enable_float_window", enableFloatWindow)
+        editor.putBoolean("enable_vpn_traffic", enableVpnTraffic)
+    }
+
+    fun saveAutoStartPromptResult(context: Context, enable: Boolean): Boolean = commit(context) {
+        it.putBoolean("enable_auto_start", enable)
+        it.putBoolean("has_shown_auto_start_prompt", true)
+    }
+
+    fun hasValidConfig(context: Context): Boolean = read(context, false) { prefs ->
+        !prefs.getString("server", "").isNullOrEmpty() &&
+            !prefs.getString("secret", "").isNullOrEmpty() &&
+            !prefs.getString("uuid", "").isNullOrEmpty()
+    }
+
+    private fun runtimeFor(context: Context): Runtime {
+        runtime?.let { return it }
+        return synchronized(runtimeLock) {
+            runtime ?: Runtime(context.applicationContext).also { runtime = it }
         }
     }
 
-    /** 悬浮窗开关 — 独立保存，不受 saveConfig 全量覆写影响 */
-    fun setEnableFloatWindow(context: Context, enable: Boolean) {
-        getEncryptedPrefs(context).edit().putBoolean("enable_float_window", enable).apply()
+    private inline fun <T> read(
+        context: Context,
+        defaultValue: T,
+        crossinline reader: (SharedPreferences) -> T
+    ): T {
+        val currentRuntime = runtimeFor(context)
+        currentRuntime.coordinator.initialize()
+        return currentRuntime.coordinator.read(defaultValue) { reader(it) }
     }
 
-    /** VPN 流量计量开关 — 独立保存，不受 saveConfig 全量覆写影响 */
-    fun setEnableVpnTraffic(context: Context, enable: Boolean) {
-        getEncryptedPrefs(context).edit().putBoolean("enable_vpn_traffic", enable).apply()
+    /** SharedPreferences.commit is intentional: callers must know whether persistence succeeded. */
+    @SuppressLint("ApplySharedPref")
+    private inline fun commit(
+        context: Context,
+        crossinline changes: (SharedPreferences.Editor) -> Unit
+    ): Boolean {
+        val currentRuntime = runtimeFor(context)
+        if (currentRuntime.coordinator.initialize() == StorageStatus.UNAVAILABLE) return false
+        return currentRuntime.coordinator.write { prefs ->
+            val editor = prefs.edit()
+            changes(editor)
+            editor.commit()
+        }
     }
 
-    // ── [安全修复] 远程命令执行独立开关 ──────────────────────────────────────
-    // 将命令执行权限从 rootMode 中解耦，防止用户启用 Root/Shizuku
-    // （用于采集器/终端/文件管理器提权）时静默授予面板远程命令执行能力。
-    // 默认 false，需用户在 UI 中显式开启并确认安全警告。
-
-    /** 获取远程命令执行开关状态（默认关闭） */
-    fun getEnableRemoteCommand(context: Context): Boolean =
-        getEncryptedPrefs(context).getBoolean("enable_remote_command", false)
-
-    /** 远程命令执行开关 — 独立保存，不受 saveConfig 全量覆写影响 */
-    fun setEnableRemoteCommand(context: Context, enable: Boolean) {
-        getEncryptedPrefs(context).edit().putBoolean("enable_remote_command", enable).apply()
+    private class Runtime(context: Context) {
+        val coordinator = SecureStorageCoordinator(AndroidSecureStorageOperations(context))
     }
 
-    fun hasValidConfig(context: Context): Boolean {
-        return getServer(context).isNotEmpty() && getSecret(context).isNotEmpty() && getUuid(context).isNotEmpty()
+    private class AndroidSecureStorageOperations(
+        private val context: Context
+    ) : SecureStorageOperations<SharedPreferences> {
+        override fun createEncryptedStorage(): SharedPreferences {
+            val masterKey = MasterKey.Builder(context)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            return EncryptedSharedPreferences.create(
+                context,
+                PREFS_FILE,
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            )
+        }
+
+        override fun clearEncryptedStorage(): Boolean =
+            deletePreferencesCompat(context, PREFS_FILE)
+
+        override fun clearLegacyFallback(): Boolean =
+            deletePreferencesCompat(context, LEGACY_FALLBACK_FILE)
+
+        override fun clearMasterKey(): Boolean = try {
+            val keyStore = KeyStore.getInstance("AndroidKeyStore")
+            keyStore.load(null)
+            if (keyStore.containsAlias(MASTER_KEY_ALIAS)) {
+                keyStore.deleteEntry(MASTER_KEY_ALIAS)
+            }
+            !keyStore.containsAlias(MASTER_KEY_ALIAS)
+        } catch (_: Exception) {
+            false
+        }
+
+        override fun migrateLegacyFallback(storage: SharedPreferences): Boolean {
+            return LegacyPreferencesMigrator(
+                AndroidLegacyPreferenceOperations(context, storage)
+            ).migrate()
+        }
+
+        override fun isStorageEmpty(storage: SharedPreferences): Boolean = storage.all.isEmpty()
+    }
+
+    private class AndroidLegacyPreferenceOperations(
+        private val context: Context,
+        private val encryptedPreferences: SharedPreferences
+    ) : LegacyPreferenceOperations {
+        private val legacyFiles = preferencesFiles(context, LEGACY_FALLBACK_FILE)
+        private val legacyPreferences by lazy {
+            context.getSharedPreferences(LEGACY_FALLBACK_FILE, Context.MODE_PRIVATE)
+        }
+
+        override fun legacyStorageExists(): Boolean = legacyFiles.exists()
+
+        override fun readLegacyValues(): Map<String, Any?> = legacyPreferences.all
+
+        override fun encryptedContains(key: String): Boolean =
+            encryptedPreferences.contains(key)
+
+        override fun encryptedEditor(): PreferenceValueEditor =
+            SharedPreferencesValueEditor(encryptedPreferences.edit())
+
+        @SuppressLint("ApplySharedPref")
+        override fun clearLegacyValues(): Boolean = legacyPreferences.edit().clear().commit()
+
+        override fun deleteLegacyStorage(): Boolean =
+            deletePreferencesCompat(context, LEGACY_FALLBACK_FILE)
+    }
+
+    private class SharedPreferencesValueEditor(
+        private val editor: SharedPreferences.Editor
+    ) : PreferenceValueEditor {
+        override fun putString(key: String, value: String) {
+            editor.putString(key, value)
+        }
+
+        override fun putStringSet(key: String, value: Set<String>) {
+            editor.putStringSet(key, value)
+        }
+
+        override fun putInt(key: String, value: Int) {
+            editor.putInt(key, value)
+        }
+
+        override fun putLong(key: String, value: Long) {
+            editor.putLong(key, value)
+        }
+
+        override fun putFloat(key: String, value: Float) {
+            editor.putFloat(key, value)
+        }
+
+        override fun putBoolean(key: String, value: Boolean) {
+            editor.putBoolean(key, value)
+        }
+
+        @SuppressLint("ApplySharedPref")
+        override fun commit(): Boolean = editor.commit()
+    }
+
+    private fun deletePreferencesCompat(context: Context, name: String): Boolean {
+        return PreferencesDeletionCoordinator(
+            AndroidPreferencesDeletionOperations(context, name)
+        ).delete()
+    }
+
+    private class AndroidPreferencesDeletionOperations(
+        private val context: Context,
+        private val name: String
+    ) : PreferencesDeletionOperations {
+        private val files = preferencesFiles(context, name)
+
+        override val supportsPlatformDelete: Boolean
+            get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N
+
+        @SuppressLint("ApplySharedPref")
+        override fun clearCacheSynchronously(): Boolean {
+            return context.getSharedPreferences(name, Context.MODE_PRIVATE)
+                .edit()
+                .clear()
+                .commit()
+        }
+
+        override fun deleteWithPlatform(): Boolean {
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                context.deleteSharedPreferences(name)
+            } else {
+                false
+            }
+        }
+
+        override fun deleteFiles(): Boolean = files.delete()
+    }
+
+    private fun preferencesFiles(context: Context, name: String): SharedPreferencesFiles {
+        return SharedPreferencesFiles(File(context.applicationInfo.dataDir), name)
     }
 }

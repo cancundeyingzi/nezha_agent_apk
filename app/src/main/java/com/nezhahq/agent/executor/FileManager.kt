@@ -24,11 +24,23 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Nezha 文件管理器（TaskType 11）。
  */
-class FileManager(
+class FileManager internal constructor(
     private val context: Context,
-    private val stub: NezhaServiceCoroutineStub,
-    private val streamId: String
+    private val streamId: String,
+    private val openIoStream: (Flow<Nezha.IOStreamData>) -> Flow<Nezha.IOStreamData>,
+    private val downloadSourceOverride: DownloadFileSource?
 ) {
+    constructor(
+        context: Context,
+        stub: NezhaServiceCoroutineStub,
+        streamId: String
+    ) : this(
+        context = context,
+        streamId = streamId,
+        openIoStream = { requests -> stub.iOStream(requests) },
+        downloadSourceOverride = null
+    )
+
     private companion object {
         /** IOStream StreamID 魔术头（协议规定） */
         val STREAM_MAGIC = byteArrayOf(0xFF.toByte(), 0x05, 0xFF.toByte(), 0x05)
@@ -64,7 +76,7 @@ class FileManager(
 
                 launch { keepAliveLoop() }
 
-                stub.iOStream(outputFlow()).collect { ioData ->
+                openIoStream(outputFlow()).collect { ioData ->
                     val bytes = ioData.data.toByteArray()
                     if (bytes.isEmpty()) return@collect
 
@@ -82,7 +94,7 @@ class FileManager(
                         0x01 -> {
                             val filePath = String(bytes, 1, bytes.size - 1, Charsets.UTF_8)
                             Logger.i("FileManager: 收到下载请求: $filePath (StreamID=$streamId)")
-                            launch(Dispatchers.IO) { download(filePath) }
+                            withContext(Dispatchers.IO) { download(filePath) }
                         }
                         0x02 -> {
                             if (bytes.size < UPLOAD_MIN_REQUEST_BYTES) {
@@ -243,7 +255,12 @@ class FileManager(
 
     private suspend fun download(filePath: String) {
         try {
-            val fileSize = getFileSize(filePath)
+            val sourceOverride = downloadSourceOverride
+            val fileSize = if (sourceOverride == null) {
+                getFileSize(filePath)
+            } else {
+                sourceOverride.size(filePath)
+            }
             if (fileSize == null) {
                 sendError("无法获取文件信息: $filePath")
                 return
@@ -253,39 +270,71 @@ class FileManager(
                 return
             }
 
-            val inputStream = openInputStreamForPath(filePath)
+            val inputStream = if (sourceOverride == null) {
+                openInputStreamForPath(filePath)
+            } else {
+                sourceOverride.open(filePath)
+            }
             if (inputStream == null) {
                 sendError("无法打开文件: $filePath（权限不足）")
                 return
             }
 
-            try {
-                val headerBuf = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN)
-                headerBuf.put(FILE_DATA_IDENTIFIER)
-                headerBuf.putLong(fileSize)
-                sendData(headerBuf.array())
-
-                val buffer = ByteArray(BUFFER_SIZE)
-                while (true) {
-                    val bytesRead = withContext(Dispatchers.IO) {
-                        inputStream.read(buffer)
-                    }
-                    if (bytesRead == -1) break
-                    if (bytesRead > 0) {
-                        sendData(buffer.copyOf(bytesRead))
+            val closeLock = Any()
+            var streamClosed = false
+            fun closeInputStream() {
+                synchronized(closeLock) {
+                    if (streamClosed) return
+                    streamClosed = true
+                    try {
+                        inputStream.close()
+                    } catch (e: Exception) {
+                        Logger.e("FileManager: 关闭下载流失败: $filePath (StreamID=$streamId)", e)
                     }
                 }
-                Logger.i("FileManager: 文件下载完成: $filePath (StreamID=$streamId)")
-            } finally {
-                withContext(Dispatchers.IO) {
-                    try { inputStream.close() } catch (_: Exception) {}
+            }
+
+            coroutineScope {
+                val cancellationCloser = launch(
+                    context = Dispatchers.IO,
+                    start = CoroutineStart.UNDISPATCHED
+                ) {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        withContext(NonCancellable + Dispatchers.IO) {
+                            closeInputStream()
+                        }
+                    }
+                }
+                try {
+                    val headerBuf = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN)
+                    headerBuf.put(FILE_DATA_IDENTIFIER)
+                    headerBuf.putLong(fileSize)
+                    sendData(headerBuf.array())
+
+                    val buffer = ByteArray(BUFFER_SIZE)
+                    while (true) {
+                        val bytesRead = withContext(Dispatchers.IO) {
+                            inputStream.read(buffer)
+                        }
+                        if (bytesRead == -1) break
+                        if (bytesRead > 0) {
+                            sendData(buffer.copyOf(bytesRead))
+                        }
+                    }
+                    Logger.i("FileManager: 文件下载完成: $filePath (StreamID=$streamId)")
+                } finally {
+                    cancellationCloser.cancel()
+                    withContext(NonCancellable + Dispatchers.IO) {
+                        closeInputStream()
+                    }
                 }
             }
         } catch (e: Exception) {
-            if (e !is CancellationException) {
-                Logger.e("FileManager: 下载失败: $filePath (StreamID=$streamId)", e)
-                sendError("下载失败: ${e.message}")
-            }
+            if (e is CancellationException) throw e
+            Logger.e("FileManager: 下载失败: $filePath (StreamID=$streamId)", e)
+            sendError("下载失败: ${e.message}")
         }
     }
 
@@ -352,46 +401,28 @@ class FileManager(
             if (target.exists() && target.length() == sourceFile.length()) return true
         } catch (_: Exception) {}
 
-        // [安全修复] 仅在 rootMode=true 时才尝试 RootShell/Shizuku 提权写入
+        // [安全修复] 仅在 rootMode=true 时才尝试 RootShell 提权写入
         if (!isRootMode) {
             Logger.i("FileManager: Java API 写入失败且 rootMode=false，不尝试提权兜底")
             return false
         }
 
-        // 第二次尝试：RootShell (su cp)
+        // 第二次尝试：RootShell（内部统一处理 su/Shizuku 回退和超时）
         try {
             val parentDir = File(targetPath).parent ?: ""
             withContext(Dispatchers.IO) {
-                if (parentDir.isNotEmpty()) RootShell.execute("mkdir -p ${shellEscape(parentDir)}")
-                RootShell.execute("cp ${shellEscape(sourceFile.absolutePath)} ${shellEscape(targetPath)}")
-                RootShell.execute("chmod 666 ${shellEscape(targetPath)}")
+                val command = buildList {
+                    if (parentDir.isNotEmpty()) add("mkdir -p ${shellEscape(parentDir)}")
+                    add("cp ${shellEscape(sourceFile.absolutePath)} ${shellEscape(targetPath)}")
+                    add("chmod 666 ${shellEscape(targetPath)}")
+                }.joinToString(" && ")
+                RootShell.execute(command, timeoutMs = 120_000)
             }
             if (withContext(Dispatchers.IO) { getFileSize(targetPath) } == sourceFile.length()) {
                 return true
             }
-        } catch (_: Exception) {}
-
-        // 第三次尝试：Shizuku (sh cp)
-        try {
-            if (isShizukuAvailable()) {
-                @Suppress("DEPRECATION")
-                val method = Shizuku::class.java.getDeclaredMethod(
-                    "newProcess",
-                    Array<String>::class.java,
-                    Array<String>::class.java,
-                    String::class.java
-                )
-                method.isAccessible = true
-                val p = method.invoke(
-                    null,
-                    arrayOf("sh", "-c", "cp ${shellEscape(sourceFile.absolutePath)} ${shellEscape(targetPath)} && chmod 666 ${shellEscape(targetPath)}"),
-                    null, null
-                ) as Process
-                withContext(Dispatchers.IO) { p.waitFor() }
-                if (withContext(Dispatchers.IO) { getFileSize(targetPath) } == sourceFile.length()) {
-                    return true
-                }
-            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {}
 
         return false
@@ -568,4 +599,9 @@ class FileManager(
             false
         }
     }
+}
+
+internal interface DownloadFileSource {
+    suspend fun size(path: String): Long?
+    suspend fun open(path: String): InputStream?
 }

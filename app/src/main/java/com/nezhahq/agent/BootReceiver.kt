@@ -7,6 +7,7 @@ import androidx.core.content.ContextCompat
 import com.nezhahq.agent.service.AgentService
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
+import com.nezhahq.agent.util.StorageStatus
 
 /**
  * 开机自启与应用更新后自动恢复的广播接收器。
@@ -33,6 +34,11 @@ class BootReceiver : BroadcastReceiver() {
         if (action != Intent.ACTION_BOOT_COMPLETED &&
             action != Intent.ACTION_MY_PACKAGE_REPLACED
         ) return
+
+        if (ConfigStore.initialize(context) == StorageStatus.UNAVAILABLE) {
+            Logger.e("BootReceiver: 收到 $action，但安全配置存储不可用，拒绝自动启动。")
+            return
+        }
 
         // 若用户尚未配置探针，无需自动启动
         if (!ConfigStore.hasValidConfig(context)) {
