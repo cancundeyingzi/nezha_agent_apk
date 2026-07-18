@@ -56,11 +56,12 @@ class AppListQuery(private val context: Context) {
         val apps = loadInstalledUserApps()
         val appByPackage = apps.associateBy { it.packageName }
         val output = RootShell.execute(
-            """
+            command = """
             dumpsys activity processes 2>/dev/null
             echo $MEMINFO_MARKER
             dumpsys meminfo 2>/dev/null
-            """.trimIndent()
+            """.trimIndent(),
+            timeoutMs = 30_000
         )
 
         if (output.isBlank()) {

@@ -68,6 +68,7 @@ import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.simulator.SimulatedDeviceConfig
+import com.nezhahq.agent.util.StorageStatus
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -268,6 +269,7 @@ private fun GlassButtonPrimary(
 private fun GlassButtonSecondary(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
     content: @Composable RowScope.() -> Unit
 ) {
     OutlinedButton(
@@ -275,6 +277,7 @@ private fun GlassButtonSecondary(
         modifier = modifier
             .height(52.dp)
             .etherShadow(shape = LgControlShape),
+        enabled = enabled,
         shape = LgControlShape,
         colors = ButtonDefaults.outlinedButtonColors(
             containerColor = LgGlassWhite40,
@@ -301,7 +304,8 @@ private fun EtherTextField(
     label: String,
     modifier: Modifier = Modifier,
     maxLines: Int = 1,
-    keyboardOptions: KeyboardOptions = KeyboardOptions.Default
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
+    enabled: Boolean = true
 ) {
     Column(modifier = modifier) {
         // 输入容器（保留 label 语义以支持 TalkBack 无障碍朗读）
@@ -313,6 +317,7 @@ private fun EtherTextField(
                 .fillMaxWidth()
                 .etherShadow(elevation = 2.dp, shape = LgControlShape),
             shape = LgControlShape,
+            enabled = enabled,
             maxLines = maxLines,
             keyboardOptions = keyboardOptions,
             textStyle = TextStyle(
@@ -343,11 +348,13 @@ private fun EtherTextField(
 @Composable
 private fun EtherSwitch(
     checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true
 ) {
     Switch(
         checked = checked,
         onCheckedChange = onCheckedChange,
+        enabled = enabled,
         colors = SwitchDefaults.colors(
             checkedThumbColor = Color.White,
             checkedTrackColor = LgCyan400,
@@ -917,7 +924,8 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 value = vm.simulatorServer,
                 onValueChange = { vm.simulatorServer = it },
                 label = "模拟器服务端 IP 或域名",
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !vm.isConfigWriteInProgress
             )
             Spacer(modifier = Modifier.height(12.dp))
             EtherTextField(
@@ -925,14 +933,16 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 onValueChange = { vm.simulatorPort = it },
                 label = "模拟器 gRPC 端口",
                 modifier = Modifier.fillMaxWidth(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                enabled = !vm.isConfigWriteInProgress
             )
             Spacer(modifier = Modifier.height(12.dp))
             EtherTextField(
                 value = vm.simulatorSecret,
                 onValueChange = { vm.simulatorSecret = it },
                 label = "模拟器客户端密钥 (Secret)",
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !vm.isConfigWriteInProgress
             )
             Spacer(modifier = Modifier.height(12.dp))
             EtherTextField(
@@ -940,7 +950,8 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 onValueChange = { vm.simulatorThreadCount = it },
                 label = "模拟器并发线程数 (1-${SimulatedDeviceConfig.MAX_THREAD_COUNT})",
                 modifier = Modifier.fillMaxWidth(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                enabled = !vm.isConfigWriteInProgress
             )
             Spacer(modifier = Modifier.height(8.dp))
             EtherToggleRow(
@@ -948,7 +959,8 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 onCheckedChange = { vm.simulatorUseTls = it },
                 title = "使用 TLS 加密连接",
                 description = "仅影响娱乐模拟设备，不会修改真实探针连接配置",
-                highlightWhenChecked = false
+                highlightWhenChecked = false,
+                enabled = !vm.isConfigWriteInProgress
             )
             Spacer(modifier = Modifier.height(8.dp))
             Column(
@@ -999,7 +1011,8 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 GlassButtonPrimary(
                     onClick = { vm.startSimulator() },
                     modifier = Modifier.weight(1f),
-                    enabled = !vm.simulatorRunning
+                    enabled = !vm.simulatorRunning && vm.isSecureStorageAvailable &&
+                        !vm.isConfigWriteInProgress
                 ) { Text("开启", fontWeight = FontWeight.Bold) }
                 GlassButtonSecondary(
                     onClick = { vm.stopSimulator() },
@@ -1024,6 +1037,8 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 Spacer(modifier = Modifier.height(4.dp))
                 PermissionStatusRow(
                     item = item,
+                    actionEnabled = item.key != "auto_start" ||
+                        (vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress),
                     onAction = {
                         // 根据权限类型执行不同的授权动作
                         when (item.key) {
@@ -1058,8 +1073,11 @@ fun ToolsScreenContent(vm: MainViewModel) {
                                 })
                             }
                             "auto_start" -> {
-                                vm.toggleAutoStart(!item.granted)
-                                permissionList = com.nezhahq.agent.util.PermissionChecker.getAllPermissionStatus(context)
+                                vm.toggleAutoStart(!item.granted) {
+                                    permissionList =
+                                        com.nezhahq.agent.util.PermissionChecker
+                                            .getAllPermissionStatus(context)
+                                }
                             }
                             "storage" -> {
                                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
@@ -1104,23 +1122,19 @@ fun ToolsScreenContent(vm: MainViewModel) {
             // 后台音频
             EtherToggleRow(
                 checked = vm.enableKeepAliveAudio,
-                onCheckedChange = { newValue ->
-                    vm.enableKeepAliveAudio = newValue
-                    vm.saveToolSettings()
-                },
+                onCheckedChange = vm::setKeepAliveAudio,
                 title = "允许后台播放微弱音频",
-                description = "发送极其微弱的次声波骗过部分系统的静音检测，防止杀后台（需重启服务生效）"
+                description = "发送极其微弱的次声波骗过部分系统的静音检测，防止杀后台（需重启服务生效）",
+                enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
             )
 
             // 悬浮窗
             EtherToggleRow(
                 checked = vm.enableFloatWindow,
-                onCheckedChange = { newValue ->
-                    vm.enableFloatWindow = newValue
-                    vm.saveToolSettings()
-                },
+                onCheckedChange = vm::setFloatWindow,
                 title = "开启像素级透明悬浮窗",
-                description = "创建一个1x1不可见的悬浮窗来拉高进程优先级（需授予悬浮窗权限并重启服务生效）"
+                description = "创建一个1x1不可见的悬浮窗来拉高进程优先级（需授予悬浮窗权限并重启服务生效）",
+                enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
             )
 
             // 开机自启动
@@ -1130,63 +1144,56 @@ fun ToolsScreenContent(vm: MainViewModel) {
                     vm.toggleAutoStart(newValue)
                 },
                 title = "开机自启动",
-                description = "设备重启后自动恢复探针后台服务，建议开启以防失联"
+                description = "设备重启后自动恢复探针后台服务，建议开启以防失联",
+                enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
             )
         }
 
-        // ══════════════════════════════════════════════════════════════════
-        // 数据采集增强
-        // ══════════════════════════════════════════════════════════════════
-
-        val vpnContext = androidx.compose.ui.platform.LocalContext.current
-
-        // VPN 授权回调：用户同意后保存配置
-        val vpnAuthLauncher = rememberLauncherForActivityResult(
-            contract = ActivityResultContracts.StartActivityForResult()
-        ) { result ->
-            if (result.resultCode == ComponentActivity.RESULT_OK) {
-                vm.enableVpnTraffic = true
-                vm.saveToolSettings()
-                Toast.makeText(vpnContext, "VPN 流量计量已授权，重启探针生效", Toast.LENGTH_SHORT).show()
-            } else {
-                vm.enableVpnTraffic = false
-                Toast.makeText(vpnContext, "VPN 授权被拒绝", Toast.LENGTH_SHORT).show()
+        if (vm.isVpnTrafficCompatibilityAvailable) {
+            val vpnContext = androidx.compose.ui.platform.LocalContext.current
+            val vpnAuthLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.StartActivityForResult()
+            ) { result ->
+                if (result.resultCode == ComponentActivity.RESULT_OK) {
+                    vm.setVpnTraffic(true)
+                } else {
+                    Toast.makeText(vpnContext, "VPN 授权被拒绝", Toast.LENGTH_SHORT).show()
+                }
             }
-        }
 
-        EtherCard {
-            Text("数据采集增强", style = MaterialTheme.typography.titleMedium)
-            Spacer(modifier = Modifier.height(8.dp))
+            EtherCard {
+                Text("数据采集增强", style = MaterialTheme.typography.titleMedium)
+                Spacer(modifier = Modifier.height(8.dp))
 
-            Row(verticalAlignment = Alignment.Top) {
-                EtherSwitch(
-                    checked = vm.enableVpnTraffic,
-                    onCheckedChange = { newValue ->
-                        if (newValue) {
-                            val prepareIntent = VpnService.prepare(vpnContext)
-                            if (prepareIntent != null) {
-                                vpnAuthLauncher.launch(prepareIntent)
+                Row(verticalAlignment = Alignment.Top) {
+                    EtherSwitch(
+                        checked = vm.enableVpnTraffic,
+                        enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress,
+                        onCheckedChange = { newValue ->
+                            if (newValue) {
+                                val prepareIntent = VpnService.prepare(vpnContext)
+                                if (prepareIntent != null) {
+                                    vpnAuthLauncher.launch(prepareIntent)
+                                } else {
+                                    vm.setVpnTraffic(true)
+                                }
                             } else {
-                                vm.enableVpnTraffic = true
-                                vm.saveToolSettings()
+                                vm.setVpnTraffic(false)
                             }
-                        } else {
-                            vm.enableVpnTraffic = false
-                            vm.saveToolSettings()
                         }
+                    )
+                    Column(modifier = Modifier.padding(start = 12.dp)) {
+                        Text("VPN 流量兼容模式", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "部分 ROM 在无 Root/Shizuku 时可能需要占位 VPN 才能取得系统流量（需重启服务生效）",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text(
+                            "⚠️ 该模式不代理数据包，但会占用系统 VPN 槽位，无法与其他 VPN 同时使用",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = LgWarning
+                        )
                     }
-                )
-                Column(modifier = Modifier.padding(start = 12.dp)) {
-                    Text("VPN 流量计量模式", style = MaterialTheme.typography.bodyMedium)
-                    Text(
-                        "在无 Root/Shizuku 且 Android 12 以下的设备上，通过本地 VPN 隧道精确统计网络流量（需重启服务生效）",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Text(
-                        "⚠️ 开启后将与其他 VPN 应用冲突（系统仅允许同时运行一个 VPN）",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = LgWarning
-                    )
                 }
             }
         }
@@ -1206,7 +1213,8 @@ private fun EtherToggleRow(
     onCheckedChange: (Boolean) -> Unit,
     title: String,
     description: String,
-    highlightWhenChecked: Boolean = true
+    highlightWhenChecked: Boolean = true,
+    enabled: Boolean = true
 ) {
     Row(
         modifier = Modifier
@@ -1219,7 +1227,7 @@ private fun EtherToggleRow(
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.Top
     ) {
-        EtherSwitch(checked = checked, onCheckedChange = onCheckedChange)
+        EtherSwitch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
         Column(modifier = Modifier.padding(start = 12.dp)) {
             Text(title, style = MaterialTheme.typography.bodyMedium)
             Text(description, style = MaterialTheme.typography.bodySmall)
@@ -1238,6 +1246,7 @@ private fun EtherToggleRow(
 @Composable
 private fun PermissionStatusRow(
     item: com.nezhahq.agent.util.PermissionChecker.PermissionItem,
+    actionEnabled: Boolean = true,
     onAction: () -> Unit
 ) {
     Row(
@@ -1264,6 +1273,7 @@ private fun PermissionStatusRow(
         if (!item.granted) {
             TextButton(
                 onClick = onAction,
+                enabled = actionEnabled,
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                 colors = ButtonDefaults.textButtonColors(contentColor = LgCyan600)
             ) {
@@ -1370,6 +1380,61 @@ fun ConfigScreenContent(
             )
         }
 
+        if (!vm.isSecureStorageAvailable) {
+            EtherCard(
+                modifier = Modifier.border(
+                    width = 2.dp,
+                    color = LgError.copy(alpha = 0.75f),
+                    shape = LgPanelShape
+                )
+            ) {
+                Text(
+                    "安全配置存储不可用",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = LgError
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    vm.storageErrorMessage
+                        ?: "安全配置存储不可用，凭据不会写入；请重置安全配置",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LgError
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                GlassButtonPrimary(
+                    onClick = { vm.resetSecureStorage() },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !vm.isResettingSecureStorage
+                ) {
+                    if (vm.isResettingSecureStorage) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = LgPrimary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("正在重置...", fontWeight = FontWeight.Bold)
+                    } else {
+                        Text("重置安全配置", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        } else if (vm.storageStatus == StorageStatus.RECOVERED) {
+            EtherCard(
+                modifier = Modifier.border(
+                    width = 1.dp,
+                    color = LgWarning.copy(alpha = 0.7f),
+                    shape = LgPanelShape
+                )
+            ) {
+                Text(
+                    "安全配置存储已自动修复，请核对并重新保存连接配置。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LgWarning
+                )
+            }
+        }
+
         // ── 首次启动自启动授权弹窗（保持功能不变）──
         if (vm.showAutoStartPrompt) {
             AlertDialog(
@@ -1377,12 +1442,18 @@ fun ConfigScreenContent(
                 title = { Text("启用开机自启动？") },
                 text = { Text("为了保证设备重启后探针不会离线，强烈建议您开启「开机自启动」功能。您稍后随时可以在「工具」页面修改此选项。") },
                 confirmButton = {
-                    GlassButtonPrimary(onClick = { vm.onAutoStartPromptResult(true) }) {
+                    GlassButtonPrimary(
+                        onClick = { vm.onAutoStartPromptResult(true) },
+                        enabled = !vm.isConfigWriteInProgress
+                    ) {
                         Text("启用")
                     }
                 },
                 dismissButton = {
-                    GlassButtonSecondary(onClick = { vm.onAutoStartPromptResult(false) }) {
+                    GlassButtonSecondary(
+                        onClick = { vm.onAutoStartPromptResult(false) },
+                        enabled = !vm.isConfigWriteInProgress
+                    ) {
                         Text("暂不启用")
                     }
                 }
@@ -1408,12 +1479,14 @@ fun ConfigScreenContent(
                 onValueChange = { vm.clipboardInput = it },
                 label = "请粘贴面板上的 curl 安装脚本/命令",
                 modifier = Modifier.fillMaxWidth(),
-                maxLines = 3
+                maxLines = 3,
+                enabled = !vm.isConfigWriteInProgress
             )
             Spacer(modifier = Modifier.height(12.dp))
             GlassButtonPrimary(
                 onClick = { vm.parseClipboardConfig() },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !vm.isConfigWriteInProgress
             ) { Text("开始智能解析", fontWeight = FontWeight.Bold) }
         }
 
@@ -1424,22 +1497,26 @@ fun ConfigScreenContent(
 
             EtherTextField(
                 value = vm.server, onValueChange = { vm.server = it },
-                label = "服务端 IP 或域名", modifier = Modifier.fillMaxWidth()
+                label = "服务端 IP 或域名", modifier = Modifier.fillMaxWidth(),
+                enabled = !vm.isConfigWriteInProgress
             )
             Spacer(modifier = Modifier.height(12.dp))
             EtherTextField(
                 value = vm.port, onValueChange = { vm.port = it },
-                label = "gRPC 端口 (例如 8008)", modifier = Modifier.fillMaxWidth()
+                label = "gRPC 端口 (例如 8008)", modifier = Modifier.fillMaxWidth(),
+                enabled = !vm.isConfigWriteInProgress
             )
             Spacer(modifier = Modifier.height(12.dp))
             EtherTextField(
                 value = vm.secret, onValueChange = { vm.secret = it },
-                label = "客户端密钥 (Secret)", modifier = Modifier.fillMaxWidth()
+                label = "客户端密钥 (Secret)", modifier = Modifier.fillMaxWidth(),
+                enabled = !vm.isConfigWriteInProgress
             )
             Spacer(modifier = Modifier.height(12.dp))
             EtherTextField(
                 value = vm.uuid, onValueChange = { vm.uuid = it },
-                label = "客户端标识 (UUID)", modifier = Modifier.fillMaxWidth()
+                label = "客户端标识 (UUID)", modifier = Modifier.fillMaxWidth(),
+                enabled = !vm.isConfigWriteInProgress
             )
             Spacer(modifier = Modifier.height(12.dp))
             EtherToggleRow(
@@ -1447,7 +1524,8 @@ fun ConfigScreenContent(
                 onCheckedChange = { newValue -> vm.onUseTlsChanged(newValue) },
                 title = "使用 TLS 加密连接",
                 description = "关闭后将使用明文传输，仅适用于可信内网部署（需重启服务生效）",
-                highlightWhenChecked = false
+                highlightWhenChecked = false,
+                enabled = !vm.isConfigWriteInProgress
             )
             if (!vm.useTls) {
                 Text(
@@ -1468,7 +1546,8 @@ fun ConfigScreenContent(
                     checked = vm.rootMode,
                     onCheckedChange = { newValue ->
                         vm.onRootModeChanged(newValue, shizukuRequestCode)
-                    }
+                    },
+                    enabled = !vm.isConfigWriteInProgress
                 )
                 Column(modifier = Modifier.padding(start = 12.dp)) {
                     Text("Root / Shizuku 模式", style = MaterialTheme.typography.bodyMedium)
@@ -1497,7 +1576,8 @@ fun ConfigScreenContent(
                     vm.toggleRemoteCommand(newValue)
                 },
                 title = "允许面板远程执行命令",
-                description = "允许面板通过 TaskType 4 在本设备上执行 sh -c 命令（需重启服务生效）"
+                description = "允许面板通过 TaskType 4 在本设备上执行 sh -c 命令（需重启服务生效）",
+                enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
             )
             if (vm.enableRemoteCommand) {
                 Text(
@@ -1576,7 +1656,8 @@ fun ConfigScreenContent(
                         }
                     )
                 },
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.weight(1f),
+                enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
             ) { Text("启动探针", fontWeight = FontWeight.Bold) }
 
             GlassButtonSecondary(

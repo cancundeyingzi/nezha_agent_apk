@@ -68,11 +68,7 @@ class SystemStateCollector(private val context: Context) {
     private var lastTxBytes = -1L
     private var lastTimeMs  = SystemClock.elapsedRealtime()
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // 状态变量：/proc/stat CPU 差值采样（在 Root 模式下有效）
-    // ──────────────────────────────────────────────────────────────────────────
-    private var lastCpuTotal = 0L
-    private var lastCpuIdle  = 0L
+    private val cpuUsageSampler = CpuUsageSampler()
 
     // ──────────────────────────────────────────────────────────────────────────
     // 日志去重标志：对于已知的不可恢复限制，只打印一次警告
@@ -181,7 +177,7 @@ class SystemStateCollector(private val context: Context) {
      * - 普通模式（Android 12+）：遍历 NetworkInterface 并调用 TrafficStats.getRxBytes(iface.name)。
      * - 普通模式（Android 6+ 降级）：尝试使用 NetworkStatsManager 查询设备总计。
      * - 普通模式（最低兜底）：使用 TrafficStats.getTotalRxBytes()，若被系统拦截或不支持则回退为 0。
-     * - VPN 纯计量模式（最终兜底）：TrafficVpnService 定时读取 /proc/net/dev，不拦截任何流量。
+     * - 所有普通策略均返回 0 时，直接尝试读取 `/proc/net/dev`。
      */
     private fun readNetworkTrafficBytes(isRootMode: Boolean): Pair<Long, Long> {
         var rx = -1L
@@ -189,24 +185,9 @@ class SystemStateCollector(private val context: Context) {
 
         if (isRootMode) {
             try {
-                val output = RootShell.execute("cat /proc/net/dev")
-                if (output.isNotBlank()) {
-                    var tempRx = 0L
-                    var tempTx = 0L
-                    var hasData = false
-                    output.lineSequence().forEach { line ->
-                        // 使用零拷贝字符索引解析，避免 split/substring 的临时对象分配
-                        val parsed = parseProcNetDevLine(line)
-                        if (parsed != null) {
-                            tempRx += parsed.first
-                            tempTx += parsed.second
-                            if (parsed.first > 0 || parsed.second > 0) hasData = true
-                        }
-                    }
-                    if (hasData) {
-                        rx = tempRx
-                        tx = tempTx
-                    }
+                ProcNetDevReader.parse(RootShell.execute("cat /proc/net/dev"))?.let { snapshot ->
+                    rx = snapshot.rxBytes
+                    tx = snapshot.txBytes
                 }
             } catch (e: Exception) {
                 Logger.e("StateCollector: Root 模式读取 /proc/net/dev 失败", e)
@@ -290,85 +271,12 @@ class SystemStateCollector(private val context: Context) {
             tx = if (tsTx >= 0) tsTx else 0L
         }
 
-        // 降级策略 4（VPN 纯计量兜底）：当所有系统 API 均返回 0 时，
-        // 从 TrafficVpnService 获取通过 /proc/net/dev 采集的流量数据。
-        // TrafficVpnService 不拦截任何网络流量，仅建立一个占位 VPN 接口，
-        // 通过定时读取 /proc/net/dev 获取真实网卡累计流量（与 Root 模式相同的数据源）。
-        // 仅在用户手动开启 VPN 模式且 VPN 服务正在运行时生效。
-        if (rx <= 0L && tx <= 0L && ConfigStore.getEnableVpnTraffic(context)) {
-            val vpnBytes = com.nezhahq.agent.service.TrafficVpnService.getTrafficBytes()
-            if (vpnBytes.first > 0 || vpnBytes.second > 0) {
-                rx = vpnBytes.first
-                tx = vpnBytes.second
-            }
-        }
-
-        return Pair(rx, tx)
-    }
-
-    /**
-     * 零拷贝解析 /proc/net/dev 的单行数据。
-     *
-     * 行格式示例：
-     * ```
-     *   wlan0:  123456  100  0  0  0  0  0  0   654321  50  0  0  0  0  0  0
-     * ```
-     *
-     * 通过纯字符索引定位，提取冒号后的第 1 个字段（接收字节）和第 9 个字段（发送字节），
-     * **无 split()、无 substringAfter()、无临时 List/Array 分配**，
-     * GC 开销为零（仅栈上局部变量）。
-     *
-     * @param line /proc/net/dev 中的一行
-     * @return Pair(rxBytes, txBytes)，不含 lo 接口；若行格式不匹配则返回 null
-     */
-    private fun parseProcNetDevLine(line: String): Pair<Long, Long>? {
-        // 查找冒号，冒号前是接口名
-        val colonIdx = line.indexOf(':')
-        if (colonIdx < 0) return null
-
-        // 检查接口名是否为 lo（跳过环回接口）
-        // 从 colonIdx 向前扫描非空白字符，提取接口名
-        var nameEnd = colonIdx - 1
-        while (nameEnd >= 0 && line[nameEnd] == ' ') nameEnd--
-        if (nameEnd < 0) return null
-        var nameStart = nameEnd
-        while (nameStart > 0 && line[nameStart - 1] != ' ') nameStart--
-        // 比较接口名是否为 "lo"（2 字符精确匹配）
-        val nameLen = nameEnd - nameStart + 1
-        if (nameLen == 2 && line[nameStart] == 'l' && line[nameStart + 1] == 'o') return null
-
-        // 从冒号后开始，逐字段扫描提取第 1 和第 9 个数字字段
-        val len = line.length
-        var pos = colonIdx + 1
-        var fieldIndex = 0
-        var rxBytes = 0L
-        var txBytes = 0L
-
-        while (pos < len && fieldIndex < 9) {
-            // 跳过空白
-            while (pos < len && line[pos] == ' ') pos++
-            if (pos >= len) break
-
-            // 解析当前数字字段
-            var value = 0L
-            val fieldStart = pos
-            while (pos < len && line[pos] in '0'..'9') {
-                value = value * 10 + (line[pos] - '0')
-                pos++
-            }
-            // 若没有实际数字字符，说明格式异常
-            if (pos == fieldStart) break
-
-            when (fieldIndex) {
-                0 -> rxBytes = value   // 第 1 个字段：接收字节
-                8 -> txBytes = value   // 第 9 个字段：发送字节
-            }
-            fieldIndex++
-        }
-
-        // 至少需要解析到第 9 个字段
-        if (fieldIndex < 9) return null
-        return Pair(rxBytes, txBytes)
+        // 任一方向缺失时整体切换到同一个 /proc 快照，避免混合不同计数域。
+        val selected = selectTrafficSnapshot(
+            primary = TrafficSnapshot(rxBytes = rx, txBytes = tx),
+            fallback = ProcNetDevReader::read
+        )
+        return Pair(selected.rxBytes, selected.txBytes)
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -396,21 +304,19 @@ class SystemStateCollector(private val context: Context) {
      * @return [0.0, 100.0] 内的 CPU 使用率
      */
     private fun readCpuUsagePercent(isRootMode: Boolean): Double {
-        if (isRootMode) {
-            // Root 模式：使用持久 su 会话读取（不创建新进程！）
-            val line = RootShell.executeFirstLine("head -n 1 /proc/stat")
-            return parseProcStatLine(line)
-        }
-
-        // 普通模式：直接尝试读取 /proc/stat
-        return try {
-            val line = File("/proc/stat").bufferedReader().use { it.readLine() }
-            parseProcStatLine(line)
+        val line = try {
+            if (isRootMode) {
+                // Root 模式：使用持久 su 会话读取（不创建新进程！）
+                RootShell.executeFirstLine("head -n 1 /proc/stat")
+            } else {
+                File("/proc/stat").bufferedReader().use { it.readLine() }
+            }
         } catch (e: Exception) {
             // Android 9+ SELinux 策略收紧导致 EACCES，属预期行为
             // 诚实返回 0.0，不使用 top（第一帧陷阱 + OEM 格式混乱）
-            0.0
+            null
         }
+        return parseProcStatLine(line)
     }
 
     /**
@@ -425,36 +331,7 @@ class SystemStateCollector(private val context: Context) {
      * @return [0.0, 100.0] 的 CPU 使用率，首次调用返回 0.0（无历史基准）
      */
     private fun parseProcStatLine(line: String?): Double {
-        if (line == null) return 0.0
-        // 使用预编译常量分割，避免每次 JIT 编译正则
-        val parts = line.trim().split(WHITESPACE_RE)
-        if (parts.size < 5 || parts[0] != "cpu") return 0.0
-
-        val user    = parts.getOrNull(1)?.toLongOrNull() ?: 0L
-        val nice    = parts.getOrNull(2)?.toLongOrNull() ?: 0L
-        val system  = parts.getOrNull(3)?.toLongOrNull() ?: 0L
-        val idle    = parts.getOrNull(4)?.toLongOrNull() ?: 0L
-        val iowait  = parts.getOrNull(5)?.toLongOrNull() ?: 0L
-        val irq     = parts.getOrNull(6)?.toLongOrNull() ?: 0L
-        val softirq = parts.getOrNull(7)?.toLongOrNull() ?: 0L
-
-        val total   = user + nice + system + idle + iowait + irq + softirq
-        // iowait 期间 CPU 本质上也是空闲的（等待 IO 完成）
-        val idleAll = idle + iowait
-
-        val deltaTotal = total - lastCpuTotal
-        val deltaIdle  = idleAll - lastCpuIdle
-
-        // 更新历史基准，供下次差值计算
-        lastCpuTotal = total
-        lastCpuIdle  = idleAll
-
-        // 首次调用时 lastCpuTotal == 0，deltaTotal 为历史累计值，
-        // 不能直接当做采样间隔使用，返回 0.0 等待下一次调用建立基准
-        if (deltaTotal <= 0L) return 0.0
-
-        return ((deltaTotal - deltaIdle).toDouble() / deltaTotal.toDouble() * 100.0)
-            .coerceIn(0.0, 100.0)
+        return cpuUsageSampler.sample(line)
     }
 
     // ──────────────────────────────────────────────────────────────────────────

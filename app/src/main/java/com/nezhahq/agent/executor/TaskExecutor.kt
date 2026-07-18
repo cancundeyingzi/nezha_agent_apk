@@ -1,25 +1,289 @@
 package com.nezhahq.agent.executor
 
+import android.os.Build
+import androidx.annotation.RequiresApi
 import com.nezhahq.agent.util.Logger
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONObject
 import proto.Nezha.Task
 import proto.Nezha.TaskResult
+import java.io.Closeable
+import java.io.IOException
+import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
-import org.json.JSONObject
-import java.io.InputStream
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+internal sealed interface ProcessWaitResult {
+    data class Exited(val exitCode: Int) : ProcessWaitResult
+
+    data object TimedOut : ProcessWaitResult
+}
+
+/**
+ * Process operations that are safe on every supported Android API level.
+ *
+ * The SDK value and blocking primitives are injected so JVM tests do not need an Android runtime.
+ * Waiting deliberately uses only [Process.exitValue], because Android did not expose the timed
+ * `Process.waitFor` overload until API 26.
+ */
+internal class ProcessCompatibility(
+    private val sdkInt: Int,
+    private val destroyForcibly: (Process) -> Unit,
+    private val pollIntervalMillis: Long = 10L,
+    private val nanoTime: () -> Long = System::nanoTime,
+    private val sleep: (Long) -> Unit = { Thread.sleep(it) },
+    private val destroy: (Process) -> Unit = { it.destroy() }
+) {
+    init {
+        require(pollIntervalMillis > 0) { "pollIntervalMillis must be positive" }
+    }
+
+    @Throws(InterruptedException::class)
+    fun waitFor(process: Process, timeoutMillis: Long): ProcessWaitResult {
+        require(timeoutMillis >= 0) { "timeoutMillis must not be negative" }
+        val deadlineNanos = nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        return waitForUntil(process, deadlineNanos)
+    }
+
+    @Throws(InterruptedException::class)
+    fun waitForUntil(process: Process, deadlineNanos: Long): ProcessWaitResult {
+        while (true) {
+            if (hasReachedDeadline(nanoTime(), deadlineNanos)) {
+                return ProcessWaitResult.TimedOut
+            }
+
+            val exitCode = try {
+                process.exitValue()
+            } catch (_: IllegalThreadStateException) {
+                null
+            }
+            if (exitCode != null) {
+                return if (hasReachedDeadline(nanoTime(), deadlineNanos)) {
+                    ProcessWaitResult.TimedOut
+                } else {
+                    ProcessWaitResult.Exited(exitCode)
+                }
+            }
+
+            val remainingNanos = deadlineNanos - nanoTime()
+            if (remainingNanos <= 0) return ProcessWaitResult.TimedOut
+            val remainingMillis = TimeUnit.NANOSECONDS.toMillis(remainingNanos).coerceAtLeast(1L)
+            try {
+                sleep(minOf(pollIntervalMillis, remainingMillis))
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw interrupted
+            }
+        }
+    }
+
+    fun terminate(process: Process) {
+        try {
+            if (sdkInt >= FORCE_DESTROY_MIN_SDK) {
+                destroyForcibly(process)
+            } else {
+                destroy(process)
+            }
+        } catch (_: Exception) {
+            // Stream cleanup below must still run if a vendor Process implementation rejects destroy.
+        } finally {
+            closeStreams(process)
+        }
+    }
+
+    fun closeStreams(process: Process) {
+        closeQuietly { process.outputStream } // child stdin
+        closeQuietly { process.inputStream } // child stdout
+        closeQuietly { process.errorStream } // child stderr
+    }
+
+    private inline fun closeQuietly(stream: () -> Closeable) {
+        try {
+            stream().close()
+        } catch (_: Exception) {
+            // Each stream is attempted independently.
+        }
+    }
+
+    private companion object {
+        const val FORCE_DESTROY_MIN_SDK = 26
+    }
+}
+
+/** Keeps the API 26 symbol out of classes loaded on Android 6 and 7. */
+@RequiresApi(Build.VERSION_CODES.O)
+private object Api26ProcessDestroyer : (Process) -> Unit {
+    override fun invoke(process: Process) {
+        process.destroyForcibly()
+    }
+}
+
+internal sealed interface ProcessExecutionResult {
+    val output: String
+
+    data class Exited(val exitCode: Int, override val output: String) : ProcessExecutionResult
+
+    data class TimedOut(override val output: String) : ProcessExecutionResult
+}
+
+private sealed interface ProcessExecutionState {
+    data object Running : ProcessExecutionState
+    data class Exited(val exitCode: Int) : ProcessExecutionState
+    data object TimedOut : ProcessExecutionState
+    data object Cancelled : ProcessExecutionState
+    data object Failed : ProcessExecutionState
+}
+
+/** Coordinates output draining, the absolute deadline, cancellation, and process cleanup. */
+internal class ProcessExecutionOrchestrator(
+    private val processCompatibility: ProcessCompatibility,
+    private val nanoTime: () -> Long = System::nanoTime,
+    private val delayMillis: suspend (Long) -> Unit = { delay(it) }
+) {
+    suspend fun executeUntil(
+        process: Process,
+        deadlineNanos: Long,
+        maxOutputBytes: Int
+    ): ProcessExecutionResult = coroutineScope {
+        val state = AtomicReference<ProcessExecutionState>(ProcessExecutionState.Running)
+
+        fun claimAndTerminate(terminalState: ProcessExecutionState) {
+            if (state.compareAndSet(ProcessExecutionState.Running, terminalState)) {
+                processCompatibility.terminate(process)
+            }
+        }
+
+        val watchdog = launch(start = CoroutineStart.UNDISPATCHED) {
+            while (state.get() === ProcessExecutionState.Running) {
+                val remainingNanos = deadlineNanos - nanoTime()
+                if (remainingNanos <= 0) {
+                    claimAndTerminate(ProcessExecutionState.TimedOut)
+                    return@launch
+                }
+                delayMillis(TimeUnit.NANOSECONDS.toMillis(remainingNanos).coerceAtLeast(1L))
+            }
+        }
+
+        var output = ""
+        try {
+            val waitResult = runCancellableBlocking(
+                onCancellation = { claimAndTerminate(ProcessExecutionState.Cancelled) }
+            ) { isActive ->
+                output = readLimitedUtf8(process.inputStream, maxOutputBytes)
+                if (!isActive()) {
+                    return@runCancellableBlocking ProcessWaitResult.TimedOut
+                }
+                processCompatibility.waitForUntil(process, deadlineNanos)
+            }
+
+            when (waitResult) {
+                is ProcessWaitResult.Exited -> state.compareAndSet(
+                    ProcessExecutionState.Running,
+                    ProcessExecutionState.Exited(waitResult.exitCode)
+                )
+
+                ProcessWaitResult.TimedOut -> claimAndTerminate(ProcessExecutionState.TimedOut)
+            }
+            watchdog.cancelAndJoin()
+
+            when (val terminalState = state.get()) {
+                is ProcessExecutionState.Exited -> ProcessExecutionResult.Exited(
+                    exitCode = terminalState.exitCode,
+                    output = output
+                )
+
+                ProcessExecutionState.TimedOut -> ProcessExecutionResult.TimedOut(output)
+                ProcessExecutionState.Cancelled -> throw CancellationException("Process execution cancelled")
+                ProcessExecutionState.Failed -> error("Process execution failed without an exception")
+                ProcessExecutionState.Running -> error("Process execution did not reach a terminal state")
+            }
+        } catch (cancelled: CancellationException) {
+            claimAndTerminate(ProcessExecutionState.Cancelled)
+            throw cancelled
+        } catch (failure: Throwable) {
+            claimAndTerminate(ProcessExecutionState.Failed)
+            throw failure
+        } finally {
+            watchdog.cancel()
+            if (state.get() is ProcessExecutionState.Exited) {
+                processCompatibility.closeStreams(process)
+            }
+        }
+    }
+}
+
+private suspend fun <T> runCancellableBlocking(
+    onCancellation: () -> Unit,
+    block: (isActive: () -> Boolean) -> T
+): T = suspendCancellableCoroutine { continuation ->
+    continuation.invokeOnCancellation { onCancellation() }
+    if (!continuation.isActive) return@suspendCancellableCoroutine
+
+    try {
+        val result = block { continuation.isActive }
+        if (continuation.isActive) continuation.resume(result)
+    } catch (failure: Throwable) {
+        if (continuation.isActive) continuation.resumeWithException(failure)
+    }
+}
+
+private fun hasReachedDeadline(nowNanos: Long, deadlineNanos: Long): Boolean =
+    nowNanos - deadlineNanos >= 0
+
+/**
+ * Retains at most [maxBytes], but keeps draining [inputStream] so a full pipe cannot stall the
+ * child process. Decoding happens once after collection, preserving UTF-8 sequences split across
+ * read boundaries.
+ */
+internal fun readLimitedUtf8(inputStream: InputStream, maxBytes: Int): String {
+    require(maxBytes >= 0) { "maxBytes must not be negative" }
+
+    val retained = ByteArray(maxBytes)
+    val readBuffer = ByteArray(PROCESS_READ_BUFFER_BYTES)
+    var retainedBytes = 0
+    try {
+        while (true) {
+            val bytesRead = inputStream.read(readBuffer)
+            if (bytesRead == -1) break
+            if (bytesRead == 0) continue
+
+            val bytesToRetain = minOf(bytesRead, maxBytes - retainedBytes)
+            if (bytesToRetain > 0) {
+                readBuffer.copyInto(
+                    destination = retained,
+                    destinationOffset = retainedBytes,
+                    startIndex = 0,
+                    endIndex = bytesToRetain
+                )
+                retainedBytes += bytesToRetain
+            }
+        }
+    } catch (_: IOException) {
+        // Process termination closes the pipe; return the bytes retained before it closed.
+    }
+    return String(retained, 0, retainedBytes, Charsets.UTF_8)
+}
+
+private const val PROCESS_READ_BUFFER_BYTES = 8 * 1024
 
 /**
  * 任务执行器：处理面板下发的各类监控任务。
@@ -39,8 +303,26 @@ object TaskExecutor {
 
     /** 命令执行超时时间：2 小时（毫秒），对齐官方 Go Agent 的 time.Hour * 2 */
     private const val COMMAND_TIMEOUT_MS = 2L * 60 * 60 * 1000
+    private const val MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
     private const val MAX_LOGGED_UNSUPPORTED_TYPES = 64
     private val loggedUnsupportedTypes = LinkedHashSet<Long>()
+    private val processCompatibility by lazy {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ProcessCompatibility(
+                sdkInt = Build.VERSION.SDK_INT,
+                destroyForcibly = Api26ProcessDestroyer
+            )
+        } else {
+            ProcessCompatibility(
+                sdkInt = Build.VERSION.SDK_INT,
+                // The compatibility layer never selects this strategy below API 26.
+                destroyForcibly = { process -> process.destroy() }
+            )
+        }
+    }
+    private val processOrchestrator by lazy {
+        ProcessExecutionOrchestrator(processCompatibility)
+    }
 
     // ──────────────────────────────────────────────────────────────────────────
     // OkHttpClient：信任所有证书（监控场景需要能连接自签名 HTTPS 站点）
@@ -122,16 +404,21 @@ object TaskExecutor {
                     val params = parseParams(task.data)
                     val start = System.currentTimeMillis()
                     val process = ProcessBuilder("ping", "-c", "1", "-w", "5", params.host).start()
-                    // 使用带超时的 waitFor 防止 ping 命令在某些魔改 ROM 上死锁
-                    val completed = process.waitFor(10, TimeUnit.SECONDS)
-                    val delay = (System.currentTimeMillis() - start).toFloat()
-
-                    if (completed) {
-                        resultBuilder.setDelay(delay).setSuccessful(process.exitValue() == 0)
-                    } else {
-                        // 超时，强制终止 ping 进程
-                        try { process.destroyForcibly() } catch (_: Exception) {}
-                        resultBuilder.setDelay(delay).setSuccessful(false)
+                    var exitedNormally = false
+                    try {
+                        // exitValue 轮询兼容 API 23；不调用 API 26 才提供的带超时 waitFor。
+                        val waitResult = processCompatibility.waitFor(process, timeoutMillis = 10_000)
+                        exitedNormally = waitResult is ProcessWaitResult.Exited
+                        val delay = (System.currentTimeMillis() - start).toFloat()
+                        resultBuilder.setDelay(delay).setSuccessful(
+                            waitResult is ProcessWaitResult.Exited && waitResult.exitCode == 0
+                        )
+                    } finally {
+                        if (exitedNormally) {
+                            processCompatibility.closeStreams(process)
+                        } else {
+                            processCompatibility.terminate(process)
+                        }
                     }
                 }
 
@@ -178,6 +465,8 @@ object TaskExecutor {
                     resultBuilder.setSuccessful(false).setData(message)
                 }
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             resultBuilder.setSuccessful(false).setData(e.message ?: "Unknown error")
         }
@@ -209,11 +498,11 @@ object TaskExecutor {
      *
      * ## 对齐官方 Go Agent 的安全机制
      * - 官方使用 `processgroup.NewProcessExitGroup()` + `time.NewTimer(time.Hour * 2)`
-     * - Android 端使用 `withTimeout` 协程超时 + `Process.destroyForcibly()` 替代
+     * - Android 端使用 2 小时看门狗，并按系统版本选择兼容的进程终止方式
      * - 合并 stderr 到 stdout（`redirectErrorStream(true)`），与 Go Agent 行为一致
      *
      * ## 超时处理
-     * 超时后通过 `destroyForcibly()` 强制终止子进程。
+     * API 26+ 超时后强制终止进程；API 23-25 只能调用 `destroy()`。
      * 注意：Android 普通权限下无法使用进程组 kill，仅能销毁直接子进程。
      * 若命令 fork 了孙进程，孙进程可能成为孤儿进程（这是 Android 沙箱的固有限制）。
      *
@@ -226,79 +515,41 @@ object TaskExecutor {
         val process = ProcessBuilder("sh", "-c", command)
             .redirectErrorStream(true)
             .start()
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(COMMAND_TIMEOUT_MS)
 
         try {
-            coroutineScope {
-                var isTimeout = false
-                // 看门狗协程：达到超时时间后主动强制终止进程
-                // 这是为了解决 withTimeout 无法打断 Java 阻塞 IO (readText) 的问题
-                val watchdog = launch {
-                    delay(COMMAND_TIMEOUT_MS)
-                    isTimeout = true
-                    try { process.destroyForcibly() } catch (_: Exception) {}
-                }
+            when (
+                val execution = processOrchestrator.executeUntil(
+                    process = process,
+                    deadlineNanos = deadlineNanos,
+                    maxOutputBytes = MAX_COMMAND_OUTPUT_BYTES
+                )
+            ) {
+                is ProcessExecutionResult.Exited -> resultBuilder
+                    .setData(execution.output)
+                    .setDelay((System.currentTimeMillis() - startTime).toFloat())
+                    .setSuccessful(execution.exitCode == 0)
 
-                // 在 IO 线程中读取全部输出（最多读取 1 MB 避免 OOM）。
-                // 若发生超时，看门狗会杀掉进程，由此关闭管道，这里的流读取会立即停止阻塞并返回已读数据。
-                val output = readLimitedString(process.inputStream, 1024 * 1024)
-                val exitVal = process.waitFor()
-                watchdog.cancel()
-
-                val delay = (System.currentTimeMillis() - startTime).toFloat()
-                if (isTimeout) {
+                is ProcessExecutionResult.TimedOut -> {
                     val elapsed = (System.currentTimeMillis() - startTime) / 1000
-                    Logger.i("TaskExecutor: 命令执行超时（${elapsed}s），已强制终止: ${command.take(100)}")
+                    Logger.i("TaskExecutor: 命令执行超时（${elapsed}s），已终止: ${command.take(100)}")
                     resultBuilder
-                        .setData("Command execution timed out after ${elapsed}s.\n$output")
-                        .setDelay(delay)
+                        .setData("Command execution timed out after ${elapsed}s.\n${execution.output}")
+                        .setDelay((System.currentTimeMillis() - startTime).toFloat())
                         .setSuccessful(false)
-                } else {
-                    resultBuilder
-                        .setData(output)
-                        .setDelay(delay)
-                        .setSuccessful(exitVal == 0)
                 }
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             val delay = (System.currentTimeMillis() - startTime).toFloat()
             resultBuilder.setData(e.message ?: "Unknown error").setDelay(delay).setSuccessful(false)
-        } finally {
-            // 确保进程资源释放
-            try { process.destroy() } catch (_: Exception) {}
         }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
     // 基础工具方法
     // ──────────────────────────────────────────────────────────────────────────
-
-    /**
-     * 安全地读取 InputStream，限制最大读取字节数，防止被恶意或失控脚本打爆内存（OOM）。
-     *
-     * @param inputStream 要读取的输入流
-     * @param maxBytes    最大允许读取的字节数
-     * @return 读取到的字符串内容
-     */
-    private fun readLimitedString(inputStream: InputStream, maxBytes: Int): String {
-        val buffer = ByteArray(4096)
-        val sb = java.lang.StringBuilder()
-        var totalRead = 0
-        try {
-            while (totalRead < maxBytes) {
-                // read 会在此阻塞直到有数据、EOF 或由于 destroyForcibly() 抛出异常
-                val bytesRead = inputStream.read(buffer, 0, minOf(buffer.size, maxBytes - totalRead))
-                if (bytesRead == -1) break
-                totalRead += bytesRead
-                sb.append(String(buffer, 0, bytesRead, Charsets.UTF_8))
-            }
-            if (totalRead >= maxBytes) {
-                sb.append("\n...[Output truncated due to size limit (1MB)]...\n")
-            }
-        } catch (e: Exception) {
-            // 当 watchdog 杀掉进程时，这里可能抛出 IOException
-        }
-        return sb.toString()
-    }
 
     /**
      * 从 X.500 Distinguished Name 中提取 CN（Common Name）字段。

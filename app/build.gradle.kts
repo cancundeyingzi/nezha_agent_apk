@@ -12,8 +12,8 @@ android {
         applicationId = "com.nezhahq.agent"
         minSdk = 23
         targetSdk = 34
-        versionCode = 374
-        versionName = "A0.9.10"
+        versionCode = 375
+        versionName = "A0.9.11"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

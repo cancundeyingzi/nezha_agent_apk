@@ -344,7 +344,7 @@ class AgentCommandHandler(private val context: Context) {
                 fi
             """.trimIndent()
 
-            val output = RootShell.execute(command)
+            val output = RootShell.execute(command, timeoutMs = 30_000)
             if (output.isBlank()) {
                 return@withContext ShellScreenshotResult.Failure("Root/Shizuku shell 不可用或无输出")
             }

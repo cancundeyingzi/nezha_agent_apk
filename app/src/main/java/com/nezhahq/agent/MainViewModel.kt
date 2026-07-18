@@ -23,6 +23,8 @@ import com.nezhahq.agent.simulator.SimulatedDeviceConfig
 import com.nezhahq.agent.simulator.SimulatedDeviceLoop
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.RootShell
+import com.nezhahq.agent.util.StorageStatus
+import com.nezhahq.agent.util.VpnTrafficCompatibility
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -51,6 +53,20 @@ import rikka.shizuku.Shizuku
  * 所有 IO/CPU 操作在 viewModelScope 中通过协程调度执行，UI 层仅观察 State。
  */
 class MainViewModel(application: Application) : AndroidViewModel(application) {
+
+    var storageStatus by mutableStateOf(ConfigStore.initialize(application))
+        private set
+
+    val isSecureStorageAvailable: Boolean
+        get() = storageStatus != StorageStatus.UNAVAILABLE
+
+    var isResettingSecureStorage by mutableStateOf(false)
+        private set
+
+    var storageErrorMessage by mutableStateOf(
+        if (storageStatus == StorageStatus.UNAVAILABLE) SECURE_STORAGE_UNAVAILABLE_MESSAGE else null
+    )
+        private set
 
     init {
         android.util.Log.i("LiquidGlass", "====== MainViewModel 开始初始化 ======")
@@ -99,14 +115,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ── 工具页设置 ──
     /** 后台音频保活 */
     var enableKeepAliveAudio by mutableStateOf(ConfigStore.getEnableKeepAliveAudio(application))
+        private set
     /** 像素级透明悬浮窗 */
     var enableFloatWindow by mutableStateOf(ConfigStore.getEnableFloatWindow(application))
+        private set
     /** 开机自启动 */
     var enableAutoStart by mutableStateOf(ConfigStore.getEnableAutoStart(application))
-    /** VPN 流量计量模式（无 Root/Shizuku 且 Android < 12 的兑底方案） */
-    var enableVpnTraffic by mutableStateOf(ConfigStore.getEnableVpnTraffic(application))
+        private set
+    /** VPN 流量兼容模式（部分无 Root/Shizuku 且 Android < 12 ROM 的兜底方案） */
+    var enableVpnTraffic by mutableStateOf(
+        VpnTrafficCompatibility.normalize(
+            enabled = ConfigStore.getEnableVpnTraffic(application),
+            sdkInt = Build.VERSION.SDK_INT
+        )
+    )
+        private set
+
+    val isVpnTrafficCompatibilityAvailable: Boolean
+        get() = VpnTrafficCompatibility.isSupported(Build.VERSION.SDK_INT)
     /** [安全修复] 远程命令执行独立开关（与 Root/Shizuku 模式解耦） */
     var enableRemoteCommand by mutableStateOf(ConfigStore.getEnableRemoteCommand(application))
+        private set
+
+    var isConfigWriteInProgress by mutableStateOf(false)
+        private set
 
     // ── 娱乐模拟设备上报 ──
     var simulatorServer by mutableStateOf(ConfigStore.getSimulatorServer(application))
@@ -114,6 +146,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var simulatorSecret by mutableStateOf(ConfigStore.getSimulatorSecret(application))
     var simulatorUseTls by mutableStateOf(ConfigStore.getSimulatorUseTls(application))
     var simulatorThreadCount by mutableStateOf(ConfigStore.getSimulatorThreadCount(application).toString())
+
+    init {
+        // A decrypt/read failure also closes the store; reflect that after loading every field.
+        storageStatus = ConfigStore.initialize(application)
+        if (!isSecureStorageAvailable) {
+            storageErrorMessage = SECURE_STORAGE_UNAVAILABLE_MESSAGE
+        }
+    }
 
     var simulatorRunning by mutableStateOf(false)
         private set
@@ -172,6 +212,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 2. 环境变量模式：`NZ_SERVER=host:port NZ_CLIENT_SECRET=xxx NZ_UUID=yyy NZ_TLS=true`
      */
     fun parseClipboardConfig() {
+        if (isConfigWriteInProgress) return
         val input = clipboardInput
 
         // Legacy flag based params
@@ -223,25 +264,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         Toast.makeText(getApplication(), "配置已解析完成", Toast.LENGTH_SHORT).show()
     }
 
-    /**
-     * 保存当前工具页设置到 ConfigStore。
-     */
-    fun saveToolSettings() {
-        val ctx = getApplication<Application>()
-        // 工具页开关设置各自独立保存，避免被 saveConfig 全量覆写
-        ConfigStore.setEnableFloatWindow(ctx, enableFloatWindow)
-        ConfigStore.setEnableVpnTraffic(ctx, enableVpnTraffic)
-        ConfigStore.saveConfig(
-            ctx,
-            ConfigStore.getServer(ctx),
-            ConfigStore.getPort(ctx),
-            ConfigStore.getSecret(ctx),
-            useTls,
-            ConfigStore.getUuid(ctx),
-            ConfigStore.getRootMode(ctx),
-            enableKeepAliveAudio
+    fun setKeepAliveAudio(enabled: Boolean) {
+        persistToolSettings(
+            enableKeepAliveAudio = enabled,
+            enableFloatWindow = enableFloatWindow,
+            enableVpnTraffic = enableVpnTraffic,
+            action = "保存后台音频设置",
+            failureMessage = "后台音频设置保存失败"
         )
-        Toast.makeText(ctx, "配置已保存，请在主页停止并重新启动探针以生效", Toast.LENGTH_LONG).show()
+    }
+
+    fun setFloatWindow(enabled: Boolean) {
+        persistToolSettings(
+            enableKeepAliveAudio = enableKeepAliveAudio,
+            enableFloatWindow = enabled,
+            enableVpnTraffic = enableVpnTraffic,
+            action = "保存悬浮窗设置",
+            failureMessage = "悬浮窗设置保存失败"
+        )
+    }
+
+    fun setVpnTraffic(enabled: Boolean) {
+        persistToolSettings(
+            enableKeepAliveAudio = enableKeepAliveAudio,
+            enableFloatWindow = enableFloatWindow,
+            enableVpnTraffic = enabled,
+            action = "保存 VPN 流量设置",
+            failureMessage = "VPN 流量设置保存失败"
+        )
     }
 
     /**
@@ -260,6 +310,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         requestNotificationPerm: (() -> Unit) -> Unit
     ) {
         val ctx = getApplication<Application>()
+        if (!requireSecureStorage("启动探针")) return
         val p = port.toIntOrNull()
 
         // [修复问题6] 启动前配置校验，防止配置不完整时启动服务
@@ -277,15 +328,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 清理可能的无效 UUID
-        uuid = uuid.trim().replace(Regex("^['\"]|['\"]$"), "")
-        if (uuid.isBlank() || uuid == "\\") {
-            uuid = java.util.UUID.randomUUID().toString()
-        }
-
-        // 持久化配置（工具页的 floatWindow / vpnTraffic 由各自独立方法保存，此处不涉及）
-        val currentAudioSetting = ConfigStore.getEnableKeepAliveAudio(ctx)
-        ConfigStore.saveConfig(ctx, server, p, secret, useTls, uuid, rootMode, currentAudioSetting)
+        val cleanedUuid = uuid.trim().replace(Regex("^['\"]|['\"]$"), "")
+        val uuidToSave = cleanedUuid.takeUnless { it.isBlank() || it == "\\" }
+            ?: java.util.UUID.randomUUID().toString()
+        val serverToSave = server
+        val secretToSave = secret
+        val useTlsToSave = useTls
+        val rootModeToSave = rootMode
 
         // 封装实际启动服务的 lambda
         val doLaunchService: () -> Unit = {
@@ -328,12 +377,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             checkAndShowAutoStartPrompt()
         }
 
-        // Android 13+ 通知权限时序控制
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notificationPermGranted) {
-            requestNotificationPerm(doLaunchService)
-        } else {
-            doLaunchService()
-        }
+        persistOnIo(
+            action = "保存连接配置并启动探针",
+            failureMessage = "连接配置保存失败，探针未启动",
+            persistence = {
+                val currentAudioSetting = ConfigStore.getEnableKeepAliveAudio(ctx)
+                ConfigStore.saveConfig(
+                    ctx,
+                    serverToSave,
+                    p,
+                    secretToSave,
+                    useTlsToSave,
+                    uuidToSave,
+                    rootModeToSave,
+                    currentAudioSetting
+                )
+            },
+            onSuccess = {
+                uuid = uuidToSave
+                // Android 13+ 通知权限时序控制 only begins after durable persistence.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    !notificationPermGranted
+                ) {
+                    requestNotificationPerm(doLaunchService)
+                } else {
+                    doLaunchService()
+                }
+            }
+        )
     }
 
     /**
@@ -350,6 +421,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (simulatorRunning) return
 
         val ctx = getApplication<Application>()
+        if (!requireSecureStorage("启动模拟器")) return
         val trimmedServer = simulatorServer.trim()
         val trimmedSecret = simulatorSecret.trim()
         val validationError = SimulatedDeviceConfig.validationError(
@@ -365,61 +437,72 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val parsedPort = simulatorPort.trim().toInt()
         val parsedThreadCount = simulatorThreadCount.trim().toInt()
-        simulatorServer = trimmedServer
-        simulatorPort = parsedPort.toString()
-        simulatorSecret = trimmedSecret
-        simulatorThreadCount = parsedThreadCount.toString()
-        ConfigStore.saveSimulatorConfig(
-            ctx,
-            server = trimmedServer,
-            port = parsedPort,
-            secret = trimmedSecret,
-            useTls = simulatorUseTls,
-            threadCount = parsedThreadCount
-        )
-
+        val simulatorTlsToSave = simulatorUseTls
         val config = SimulatedDeviceConfig(
             server = trimmedServer,
             port = parsedPort,
             secret = trimmedSecret,
-            useTls = simulatorUseTls,
+            useTls = simulatorTlsToSave,
             threadCount = parsedThreadCount
         )
-        simulatorRunning = true
-        simulatorSuccessCount = 0
-        simulatorFailureCount = 0
-        simulatorActiveThreadCount = parsedThreadCount
-        simulatorLastStatus = "模拟器已开启，$parsedThreadCount 个并发线程正在上报随机设备..."
-        simulatorJob = viewModelScope.launch(Dispatchers.IO) {
-            try {
-                simulatorLoop.run(
-                    config = config,
-                    shouldContinue = { isActive },
-                    onSuccess = {
+
+        persistOnIo(
+            action = "保存模拟器配置并启动模拟器",
+            failureMessage = "模拟器配置保存失败，模拟器未启动",
+            persistence = {
+                ConfigStore.saveSimulatorConfig(
+                    ctx,
+                    server = trimmedServer,
+                    port = parsedPort,
+                    secret = trimmedSecret,
+                    useTls = simulatorTlsToSave,
+                    threadCount = parsedThreadCount
+                )
+            },
+            onSuccess = {
+                simulatorServer = trimmedServer
+                simulatorPort = parsedPort.toString()
+                simulatorSecret = trimmedSecret
+                simulatorThreadCount = parsedThreadCount.toString()
+                simulatorRunning = true
+                simulatorSuccessCount = 0
+                simulatorFailureCount = 0
+                simulatorActiveThreadCount = parsedThreadCount
+                simulatorLastStatus =
+                    "模拟器已开启，$parsedThreadCount 个并发线程正在上报随机设备..."
+                simulatorJob = viewModelScope.launch(Dispatchers.IO) {
+                    try {
+                        simulatorLoop.run(
+                            config = config,
+                            shouldContinue = { isActive },
+                            onSuccess = {
+                                withContext(Dispatchers.Main) {
+                                    simulatorSuccessCount += 1
+                                    simulatorLastStatus =
+                                        "上次成功：第 $simulatorSuccessCount 台设备已收到状态回执"
+                                }
+                            },
+                            onFailure = { throwable ->
+                                withContext(Dispatchers.Main) {
+                                    simulatorFailureCount += 1
+                                    simulatorLastStatus =
+                                        "上次失败：${throwable.toSimulatorMessage()}"
+                                }
+                            }
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (throwable: Throwable) {
                         withContext(Dispatchers.Main) {
-                            simulatorSuccessCount += 1
+                            simulatorRunning = false
                             simulatorLastStatus =
-                                "上次成功：第 $simulatorSuccessCount 台设备已收到状态回执"
-                        }
-                    },
-                    onFailure = { throwable ->
-                        withContext(Dispatchers.Main) {
-                            simulatorFailureCount += 1
-                            simulatorLastStatus =
-                                "上次失败：${throwable.toSimulatorMessage()}"
+                                "模拟器异常停止：${throwable.toSimulatorMessage()}"
                         }
                     }
-                )
-            } catch (e: CancellationException) {
-                throw e
-            } catch (throwable: Throwable) {
-                withContext(Dispatchers.Main) {
-                    simulatorRunning = false
-                    simulatorLastStatus = "模拟器异常停止：${throwable.toSimulatorMessage()}"
                 }
+                Toast.makeText(ctx, "娱乐模拟设备已开启", Toast.LENGTH_SHORT).show()
             }
-        }
-        Toast.makeText(ctx, "娱乐模拟设备已开启", Toast.LENGTH_SHORT).show()
+        )
     }
 
     fun stopSimulator() {
@@ -436,6 +519,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onUseTlsChanged(enabled: Boolean) {
+        if (isConfigWriteInProgress) return
         useTls = enabled
     }
 
@@ -444,7 +528,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun checkAndShowAutoStartPrompt() {
         val ctx = getApplication<Application>()
-        if (!ConfigStore.getHasShownAutoStartPrompt(ctx)) {
+        if (!isSecureStorageAvailable) return
+        val hasShownAutoStartPrompt = ConfigStore.getHasShownAutoStartPrompt(ctx)
+        storageStatus = ConfigStore.initialize(ctx)
+        if (!isSecureStorageAvailable) {
+            storageErrorMessage = SECURE_STORAGE_UNAVAILABLE_MESSAGE
+            showAutoStartPrompt = false
+            return
+        }
+        if (!hasShownAutoStartPrompt) {
             showAutoStartPrompt = true
         }
     }
@@ -453,19 +545,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 处理自启动授权弹窗结果
      */
     fun onAutoStartPromptResult(accepted: Boolean) {
-        val ctx = getApplication<Application>()
-        enableAutoStart = accepted
-        ConfigStore.setEnableAutoStart(ctx, accepted)
-        ConfigStore.setHasShownAutoStartPrompt(ctx, true)
-        showAutoStartPrompt = false
+        persistOnIo(
+            action = "保存开机自启动设置",
+            failureMessage = "开机自启动设置保存失败",
+            persistence = { ConfigStore.saveAutoStartPromptResult(getApplication(), accepted) },
+            onSuccess = {
+                enableAutoStart = accepted
+                showAutoStartPrompt = false
+            },
+            onFailure = { showAutoStartPrompt = false }
+        )
     }
 
     /**
      * 工具页手动切换自启动开关
      */
-    fun toggleAutoStart(enabled: Boolean) {
-        enableAutoStart = enabled
-        ConfigStore.setEnableAutoStart(getApplication(), enabled)
+    fun toggleAutoStart(enabled: Boolean, onSaved: () -> Unit = {}) {
+        persistOnIo(
+            action = "保存开机自启动设置",
+            failureMessage = "开机自启动设置保存失败",
+            persistence = { ConfigStore.setEnableAutoStart(getApplication(), enabled) },
+            onSuccess = {
+                enableAutoStart = enabled
+                onSaved()
+            }
+        )
     }
 
     /**
@@ -475,8 +579,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 防止用户启用 Root 提权功能时静默授予面板远程命令执行权限。
      */
     fun toggleRemoteCommand(enabled: Boolean) {
-        enableRemoteCommand = enabled
-        ConfigStore.setEnableRemoteCommand(getApplication(), enabled)
+        persistOnIo(
+            action = "保存远程命令设置",
+            failureMessage = "远程命令设置保存失败",
+            persistence = { ConfigStore.setEnableRemoteCommand(getApplication(), enabled) },
+            onSuccess = { enableRemoteCommand = enabled }
+        )
+    }
+
+    /** Clears all credential storage on an IO thread and refreshes the UI with safe defaults. */
+    fun resetSecureStorage() {
+        if (isResettingSecureStorage) return
+        val ctx = getApplication<Application>()
+        isResettingSecureStorage = true
+        simulatorJob?.cancel()
+        simulatorJob = null
+        simulatorRunning = false
+        ctx.stopService(Intent(ctx, AgentService::class.java))
+        viewModelScope.launch {
+            val resetSucceeded = withContext(Dispatchers.IO) {
+                ConfigStore.resetSecureStorage(ctx)
+            }
+            isResettingSecureStorage = false
+            storageStatus = ConfigStore.initialize(ctx)
+            if (!resetSucceeded || !isSecureStorageAvailable) {
+                storageErrorMessage = "安全配置重置失败，加密存储仍不可用，请稍后重试"
+                Toast.makeText(ctx, storageErrorMessage, Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            refreshConfigurationFromSecureStorage()
+            storageStatus = ConfigStore.initialize(ctx)
+            if (!isSecureStorageAvailable) {
+                storageErrorMessage = "安全配置重置后读取失败，加密存储仍不可用，请稍后重试"
+                Toast.makeText(ctx, storageErrorMessage, Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            storageErrorMessage = null
+            Toast.makeText(ctx, "安全配置已重置，请重新填写连接信息", Toast.LENGTH_LONG).show()
+        }
     }
 
     /**
@@ -486,6 +626,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 开启时自动检测 Shizuku 可用性并按需请求权限。
      */
     fun onRootModeChanged(enabled: Boolean, shizukuRequestCode: Int) {
+        if (isConfigWriteInProgress) return
         if (enabled) {
             rootMode = true
             tryRequestShizukuPermission(shizukuRequestCode)
@@ -659,6 +800,131 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun requireSecureStorage(action: String): Boolean {
+        storageStatus = ConfigStore.initialize(getApplication())
+        if (isSecureStorageAvailable) return true
+        storageErrorMessage = SECURE_STORAGE_UNAVAILABLE_MESSAGE
+        Toast.makeText(
+            getApplication(),
+            "$action 已拒绝：$SECURE_STORAGE_UNAVAILABLE_MESSAGE",
+            Toast.LENGTH_LONG
+        ).show()
+        return false
+    }
+
+    private fun persistOnIo(
+        action: String,
+        failureMessage: String,
+        persistence: () -> Boolean,
+        onSuccess: () -> Unit,
+        onFailure: () -> Unit = {}
+    ) {
+        if (isConfigWriteInProgress) {
+            onFailure()
+            Toast.makeText(getApplication(), "安全配置正在保存，请稍候", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!requireSecureStorage(action)) {
+            onFailure()
+            return
+        }
+
+        isConfigWriteInProgress = true
+        viewModelScope.launch {
+            val persisted = withContext(Dispatchers.IO) {
+                try {
+                    persistence()
+                } catch (_: Exception) {
+                    false
+                }
+            }
+            isConfigWriteInProgress = false
+            if (persisted) {
+                onSuccess()
+            } else {
+                onFailure()
+                reportStorageWriteFailure(failureMessage)
+            }
+        }
+    }
+
+    private fun persistToolSettings(
+        enableKeepAliveAudio: Boolean,
+        enableFloatWindow: Boolean,
+        enableVpnTraffic: Boolean,
+        action: String,
+        failureMessage: String
+    ) {
+        val normalizedVpnSetting = VpnTrafficCompatibility.normalize(
+            enabled = enableVpnTraffic,
+            sdkInt = Build.VERSION.SDK_INT
+        )
+        if (!isVpnTrafficCompatibilityAvailable) {
+            this.enableVpnTraffic = false
+        }
+
+        persistOnIo(
+            action = action,
+            failureMessage = failureMessage,
+            persistence = {
+                ConfigStore.saveToolSettings(
+                    context = getApplication(),
+                    enableKeepAliveAudio = enableKeepAliveAudio,
+                    enableFloatWindow = enableFloatWindow,
+                    enableVpnTraffic = normalizedVpnSetting
+                )
+            },
+            onSuccess = {
+                this.enableKeepAliveAudio = enableKeepAliveAudio
+                this.enableFloatWindow = enableFloatWindow
+                this.enableVpnTraffic = normalizedVpnSetting
+                showToolSettingSaved()
+            }
+        )
+    }
+
+    private fun showToolSettingSaved() {
+        Toast.makeText(
+            getApplication(),
+            "配置已保存，请在主页停止并重新启动探针以生效",
+            Toast.LENGTH_LONG
+        ).show()
+    }
+
+    private fun reportStorageWriteFailure(message: String) {
+        storageStatus = ConfigStore.initialize(getApplication())
+        storageErrorMessage = "$message；安全配置存储不可用，请重置安全配置"
+        Toast.makeText(getApplication(), storageErrorMessage, Toast.LENGTH_LONG).show()
+    }
+
+    private fun refreshConfigurationFromSecureStorage() {
+        val ctx = getApplication<Application>()
+        server = ConfigStore.getServer(ctx)
+        port = ConfigStore.getPort(ctx).toString()
+        secret = ConfigStore.getSecret(ctx)
+        uuid = ConfigStore.getUuid(ctx)
+        useTls = ConfigStore.getUseTls(ctx)
+        rootMode = ConfigStore.getRootMode(ctx)
+        enableKeepAliveAudio = ConfigStore.getEnableKeepAliveAudio(ctx)
+        enableFloatWindow = ConfigStore.getEnableFloatWindow(ctx)
+        enableAutoStart = ConfigStore.getEnableAutoStart(ctx)
+        enableVpnTraffic = VpnTrafficCompatibility.normalize(
+            enabled = ConfigStore.getEnableVpnTraffic(ctx),
+            sdkInt = Build.VERSION.SDK_INT
+        )
+        enableRemoteCommand = ConfigStore.getEnableRemoteCommand(ctx)
+        simulatorServer = ConfigStore.getSimulatorServer(ctx)
+        simulatorPort = ConfigStore.getSimulatorPort(ctx).toString()
+        simulatorSecret = ConfigStore.getSimulatorSecret(ctx)
+        simulatorUseTls = ConfigStore.getSimulatorUseTls(ctx)
+        simulatorThreadCount = ConfigStore.getSimulatorThreadCount(ctx).toString()
+        simulatorSuccessCount = 0
+        simulatorFailureCount = 0
+        simulatorActiveThreadCount = 0
+        simulatorLastStatus = "未启动"
+        showAutoStartPrompt = false
+    }
+
     override fun onCleared() {
         simulatorJob?.cancel()
         simulatorJob = null
@@ -666,6 +932,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
 }
+
+private const val SECURE_STORAGE_UNAVAILABLE_MESSAGE =
+    "安全配置存储不可用，凭据不会写入；请重置安全配置"
 
 internal fun redactUuidForLog(value: String): String {
     if (value.isBlank()) return "(empty)"
