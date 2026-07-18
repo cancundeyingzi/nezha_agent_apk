@@ -12,7 +12,7 @@ android {
         applicationId = "com.nezhahq.agent"
         minSdk = 23
         targetSdk = 34
-        versionCode = 375
+        versionCode = 376
         versionName = "A0.9.11"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

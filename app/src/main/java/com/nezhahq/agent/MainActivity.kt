@@ -1463,31 +1463,75 @@ fun ConfigScreenContent(
         // ── gRPC 连接状态指示器 ──
         GrpcStatusIndicator(grpcState)
 
-        // ── 智能解析面板 ──
-        EtherCard {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("智能解析一键配置", style = MaterialTheme.typography.titleMedium)
+        // ── 常用操作：统一放在连接设置上方 ──
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                GlassButtonPrimary(
+                    onClick = { vm.parseClipboardConfig() },
+                    modifier = Modifier.weight(1f),
+                    enabled = !vm.isConfigWriteInProgress
+                ) {
+                    Text("粘贴命令", fontWeight = FontWeight.Bold)
+                }
+
+                GlassButtonSecondary(
+                    onClick = { vm.runInstantTest() },
+                    modifier = Modifier.weight(1f),
+                    enabled = !vm.isTestRunning
+                ) {
+                    if (vm.isTestRunning) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = LgPrimary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("采集中...", fontWeight = FontWeight.Bold)
+                    } else {
+                        Text("即时测试", fontWeight = FontWeight.Bold)
+                    }
+                }
             }
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                "扫描二维码或粘贴链接自动填充",
-                style = MaterialTheme.typography.bodySmall
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            EtherTextField(
-                value = vm.clipboardInput,
-                onValueChange = { vm.clipboardInput = it },
-                label = "请粘贴面板上的 curl 安装脚本/命令",
+
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-                maxLines = 3,
-                enabled = !vm.isConfigWriteInProgress
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            GlassButtonPrimary(
-                onClick = { vm.parseClipboardConfig() },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !vm.isConfigWriteInProgress
-            ) { Text("开始智能解析", fontWeight = FontWeight.Bold) }
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                GlassButtonPrimary(
+                    onClick = {
+                        val notifGranted = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                            ContextCompat.checkSelfPermission(
+                                context, Manifest.permission.POST_NOTIFICATIONS
+                            ) == PackageManager.PERMISSION_GRANTED
+                        } else true
+
+                        vm.startAgent(
+                            notificationPermGranted = notifGranted,
+                            requestNotificationPerm = { doLaunch ->
+                                pendingServiceLaunch = doLaunch
+                                notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                        )
+                    },
+                    modifier = Modifier.weight(1f),
+                    enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
+                ) {
+                    Text("启动探针", fontWeight = FontWeight.Bold)
+                }
+
+                GlassButtonSecondary(
+                    onClick = { vm.stopAgent() },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("停止探针", fontWeight = FontWeight.Bold)
+                }
+            }
         }
 
         // ── 连接设置 ──
@@ -1590,34 +1634,6 @@ fun ConfigScreenContent(
             }
         }
 
-        // ── 即时测试按钮 ──
-        EtherCard {
-            Text("数据采集测试", style = MaterialTheme.typography.titleMedium)
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                "立即执行一次系统数据采集，验证当前权限模式是否生效。",
-                style = MaterialTheme.typography.bodySmall
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            GlassButtonPrimary(
-                onClick = { vm.runInstantTest() },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !vm.isTestRunning
-            ) {
-                if (vm.isTestRunning) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                        color = LgPrimary
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("采集中...", fontWeight = FontWeight.Bold)
-                } else {
-                    Text("⚡ 即时测试", fontWeight = FontWeight.Bold)
-                }
-            }
-        }
-
         // ── 即时测试结果弹窗 ──
         vm.instantTestResult?.let { result ->
             AlertDialog(
@@ -1636,34 +1652,6 @@ fun ConfigScreenContent(
                     )
                 }
             )
-        }
-
-        // ── 守护进程启停控制 ──
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            GlassButtonPrimary(
-                onClick = {
-                    val notifGranted = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                        ContextCompat.checkSelfPermission(
-                            context, Manifest.permission.POST_NOTIFICATIONS
-                        ) == PackageManager.PERMISSION_GRANTED
-                    } else true
-
-                    vm.startAgent(
-                        notificationPermGranted = notifGranted,
-                        requestNotificationPerm = { doLaunch ->
-                            pendingServiceLaunch = doLaunch
-                            notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                        }
-                    )
-                },
-                modifier = Modifier.weight(1f),
-                enabled = vm.isSecureStorageAvailable && !vm.isConfigWriteInProgress
-            ) { Text("启动探针", fontWeight = FontWeight.Bold) }
-
-            GlassButtonSecondary(
-                onClick = { vm.stopAgent() },
-                modifier = Modifier.weight(1f)
-            ) { Text("停止探针", fontWeight = FontWeight.Bold) }
         }
 
         // ── 日志实时预览窗 ──

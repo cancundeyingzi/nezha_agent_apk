@@ -1,6 +1,7 @@
 package com.nezhahq.agent
 
 import android.app.Application
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -109,9 +110,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var useTls by mutableStateOf(ConfigStore.getUseTls(application))
     /** Root/Shizuku 高权限模式 */
     var rootMode by mutableStateOf(ConfigStore.getRootMode(application))
-    /** 智能解析输入框内容 */
-    var clipboardInput by mutableStateOf("")
-
     // ── 工具页设置 ──
     /** 后台音频保活 */
     var enableKeepAliveAudio by mutableStateOf(ConfigStore.getEnableKeepAliveAudio(application))
@@ -213,7 +211,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun parseClipboardConfig() {
         if (isConfigWriteInProgress) return
-        val input = clipboardInput
+        val context = getApplication<Application>()
+        val clipboard = context.getSystemService(ClipboardManager::class.java)
+        val input = clipboard
+            ?.primaryClip
+            ?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)
+            ?.coerceToText(context)
+            ?.toString()
+            .orEmpty()
+
+        if (input.isBlank()) {
+            Toast.makeText(context, "剪贴板中没有可解析的安装脚本", Toast.LENGTH_SHORT).show()
+            return
+        }
 
         // Legacy flag based params
         val sMatch = Regex("-s\\s+([^:\\s]+):(\\d+)").find(input)
@@ -261,7 +272,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             parseBooleanLike(envTlsMatch.groupValues[1])?.let { useTls = it }
         }
 
-        Toast.makeText(getApplication(), "配置已解析完成", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, "配置已解析完成", Toast.LENGTH_SHORT).show()
     }
 
     fun setKeepAliveAudio(enabled: Boolean) {
