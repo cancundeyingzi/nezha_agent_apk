@@ -14,20 +14,29 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.nezhahq.agent.collector.GpuCollector
 import com.nezhahq.agent.collector.SystemInfoCollector
 import com.nezhahq.agent.collector.SystemStateCollector
+import com.nezhahq.agent.core.config.ConfigRepository
+import com.nezhahq.agent.core.config.StorageStatus
+import com.nezhahq.agent.core.model.AgentConfig
+import com.nezhahq.agent.core.model.ConnectionDraft
+import com.nezhahq.agent.core.model.KeepAliveSettings
+import com.nezhahq.agent.core.model.RemoteCapability
 import com.nezhahq.agent.core.model.SimulatedDeviceConfig
+import com.nezhahq.agent.core.model.SimulatorDraft
 import com.nezhahq.agent.core.platform.VpnTrafficCompatibility
 import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.grpc.GrpcManager
 import com.nezhahq.agent.service.AgentService
 import com.nezhahq.agent.simulator.GrpcSimulatedDeviceReporter
 import com.nezhahq.agent.simulator.SimulatedDeviceLoop
-import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.RootShell
-import com.nezhahq.agent.util.StorageStatus
+import com.nezhahq.agent.util.SharedPreferencesConfigRepository
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -55,19 +64,30 @@ import rikka.shizuku.Shizuku
  * ## 线程安全
  * 所有 IO/CPU 操作在 viewModelScope 中通过协程调度执行，UI 层仅观察 State。
  */
-class MainViewModel(application: Application) : AndroidViewModel(application) {
+class MainViewModel(
+    application: Application,
+    private val repository: ConfigRepository
+) : AndroidViewModel(application) {
 
-    var storageStatus by mutableStateOf(ConfigStore.initialize(application))
+    // Read once here: opening the store is what reports its status, so every field below is loaded
+    // from the same snapshot rather than re-opening it per property.
+    private val initialConnection = repository.loadConnectionDraft()
+    private val initialTools = repository.loadToolSettings()
+    private val initialCapabilities = repository.loadRemoteCapabilities()
+    private val initialAutoStart = repository.loadAutoStartState()
+    private val initialSimulator = repository.loadSimulatorDraft()
+
+    var storageStatus by mutableStateOf(repository.storageStatus())
         private set
 
     val isConfigStorageAvailable: Boolean
-        get() = storageStatus != StorageStatus.UNAVAILABLE
+        get() = storageStatus.isUsable
 
     var isResettingConfigStorage by mutableStateOf(false)
         private set
 
     var storageErrorMessage by mutableStateOf(
-        if (storageStatus == StorageStatus.UNAVAILABLE) CONFIG_STORAGE_UNAVAILABLE_MESSAGE else null
+        if (storageStatus.isUsable) null else CONFIG_STORAGE_UNAVAILABLE_MESSAGE
     )
         private set
 
@@ -76,67 +96,52 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ══════════════════════════════════════════════════════════════════════════
 
     /** 服务端 IP 或域名 */
-    var server by mutableStateOf(ConfigStore.getServer(application))
+    var server by mutableStateOf(initialConnection.server)
     /** gRPC 端口 */
-    var port by mutableStateOf(ConfigStore.getPort(application).toString())
+    var port by mutableStateOf(initialConnection.port.toString())
     /** 客户端密钥 */
-    var secret by mutableStateOf(ConfigStore.getSecret(application))
+    var secret by mutableStateOf(initialConnection.secret)
     /** 客户端 UUID */
-    var uuid by mutableStateOf(ConfigStore.getUuid(application))
+    var uuid by mutableStateOf(initialConnection.uuid)
     /** gRPC 传输层安全开关；默认开启，只有用户显式关闭时才允许明文。 */
-    var useTls by mutableStateOf(ConfigStore.getUseTls(application))
+    var useTls by mutableStateOf(initialConnection.useTls)
     /** Root/Shizuku 高权限模式 */
-    var rootMode by mutableStateOf(ConfigStore.getRootMode(application))
+    var rootMode by mutableStateOf(initialConnection.rootMode)
     // ── 工具页设置 ──
     /** 后台音频保活 */
-    var enableKeepAliveAudio by mutableStateOf(ConfigStore.getEnableKeepAliveAudio(application))
+    var enableKeepAliveAudio by mutableStateOf(initialTools.audio)
         private set
     /** 像素级透明悬浮窗 */
-    var enableFloatWindow by mutableStateOf(ConfigStore.getEnableFloatWindow(application))
+    var enableFloatWindow by mutableStateOf(initialTools.overlay)
         private set
     /** 开机自启动 */
-    var enableAutoStart by mutableStateOf(ConfigStore.getEnableAutoStart(application))
+    var enableAutoStart by mutableStateOf(initialAutoStart.enabled)
         private set
     /** VPN 流量兼容模式（部分无 Root/Shizuku 且 Android < 12 ROM 的兜底方案） */
-    var enableVpnTraffic by mutableStateOf(
-        VpnTrafficCompatibility.normalize(
-            enabled = ConfigStore.getEnableVpnTraffic(application),
-            sdkInt = Build.VERSION.SDK_INT
-        )
-    )
+    var enableVpnTraffic by mutableStateOf(initialTools.vpn)
         private set
 
     val isVpnTrafficCompatibilityAvailable: Boolean
         get() = VpnTrafficCompatibility.isSupported(Build.VERSION.SDK_INT)
     /** 远程 Shell 开关：同时控制 TaskType 4 命令与新建交互终端。 */
-    var enableRemoteCommand by mutableStateOf(ConfigStore.getEnableRemoteCommand(application))
+    var enableRemoteCommand by mutableStateOf(initialCapabilities.shellEnabled)
         private set
     /** 远程文件管理开关：控制 TaskType 11 的浏览、下载与上传。 */
-    var enableRemoteFileManager by mutableStateOf(
-        ConfigStore.getEnableRemoteFileManager(application)
-    )
+    var enableRemoteFileManager by mutableStateOf(initialCapabilities.fileManagerEnabled)
         private set
     /** 内网穿透开关：控制 TaskType 9 的 TCP 转发。 */
-    var enableRemoteNat by mutableStateOf(ConfigStore.getEnableRemoteNat(application))
+    var enableRemoteNat by mutableStateOf(initialCapabilities.natEnabled)
         private set
 
     var isConfigWriteInProgress by mutableStateOf(false)
         private set
 
     // ── 娱乐模拟设备上报 ──
-    var simulatorServer by mutableStateOf(ConfigStore.getSimulatorServer(application))
-    var simulatorPort by mutableStateOf(ConfigStore.getSimulatorPort(application).toString())
-    var simulatorSecret by mutableStateOf(ConfigStore.getSimulatorSecret(application))
-    var simulatorUseTls by mutableStateOf(ConfigStore.getSimulatorUseTls(application))
-    var simulatorThreadCount by mutableStateOf(ConfigStore.getSimulatorThreadCount(application).toString())
-
-    init {
-        // A malformed/read-failed preferences file closes the store; reflect that after loading.
-        storageStatus = ConfigStore.initialize(application)
-        if (!isConfigStorageAvailable) {
-            storageErrorMessage = CONFIG_STORAGE_UNAVAILABLE_MESSAGE
-        }
-    }
+    var simulatorServer by mutableStateOf(initialSimulator.server)
+    var simulatorPort by mutableStateOf(initialSimulator.port.toString())
+    var simulatorSecret by mutableStateOf(initialSimulator.secret)
+    var simulatorUseTls by mutableStateOf(initialSimulator.useTls)
+    var simulatorThreadCount by mutableStateOf(initialSimulator.threadCount.toString())
 
     var simulatorRunning by mutableStateOf(false)
         private set
@@ -307,30 +312,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         val ctx = getApplication<Application>()
         if (!requireConfigStorage("启动探针")) return
-        val p = port.toIntOrNull()
 
-        // [修复问题6] 启动前配置校验，防止配置不完整时启动服务
-        // 原实现不校验配置，导致 GrpcManager.stub 为 null 后服务在循环中反复报错
-        if (server.isBlank()) {
-            Toast.makeText(ctx, "请先填写服务端 IP 或域名", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (p == null || p <= 0 || p > 65535) {
-            Toast.makeText(ctx, "端口号无效，请填写 1-65535 之间的数字", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (secret.isBlank()) {
-            Toast.makeText(ctx, "请先填写客户端密钥 (Secret)", Toast.LENGTH_SHORT).show()
+        // Same rules the service validates with, so a saved configuration can always be started.
+        AgentConfig.validationError(server = server, portText = port, secret = secret)?.let {
+            Toast.makeText(ctx, it, Toast.LENGTH_SHORT).show()
             return
         }
 
         val cleanedUuid = uuid.trim().replace(Regex("^['\"]|['\"]$"), "")
         val uuidToSave = cleanedUuid.takeUnless { it.isBlank() || it == "\\" }
             ?: java.util.UUID.randomUUID().toString()
-        val serverToSave = server
-        val secretToSave = secret
-        val useTlsToSave = useTls
-        val rootModeToSave = rootMode
+        val draftToSave = ConnectionDraft(
+            server = server,
+            port = port.trim().toInt(),
+            secret = secret,
+            uuid = uuidToSave,
+            useTls = useTls,
+            rootMode = rootMode
+        )
 
         // 封装实际启动服务的 lambda
         val doLaunchService: () -> Unit = {
@@ -371,17 +370,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         persistOnIo(
             action = "保存连接配置并启动探针",
             failureMessage = "连接配置保存失败，探针未启动",
-            persistence = {
-                ConfigStore.saveConfig(
-                    ctx,
-                    serverToSave,
-                    p,
-                    secretToSave,
-                    useTlsToSave,
-                    uuidToSave,
-                    rootModeToSave
-                )
-            },
+            persistence = { repository.saveConnection(draftToSave) },
             onSuccess = {
                 uuid = uuidToSave
                 // Android 13+ 通知权限时序控制 only begins after durable persistence.
@@ -439,13 +428,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             action = "保存模拟器配置并启动模拟器",
             failureMessage = "模拟器配置保存失败，模拟器未启动",
             persistence = {
-                ConfigStore.saveSimulatorConfig(
-                    ctx,
-                    server = trimmedServer,
-                    port = parsedPort,
-                    secret = trimmedSecret,
-                    useTls = simulatorTlsToSave,
-                    threadCount = parsedThreadCount
+                repository.saveSimulator(
+                    SimulatorDraft(
+                        server = trimmedServer,
+                        port = parsedPort,
+                        secret = trimmedSecret,
+                        useTls = simulatorTlsToSave,
+                        threadCount = parsedThreadCount
+                    )
                 )
             },
             onSuccess = {
@@ -518,8 +508,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun checkAndShowAutoStartPrompt() {
         val ctx = getApplication<Application>()
         if (!isConfigStorageAvailable) return
-        val hasShownAutoStartPrompt = ConfigStore.getHasShownAutoStartPrompt(ctx)
-        storageStatus = ConfigStore.initialize(ctx)
+        val hasShownAutoStartPrompt = repository.loadAutoStartState().promptShown
+        storageStatus = repository.storageStatus()
         if (!isConfigStorageAvailable) {
             storageErrorMessage = CONFIG_STORAGE_UNAVAILABLE_MESSAGE
             showAutoStartPrompt = false
@@ -537,7 +527,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         persistOnIo(
             action = "保存开机自启动设置",
             failureMessage = "开机自启动设置保存失败",
-            persistence = { ConfigStore.saveAutoStartPromptResult(getApplication(), accepted) },
+            persistence = { repository.saveAutoStartPromptResult(accepted) },
             onSuccess = {
                 enableAutoStart = accepted
                 showAutoStartPrompt = false
@@ -553,7 +543,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         persistOnIo(
             action = "保存开机自启动设置",
             failureMessage = "开机自启动设置保存失败",
-            persistence = { ConfigStore.setEnableAutoStart(getApplication(), enabled) },
+            persistence = { repository.saveAutoStart(enabled) },
             onSuccess = {
                 enableAutoStart = enabled
                 onSaved()
@@ -573,7 +563,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         persistOnIo(
             action = "保存远程命令设置",
             failureMessage = "远程命令设置保存失败",
-            persistence = { ConfigStore.setEnableRemoteCommand(getApplication(), enabled) },
+            persistence = { repository.saveRemoteCapability(RemoteCapability.SHELL, enabled) },
             onSuccess = {
                 enableRemoteCommand = enabled
                 AgentService.requestCapabilityRefreshIfRunning(getApplication())
@@ -590,7 +580,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         persistOnIo(
             action = "保存文件管理设置",
             failureMessage = "文件管理设置保存失败",
-            persistence = { ConfigStore.setEnableRemoteFileManager(getApplication(), enabled) },
+            persistence = { repository.saveRemoteCapability(RemoteCapability.FILE_MANAGER, enabled) },
             onSuccess = {
                 enableRemoteFileManager = enabled
                 AgentService.requestCapabilityRefreshIfRunning(getApplication())
@@ -603,7 +593,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         persistOnIo(
             action = "保存内网穿透设置",
             failureMessage = "内网穿透设置保存失败",
-            persistence = { ConfigStore.setEnableRemoteNat(getApplication(), enabled) },
+            persistence = { repository.saveRemoteCapability(RemoteCapability.NAT, enabled) },
             onSuccess = {
                 enableRemoteNat = enabled
                 AgentService.requestCapabilityRefreshIfRunning(getApplication())
@@ -622,17 +612,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ctx.stopService(Intent(ctx, AgentService::class.java))
         viewModelScope.launch {
             val resetSucceeded = withContext(Dispatchers.IO) {
-                ConfigStore.resetConfigurationStorage(ctx)
+                repository.resetStorage()
             }
             isResettingConfigStorage = false
-            storageStatus = ConfigStore.initialize(ctx)
+            storageStatus = repository.storageStatus()
             if (!resetSucceeded || !isConfigStorageAvailable) {
                 storageErrorMessage = "配置存储重置失败，请稍后重试"
                 Toast.makeText(ctx, storageErrorMessage, Toast.LENGTH_LONG).show()
                 return@launch
             }
             refreshConfigurationFromStorage()
-            storageStatus = ConfigStore.initialize(ctx)
+            storageStatus = repository.storageStatus()
             if (!isConfigStorageAvailable) {
                 storageErrorMessage = "配置存储重置后读取失败，请稍后重试"
                 Toast.makeText(ctx, storageErrorMessage, Toast.LENGTH_LONG).show()
@@ -832,7 +822,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun requireConfigStorage(action: String): Boolean {
-        storageStatus = ConfigStore.initialize(getApplication())
+        storageStatus = repository.storageStatus()
         if (isConfigStorageAvailable) return true
         storageErrorMessage = CONFIG_STORAGE_UNAVAILABLE_MESSAGE
         Toast.makeText(
@@ -846,7 +836,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun persistOnIo(
         action: String,
         failureMessage: String,
-        persistence: () -> Boolean,
+        persistence: () -> Result<Unit>,
         onSuccess: () -> Unit,
         onFailure: () -> Unit = {}
     ) {
@@ -863,15 +853,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         isConfigWriteInProgress = true
         viewModelScope.launch {
             val persisted = withContext(Dispatchers.IO) {
-                try {
-                    persistence()
-                } catch (_: Exception) {
-                    false
-                }
+                persistence().isSuccess
             }
             isConfigWriteInProgress = false
             if (persisted) {
-                storageStatus = ConfigStore.initialize(getApplication())
+                storageStatus = repository.storageStatus()
                 storageErrorMessage = null
                 onSuccess()
             } else {
@@ -900,11 +886,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             action = action,
             failureMessage = failureMessage,
             persistence = {
-                ConfigStore.saveToolSettings(
-                    context = getApplication(),
-                    enableKeepAliveAudio = enableKeepAliveAudio,
-                    enableFloatWindow = enableFloatWindow,
-                    enableVpnTraffic = normalizedVpnSetting
+                repository.saveToolSettings(
+                    KeepAliveSettings(
+                        audio = enableKeepAliveAudio,
+                        overlay = enableFloatWindow,
+                        vpn = normalizedVpnSetting
+                    )
                 )
             },
             onSuccess = {
@@ -925,34 +912,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun reportStorageWriteFailure(message: String) {
-        storageStatus = ConfigStore.initialize(getApplication())
+        storageStatus = repository.storageStatus()
         storageErrorMessage = "$message；配置存储不可用，请重置配置存储"
         Toast.makeText(getApplication(), storageErrorMessage, Toast.LENGTH_LONG).show()
     }
 
     private fun refreshConfigurationFromStorage() {
-        val ctx = getApplication<Application>()
-        server = ConfigStore.getServer(ctx)
-        port = ConfigStore.getPort(ctx).toString()
-        secret = ConfigStore.getSecret(ctx)
-        uuid = ConfigStore.getUuid(ctx)
-        useTls = ConfigStore.getUseTls(ctx)
-        rootMode = ConfigStore.getRootMode(ctx)
-        enableKeepAliveAudio = ConfigStore.getEnableKeepAliveAudio(ctx)
-        enableFloatWindow = ConfigStore.getEnableFloatWindow(ctx)
-        enableAutoStart = ConfigStore.getEnableAutoStart(ctx)
-        enableVpnTraffic = VpnTrafficCompatibility.normalize(
-            enabled = ConfigStore.getEnableVpnTraffic(ctx),
-            sdkInt = Build.VERSION.SDK_INT
-        )
-        enableRemoteCommand = ConfigStore.getEnableRemoteCommand(ctx)
-        enableRemoteFileManager = ConfigStore.getEnableRemoteFileManager(ctx)
-        enableRemoteNat = ConfigStore.getEnableRemoteNat(ctx)
-        simulatorServer = ConfigStore.getSimulatorServer(ctx)
-        simulatorPort = ConfigStore.getSimulatorPort(ctx).toString()
-        simulatorSecret = ConfigStore.getSimulatorSecret(ctx)
-        simulatorUseTls = ConfigStore.getSimulatorUseTls(ctx)
-        simulatorThreadCount = ConfigStore.getSimulatorThreadCount(ctx).toString()
+        val connection = repository.loadConnectionDraft()
+        server = connection.server
+        port = connection.port.toString()
+        secret = connection.secret
+        uuid = connection.uuid
+        useTls = connection.useTls
+        rootMode = connection.rootMode
+
+        val tools = repository.loadToolSettings()
+        enableKeepAliveAudio = tools.audio
+        enableFloatWindow = tools.overlay
+        enableVpnTraffic = tools.vpn
+        enableAutoStart = repository.loadAutoStartState().enabled
+
+        val capabilities = repository.loadRemoteCapabilities()
+        enableRemoteCommand = capabilities.shellEnabled
+        enableRemoteFileManager = capabilities.fileManagerEnabled
+        enableRemoteNat = capabilities.natEnabled
+
+        val simulator = repository.loadSimulatorDraft()
+        simulatorServer = simulator.server
+        simulatorPort = simulator.port.toString()
+        simulatorSecret = simulator.secret
+        simulatorUseTls = simulator.useTls
+        simulatorThreadCount = simulator.threadCount.toString()
         simulatorSuccessCount = 0
         simulatorFailureCount = 0
         simulatorActiveThreadCount = 0
@@ -966,6 +956,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
     }
 
+    companion object {
+        /** Supplies the storage-backed repository; the UI never constructs storage itself. */
+        val Factory: ViewModelProvider.Factory = viewModelFactory {
+            initializer {
+                val application = checkNotNull(
+                    this[ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY]
+                )
+                MainViewModel(application, SharedPreferencesConfigRepository(application))
+            }
+        }
+    }
 }
 
 private const val CONFIG_STORAGE_UNAVAILABLE_MESSAGE =

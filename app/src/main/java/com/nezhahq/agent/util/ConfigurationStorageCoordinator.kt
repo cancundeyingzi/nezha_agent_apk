@@ -1,18 +1,7 @@
 package com.nezhahq.agent.util
 
+import com.nezhahq.agent.core.config.StorageStatus
 import java.io.File
-
-/** Current availability of the app-private, plaintext configuration store. */
-enum class StorageStatus {
-    READY,
-
-    /**
-     * Plaintext storage is usable, but the one-time import from the old encrypted store could not
-     * be read. Existing plaintext fallback values remain available and no legacy data is deleted.
-     */
-    LEGACY_UNREADABLE,
-    UNAVAILABLE
-}
 
 internal enum class LegacyImportResult {
     COMPLETED,

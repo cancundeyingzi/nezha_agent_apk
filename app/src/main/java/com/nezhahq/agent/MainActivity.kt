@@ -68,7 +68,7 @@ import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.core.model.SimulatedDeviceConfig
-import com.nezhahq.agent.util.StorageStatus
+import com.nezhahq.agent.core.config.StorageStatus
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -489,7 +489,7 @@ class MainActivity : ComponentActivity() {
                     )
 
                     // 获取 ViewModel（绑定到 Activity 的 ViewModelStore，旋转安全）
-                    val vm: MainViewModel = viewModel()
+                    val vm: MainViewModel = viewModel(factory = MainViewModel.Factory)
 
                     // 注册 ViewModel 的 Shizuku 回调桥接
                     LaunchedEffect(Unit) {

@@ -16,6 +16,25 @@ data class AgentConfig(
         require(secret.isNotBlank()) { "Secret must not be blank." }
         require(uuid.isNotBlank()) { "UUID must not be blank." }
     }
+
+    companion object {
+        /**
+         * Validates what the user typed, returning a message to show or null when it is usable.
+         *
+         * The UI cannot construct an [AgentConfig] to find out whether a half-filled form is valid,
+         * so both sides share this instead of each keeping its own rules. UUID is absent on purpose:
+         * a blank one is filled in for the user rather than rejected.
+         */
+        fun validationError(server: String, portText: String, secret: String): String? {
+            val port = portText.trim().toIntOrNull()
+            return when {
+                server.isBlank() -> "请先填写服务端 IP 或域名"
+                port == null || port !in 1..65535 -> "端口号无效，请填写 1-65535 之间的数字"
+                secret.isBlank() -> "请先填写客户端密钥 (Secret)"
+                else -> null
+            }
+        }
+    }
 }
 
 data class KeepAliveSettings(

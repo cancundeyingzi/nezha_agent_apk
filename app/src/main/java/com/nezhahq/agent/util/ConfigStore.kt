@@ -6,6 +6,7 @@ import android.content.SharedPreferences
 import android.os.Build
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import com.nezhahq.agent.core.config.StorageStatus
 import com.nezhahq.agent.core.model.SimulatedDeviceConfig
 import com.nezhahq.agent.core.security.RootModeMutationCoordinator
 import java.io.File
@@ -16,8 +17,11 @@ import java.io.File
  * Values intentionally use ordinary [SharedPreferences], matching the upstream agent's plaintext
  * configuration model. Android sandbox permissions still protect the file on non-rooted devices,
  * but a root-capable process can read secrets from it.
+ *
+ * `internal` on purpose: this is the storage detail behind
+ * [com.nezhahq.agent.core.config.ConfigRepository], not an API other modules may reach for.
  */
-object ConfigStore {
+internal object ConfigStore {
     // Keep the historical fallback filename so devices that previously entered fallback mode use
     // those values directly instead of creating another empty preferences file.
     private const val PREFS_FILE = "nezha_secure_prefs_fallback"
@@ -74,21 +78,6 @@ object ConfigStore {
             editor.putString("uuid", uuid)
             editor.putBoolean("root_mode", rootMode)
         }
-    }
-
-    fun saveConnectionConfig(
-        context: Context,
-        server: String,
-        port: Int,
-        secret: String,
-        uuid: String,
-        useTls: Boolean
-    ): Boolean = commit(context) { editor ->
-        editor.putString("server", server)
-        editor.putInt("port", port)
-        editor.putString("secret", secret)
-        editor.putString("uuid", uuid)
-        editor.putBoolean("use_tls", useTls)
     }
 
     fun getServer(context: Context): String = read(context, "") {

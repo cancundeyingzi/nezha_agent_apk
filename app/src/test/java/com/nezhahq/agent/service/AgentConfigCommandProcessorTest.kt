@@ -1,10 +1,9 @@
 package com.nezhahq.agent.service
 
+import com.nezhahq.agent.StubConfigRepository
 import com.nezhahq.agent.core.config.ConfigRepository
 import com.nezhahq.agent.core.model.AgentConfig
-import com.nezhahq.agent.core.model.KeepAliveSettings
 import com.nezhahq.agent.core.model.RemoteCapabilities
-import com.nezhahq.agent.core.model.RemoteCapability
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -507,7 +506,7 @@ class AgentConfigCommandProcessorTest {
         }
     }
 
-    private class FakeConfigRepository(initial: AgentConfig) : ConfigRepository {
+    private class FakeConfigRepository(initial: AgentConfig) : StubConfigRepository() {
         @Volatile
         var result: Result<AgentConfig> = Result.success(initial)
 
@@ -521,25 +520,5 @@ class AgentConfigCommandProcessorTest {
             onLoad()
             return result
         }
-
-        override fun saveConnection(
-            server: String,
-            port: Int,
-            secret: String,
-            uuid: String,
-            useTls: Boolean
-        ): Result<Unit> = unsupported()
-
-        override fun saveToolSettings(settings: KeepAliveSettings): Result<Unit> = unsupported()
-
-        override fun saveRootMode(enabled: Boolean): Result<Unit> = unsupported()
-
-        override fun saveRemoteCapability(
-            capability: RemoteCapability,
-            enabled: Boolean
-        ): Result<Unit> = unsupported()
-
-        private fun unsupported(): Result<Unit> =
-            Result.failure(UnsupportedOperationException())
     }
 }

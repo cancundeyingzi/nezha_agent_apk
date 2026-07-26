@@ -4,9 +4,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import com.nezhahq.agent.service.AgentService
-import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
-import com.nezhahq.agent.util.StorageStatus
+import com.nezhahq.agent.util.SharedPreferencesConfigRepository
 
 /**
  * 开机自启与应用更新后自动恢复的广播接收器。
@@ -16,7 +15,7 @@ import com.nezhahq.agent.util.StorageStatus
  *  - [Intent.ACTION_MY_PACKAGE_REPLACED]：本应用自身被更新替换后触发
  *
  * ## 触发条件
- * 仅当 [ConfigStore.hasValidConfig] 返回 true（即用户已配置过服务端信息）时，
+ * 仅当已存在完整的连接配置（即用户已配置过服务端信息）时，
  * 才自动重启探针服务，避免在未配置时产生无意义的前台服务。
  *
  * ## 注意事项
@@ -34,19 +33,20 @@ class BootReceiver : BroadcastReceiver() {
             action != Intent.ACTION_MY_PACKAGE_REPLACED
         ) return
 
-        if (ConfigStore.initialize(context) == StorageStatus.UNAVAILABLE) {
+        val repository = SharedPreferencesConfigRepository(context)
+        if (!repository.storageStatus().isUsable) {
             Logger.e("BootReceiver: 收到 $action，但配置存储不可用，拒绝自动启动。")
             return
         }
 
         // 若用户尚未配置探针，无需自动启动
-        if (!ConfigStore.hasValidConfig(context)) {
+        if (!repository.hasCompleteConnection()) {
             Logger.i("BootReceiver: 收到 $action，但探针尚未配置，跳过自动启动。")
             return
         }
 
         // 若用户未启用自启动功能，跳过
-        if (!ConfigStore.getEnableAutoStart(context)) {
+        if (!repository.loadAutoStartState().enabled) {
             Logger.i("BootReceiver: 收到 $action，但用户未启用自启动开关，跳过自动启动。")
             return
         }

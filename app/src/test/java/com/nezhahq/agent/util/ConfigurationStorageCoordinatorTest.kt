@@ -1,5 +1,6 @@
 package com.nezhahq.agent.util
 
+import com.nezhahq.agent.core.config.StorageStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
