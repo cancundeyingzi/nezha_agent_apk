@@ -8,6 +8,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -48,9 +49,17 @@ internal class KeepAliveController(
         attempt("wake lock close") { closeWakeLock() }
     }
 
+    /**
+     * Closes every resource and releases [cleanupScope]. The controller is not reusable afterwards.
+     *
+     * Cancelling on timeout is deliberate: a replacement runtime may already be acquiring the same
+     * audio and window resources, so an unfinished teardown must not keep running against them.
+     */
     suspend fun closeWithin(timeoutMillis: Long): Boolean {
         val closeJob = cleanupScope.launch { close() }
-        return closeWaiter.await(closeJob, timeoutMillis)
+        val closed = closeWaiter.await(closeJob, timeoutMillis)
+        cleanupScope.cancel()
+        return closed
     }
 
     private suspend fun configureAudio(enabled: Boolean) = audio.setEnabled(enabled)
@@ -80,16 +89,25 @@ internal class KeepAliveController(
     }
 
     companion object {
+        /**
+         * Builds one runtime's keep-alive resources around a single cleanup scope.
+         *
+         * Teardown must outlive [scope] — cancelling the runtime's work must not abort the release
+         * of an AudioTrack or a window — so cleanup gets its own scope, owned and cancelled here by
+         * [closeWithin] rather than left unowned inside each resource.
+         */
         fun create(context: Context, scope: CoroutineScope): KeepAliveController {
             val appContext = context.applicationContext
+            val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
             return KeepAliveController(
-                audio = AudioKeepAlive(scope),
+                audio = AudioKeepAlive(scope, cleanupScope = cleanupScope),
                 overlay = OverlayKeepAlive(AndroidOverlayHost(appContext)),
                 wakeLock = WakeLockKeepAlive(
                     AndroidWakeLockLease(appContext),
                     CoroutineRenewalScheduler(scope)
                 ),
-                vpn = PlaceholderVpnKeepAlive(AndroidPlaceholderVpnHost(appContext))
+                vpn = PlaceholderVpnKeepAlive(AndroidPlaceholderVpnHost(appContext)),
+                cleanupScope = cleanupScope
             )
         }
     }

@@ -404,21 +404,14 @@ class MainActivity : ComponentActivity() {
 
     @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
-        android.util.Log.i("LiquidGlass", "====== MainActivity.onCreate 开始 ======")
         super.onCreate(savedInstanceState)
-        android.util.Log.i("LiquidGlass", "✓ super.onCreate 完成")
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        android.util.Log.i("LiquidGlass", "✓ WindowCompat.setDecorFitsSystemWindows 完成")
 
         // 注册 Shizuku 权限回调监听器（必须在 Activity 生命周期内注册）
         Shizuku.addRequestPermissionResultListener(shizukuPermResultListener)
-        android.util.Log.i("LiquidGlass", "✓ Shizuku 监听器注册完成")
 
-        android.util.Log.i("LiquidGlass", "→ 开始 setContent")
         setContent {
-            android.util.Log.i("LiquidGlass", "→ Compose setContent 回调执行")
-            android.util.Log.i("LiquidGlass", "→ 开始创建 MaterialTheme")
             // ── Liquid Glass 浅色主题 ──
             MaterialTheme(
                 colorScheme = lightColorScheme(
@@ -453,16 +446,12 @@ class MainActivity : ComponentActivity() {
                     )
                 )
             ) {
-                android.util.Log.i("LiquidGlass", "✓ MaterialTheme 创建成功")
-                android.util.Log.i("LiquidGlass", "→ 开始创建最外层 Box")
                 // 最外层容器 — 浅色背景 + 装饰性渐变光斑
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .background(LgBackground)
                 ) {
-                    android.util.Log.i("LiquidGlass", "✓ 最外层 Box 创建成功")
-                    android.util.Log.i("LiquidGlass", "→ 开始创建装饰光斑")
                     // 装饰光斑 — 左上角青色
                     Box(
                         modifier = Modifier
@@ -499,27 +488,20 @@ class MainActivity : ComponentActivity() {
                             .blur(120.dp)
                     )
 
-                    android.util.Log.i("LiquidGlass", "✓ 装饰光斑创建成功")
-                    android.util.Log.i("LiquidGlass", "→ 开始获取 ViewModel")
                     // 获取 ViewModel（绑定到 Activity 的 ViewModelStore，旋转安全）
                     val vm: MainViewModel = viewModel()
-                    android.util.Log.i("LiquidGlass", "✓ ViewModel 创建成功: $vm")
 
-                    android.util.Log.i("LiquidGlass", "→ 开始注册 LaunchedEffect")
                     // 注册 ViewModel 的 Shizuku 回调桥接
                     LaunchedEffect(Unit) {
-                        android.util.Log.i("LiquidGlass", "✓ LaunchedEffect 回调执行")
                         viewModelCallback = { granted ->
                             vm.onShizukuPermissionResult(granted)
                         }
                     }
 
-                    android.util.Log.i("LiquidGlass", "→ 开始调用 MainScreen")
                     MainScreen(
                         vm = vm,
                         shizukuRequestCode = SHIZUKU_REQUEST_CODE
                     )
-                    android.util.Log.i("LiquidGlass", "✓ MainScreen 调用完成")
                 }
             }
         }
@@ -542,13 +524,10 @@ fun MainScreen(
     vm: MainViewModel,
     shizukuRequestCode: Int = 19527
 ) {
-    android.util.Log.i("LiquidGlass", "→ MainScreen Composable 开始执行")
     var selectedTab by remember { mutableIntStateOf(0) }
     val contentViewHolder = remember { mutableStateOf<View?>(null) }
-    android.util.Log.i("LiquidGlass", "✓ MainScreen 状态初始化完成")
 
     Box(modifier = Modifier.fillMaxSize()) {
-        android.util.Log.i("LiquidGlass", "→ MainScreen Box 开始渲染")
         MainPagesHost(
             vm = vm,
             shizukuRequestCode = shizukuRequestCode,
@@ -705,25 +684,19 @@ private fun NekogramBottomBar(
     items: List<NekoBottomBarItem>,
     onSelect: (Int) -> Unit
 ) {
-    android.util.Log.i("LiquidGlass", "→ NekogramBottomBar Composable 开始执行")
-    android.util.Log.i("LiquidGlass", "  sourceView = $sourceView, selectedIndex = $selectedIndex")
     BoxWithConstraints(
         modifier = modifier.fillMaxWidth(),
         contentAlignment = Alignment.BottomCenter
     ) {
-        android.util.Log.i("LiquidGlass", "→ NekogramBottomBar BoxWithConstraints 开始渲染")
         val containerWidth = (maxWidth - 16.dp).coerceAtMost(344.dp)
         val containerShape = SmoothCornerShape(28.dp)
         val glassInset = 7.666.dp
-        android.util.Log.i("LiquidGlass", "  containerWidth = $containerWidth")
 
         Box(
             modifier = Modifier
                 .width(containerWidth)
                 .height(72.dp)
         ) {
-            android.util.Log.i("LiquidGlass", "→ NekogramBottomBar 内部 Box 开始渲染")
-            android.util.Log.i("LiquidGlass", "  Build.VERSION.SDK_INT = ${Build.VERSION.SDK_INT}, TIRAMISU = ${Build.VERSION_CODES.TIRAMISU}")
             Box(
                 modifier = Modifier
                     .matchParentSize()
@@ -736,25 +709,18 @@ private fun NekogramBottomBar(
                     )
                     .clip(containerShape)
             ) {
-                android.util.Log.i("LiquidGlass", "→ 进入玻璃效果容器，准备判断 API 版本")
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    android.util.Log.i("LiquidGlass", "✓ API 版本 >= 33，使用 NekogramLiquidGlassBarView")
                     AndroidView(
                         modifier = Modifier.matchParentSize(),
                         factory = { context ->
-                            android.util.Log.i("LiquidGlass", "====== MainActivity: 开始创建 NekogramLiquidGlassBarView ======")
                             try {
                                 val view = NekogramLiquidGlassBarView(context)
-                                android.util.Log.i("LiquidGlass", "✓ NekogramLiquidGlassBarView 创建成功")
                                 view
                             } catch (e: Exception) {
-                                android.util.Log.e("LiquidGlass", "✗ NekogramLiquidGlassBarView 创建失败", e)
-                                android.util.Log.e("LiquidGlass", "异常堆栈: ${e.stackTraceToString()}")
                                 throw e
                             }
                         },
                         update = { view ->
-                            android.util.Log.i("LiquidGlass", "→ 设置 sourceView")
                             view.setSourceView(sourceView)
                         }
                     )
@@ -1632,6 +1598,48 @@ fun ConfigScreenContent(
                 Text(
                     "⚠️ 安全警告：开启后，面板可通过任务或交互终端执行任意 Shell 命令。" +
                             "请确保你完全信任面板管理员，否则可能带来数据泄露或设备损坏风险。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LgError,
+                    modifier = Modifier.padding(start = 52.dp, top = 4.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            EtherToggleRow(
+                checked = vm.enableRemoteFileManager,
+                onCheckedChange = { newValue ->
+                    vm.toggleRemoteFileManager(newValue)
+                },
+                title = "允许面板远程管理文件",
+                description = "允许 TaskType 11 浏览、下载和上传设备文件；关闭后新请求立即生效",
+                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
+            )
+            if (vm.enableRemoteFileManager) {
+                Text(
+                    "⚠️ 安全警告：本应用持有「所有文件访问」权限，开启后面板可读写设备上几乎全部文件，" +
+                            "包括照片、下载目录和其他应用的公共数据。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LgError,
+                    modifier = Modifier.padding(start = 52.dp, top = 4.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            EtherToggleRow(
+                checked = vm.enableRemoteNat,
+                onCheckedChange = { newValue ->
+                    vm.toggleRemoteNat(newValue)
+                },
+                title = "允许面板内网穿透",
+                description = "允许 TaskType 9 通过本机转发 TCP 流量；关闭后新请求立即生效",
+                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
+            )
+            if (vm.enableRemoteNat) {
+                Text(
+                    "⚠️ 安全警告：开启后，面板可借本机访问其自身无法直达的地址，" +
+                            "包括你所在的家庭或公司内网设备。",
                     style = MaterialTheme.typography.bodySmall,
                     color = LgError,
                     modifier = Modifier.padding(start = 52.dp, top = 4.dp)

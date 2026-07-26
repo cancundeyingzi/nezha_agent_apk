@@ -30,9 +30,6 @@ class NekogramLiquidGlassBarView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     init {
-        android.util.Log.i("LiquidGlass", "====== NekogramLiquidGlassBarView 构造函数被调用 ======")
-        android.util.Log.i("LiquidGlass", "  context = $context")
-        android.util.Log.i("LiquidGlass", "  attrs = $attrs")
     }
 
     private val clipPath = Path()
@@ -53,17 +50,11 @@ class NekogramLiquidGlassBarView @JvmOverloads constructor(
     private val liquidGlassEffect: LiquidGlassRuntimeEffect
 
     init {
-        android.util.Log.i("LiquidGlass", "→ 开始创建 blurNode")
         blurNode = RenderNode("AgentLiquidGlassBarBlur")
-        android.util.Log.i("LiquidGlass", "✓ blurNode 创建成功")
 
-        android.util.Log.i("LiquidGlass", "→ 开始创建 fillNode")
         fillNode = RenderNode("AgentLiquidGlassBarFill")
-        android.util.Log.i("LiquidGlass", "✓ fillNode 创建成功")
 
-        android.util.Log.i("LiquidGlass", "→ 开始创建 LiquidGlassRuntimeEffect")
         liquidGlassEffect = LiquidGlassRuntimeEffect(context, fillNode)
-        android.util.Log.i("LiquidGlass", "✓ liquidGlassEffect 创建成功")
     }
 
 
@@ -82,11 +73,8 @@ class NekogramLiquidGlassBarView @JvmOverloads constructor(
     }
 
     init {
-        android.util.Log.i("LiquidGlass", "====== NekogramLiquidGlassBarView 开始初始化 ======")
-
         try {
             setWillNotDraw(false)
-            android.util.Log.i("LiquidGlass", "✓ setWillNotDraw(false) 成功")
         } catch (e: Exception) {
             android.util.Log.e("LiquidGlass", "✗ setWillNotDraw 失败", e)
             throw e
@@ -97,7 +85,6 @@ class NekogramLiquidGlassBarView @JvmOverloads constructor(
             bottomStrokePaint.strokeWidth = strokeBottomWidth
             topStrokePaint.color = strokeTopColor
             bottomStrokePaint.color = strokeBottomColor
-            android.util.Log.i("LiquidGlass", "✓ Paint 初始化成功")
         } catch (e: Exception) {
             android.util.Log.e("LiquidGlass", "✗ Paint 初始化失败", e)
             throw e
@@ -126,28 +113,21 @@ class NekogramLiquidGlassBarView @JvmOverloads constructor(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        android.util.Log.i("LiquidGlass", "====== onSizeChanged: ${w}x${h} ======")
 
         try {
-            android.util.Log.i("LiquidGlass", "→ 设置 blurNode 位置")
             blurNode.setPosition(0, 0, w, h)
-            android.util.Log.i("LiquidGlass", "✓ blurNode.setPosition 成功")
         } catch (e: Exception) {
             android.util.Log.e("LiquidGlass", "✗ blurNode.setPosition 失败", e)
         }
 
         try {
-            android.util.Log.i("LiquidGlass", "→ 创建 BlurEffect")
             blurNode.setRenderEffect(RenderEffect.createBlurEffect(dp(1.66f), dp(1.66f), Shader.TileMode.CLAMP))
-            android.util.Log.i("LiquidGlass", "✓ blurNode.setRenderEffect(BlurEffect) 成功")
         } catch (e: Exception) {
             android.util.Log.e("LiquidGlass", "✗ BlurEffect 创建失败", e)
         }
 
         try {
-            android.util.Log.i("LiquidGlass", "→ 设置 fillNode 位置")
             fillNode.setPosition(0, 0, w, h)
-            android.util.Log.i("LiquidGlass", "✓ fillNode.setPosition 成功")
         } catch (e: Exception) {
             android.util.Log.e("LiquidGlass", "✗ fillNode.setPosition 失败", e)
         }
@@ -156,7 +136,6 @@ class NekogramLiquidGlassBarView @JvmOverloads constructor(
             rebuildPath(w, h)
             topStrokeClip.set(0, 0, w, h / 2)
             bottomStrokeClip.set(0, h / 3, w, h)
-            android.util.Log.i("LiquidGlass", "✓ Path 和 Clip 重建成功")
         } catch (e: Exception) {
             android.util.Log.e("LiquidGlass", "✗ Path 重建失败", e)
         }
@@ -312,16 +291,11 @@ private class LiquidGlassRuntimeEffect(
     private val node: RenderNode
 ) {
     private val shader = try {
-        android.util.Log.i("LiquidGlass", "====== LiquidGlassRuntimeEffect 开始初始化 ======")
-        android.util.Log.i("LiquidGlass", "→ 开始读取 liquid_glass_shader.agsl")
         val shaderCode = context.resources.openRawResource(R.raw.liquid_glass_shader)
             .bufferedReader()
             .use { it.readText() }
-        android.util.Log.i("LiquidGlass", "✓ Shader 文件读取成功，长度: ${shaderCode.length}")
 
-        android.util.Log.i("LiquidGlass", "→ 开始创建 RuntimeShader")
         val result = RuntimeShader(shaderCode)
-        android.util.Log.i("LiquidGlass", "✓ RuntimeShader 创建成功")
         result
     } catch (e: Exception) {
         android.util.Log.e("LiquidGlass", "✗ RuntimeShader 创建失败", e)
@@ -329,9 +303,7 @@ private class LiquidGlassRuntimeEffect(
     }
 
     private var effect: RenderEffect = try {
-        android.util.Log.i("LiquidGlass", "→ 开始创建 RenderEffect")
         val result = RenderEffect.createRuntimeShaderEffect(shader, "img")
-        android.util.Log.i("LiquidGlass", "✓ RenderEffect.createRuntimeShaderEffect 成功")
         result
     } catch (e: Exception) {
         android.util.Log.e("LiquidGlass", "✗ RenderEffect.createRuntimeShaderEffect 失败", e)
@@ -340,10 +312,7 @@ private class LiquidGlassRuntimeEffect(
 
     init {
         try {
-            android.util.Log.i("LiquidGlass", "→ 开始将 RenderEffect 应用到 RenderNode")
             node.setRenderEffect(effect)
-            android.util.Log.i("LiquidGlass", "✓ node.setRenderEffect 成功")
-            android.util.Log.i("LiquidGlass", "====== LiquidGlassRuntimeEffect 初始化完成 ======")
         } catch (e: Exception) {
             android.util.Log.e("LiquidGlass", "✗ node.setRenderEffect 失败", e)
             throw e

@@ -9,12 +9,14 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 internal enum class AgentServiceCommand {
     START_OR_RELOAD,
     RECOVER_LATEST,
+    REFRESH_CAPABILITIES,
     IGNORE
 }
 
@@ -33,7 +35,37 @@ internal object AgentServiceCommandPolicy {
     fun fromAction(action: String?): AgentServiceCommand = when (action) {
         null -> AgentServiceCommand.RECOVER_LATEST
         AgentService.ACTION_START_OR_RELOAD -> AgentServiceCommand.START_OR_RELOAD
+        AgentService.ACTION_REFRESH_CAPABILITIES -> AgentServiceCommand.REFRESH_CAPABILITIES
         else -> AgentServiceCommand.IGNORE
+    }
+}
+
+/**
+ * How a freshly loaded configuration snapshot is applied to the runtime.
+ *
+ * [RELOAD] replaces the runtime and therefore reconnects. [CAPABILITIES_ONLY] only changes which
+ * remote tasks the live runtime accepts, leaving the connection untouched.
+ */
+internal enum class ConfigApplyMode {
+    CAPABILITIES_ONLY,
+    RELOAD;
+
+    /** A reload starts from the latest snapshot, so it already covers a pending refresh. */
+    fun merge(other: ConfigApplyMode): ConfigApplyMode =
+        if (this == RELOAD || other == RELOAD) RELOAD else CAPABILITIES_ONLY
+}
+
+/** Collapses requests arriving during a transition into the single strongest mode. */
+internal class PendingApplyMode {
+    private val lock = Any()
+    private var mode: ConfigApplyMode? = null
+
+    fun record(requested: ConfigApplyMode) = synchronized(lock) {
+        mode = mode?.merge(requested) ?: requested
+    }
+
+    fun take(): ConfigApplyMode? = synchronized(lock) {
+        mode.also { mode = null }
     }
 }
 
@@ -44,60 +76,125 @@ internal sealed interface ConfigLoadOutcome {
 
 /**
  * Conflates pending requests and loads configuration only when a serial transition is ready.
+ *
+ * Failures are split by what the user would have to do about them. A configuration that cannot be
+ * loaded needs the user to fix it, so the service gives up; a runtime that failed to start is
+ * usually a transient condition, so it is retried with [retryPolicy] and the agent comes back
+ * without anyone touching the app.
  */
-internal class AgentReloadCommandProcessor(
-    scope: CoroutineScope,
+internal class AgentConfigCommandProcessor(
+    private val scope: CoroutineScope,
     private val repository: ConfigRepository,
     private val controller: AgentRuntimeController,
     private val ioDispatcher: CoroutineDispatcher,
-    private val onFailureWithoutRuntime: (Throwable) -> Unit,
-    private val onFailureWithRuntime: (Throwable) -> Unit
+    private val onConfigurationUnusable: (Throwable) -> Unit,
+    private val onRuntimeUnavailable: (failure: Throwable, retryDelayMillis: Long) -> Unit,
+    private val onReloadRejected: (Throwable) -> Unit,
+    private val awaitPreviousShutdown: suspend () -> Unit = {},
+    private val retryPolicy: StartRetryPolicy = StartRetryPolicy(),
+    private val delayBeforeRetry: suspend (Long) -> Unit = { delay(it) }
 ) {
     private val requests = Channel<Unit>(Channel.CONFLATED)
+    private val pendingMode = PendingApplyMode()
     private val closed = AtomicBoolean()
+    private val retryLock = Any()
+    private var retryJob: Job? = null
+
     private val worker: Job = scope.launch {
         for (ignored in requests) {
-            while (requests.tryReceive().isSuccess) {
-                // Drop duplicate requests already pending before loading the latest snapshot.
-            }
-            val outcome = withContext(ioDispatcher) {
-                repository.loadAgentConfig().fold(
-                    onSuccess = { ConfigLoadOutcome.Ready(it) },
-                    onFailure = { ConfigLoadOutcome.Failed(it) }
-                )
-            }
-            when (outcome) {
-                is ConfigLoadOutcome.Ready -> {
-                    try {
-                        controller.reload(outcome.config)
-                    } catch (cancellation: CancellationException) {
-                        throw cancellation
-                    } catch (failure: Throwable) {
-                        if (controller.isRunning) {
-                            onFailureWithRuntime(failure)
-                        } else {
-                            onFailureWithoutRuntime(failure)
-                        }
-                    }
-                }
-                is ConfigLoadOutcome.Failed -> {
-                    if (controller.isRunning) {
-                        onFailureWithRuntime(outcome.error)
-                    } else {
-                        onFailureWithoutRuntime(outcome.error)
-                    }
-                }
+            drainRedundantWakeUps()
+            val mode = pendingMode.take() ?: continue
+            when (val outcome = loadConfig()) {
+                is ConfigLoadOutcome.Ready -> applyOrReport(mode, outcome.config)
+                is ConfigLoadOutcome.Failed -> reportConfigurationFailure(outcome.error)
             }
         }
     }
 
-    fun request() {
-        if (!closed.get()) requests.trySend(Unit)
+    /**
+     * Requests a full runtime replacement built from the latest persisted configuration.
+     *
+     * This is the explicit path — a user start or a boot — so it preempts a scheduled retry and
+     * restarts the backoff instead of making the user wait out the previous schedule.
+     */
+    fun requestReload() {
+        cancelPendingRetry()
+        retryPolicy.reset()
+        enqueue(ConfigApplyMode.RELOAD)
     }
+
+    /**
+     * Requests that the live runtime re-read its remote capability grants.
+     *
+     * The connection is preserved, so revoking a capability takes effect without a reconnect.
+     */
+    fun requestCapabilityRefresh() = enqueue(ConfigApplyMode.CAPABILITIES_ONLY)
 
     suspend fun close() {
         if (closed.compareAndSet(false, true)) requests.close()
+        cancelPendingRetry()
         worker.cancel()
         worker.join()
+    }
+
+    private fun enqueue(mode: ConfigApplyMode) {
+        if (closed.get()) return
+        // Recorded before the wake-up so the worker always finds a mode waiting for it.
+        pendingMode.record(mode)
+        requests.trySend(Unit)
+    }
+
+    private fun drainRedundantWakeUps() {
+        while (requests.tryReceive().isSuccess) {
+            // Their modes are already merged into pendingMode; only the signal is redundant.
+        }
+    }
+
+    private suspend fun loadConfig(): ConfigLoadOutcome = withContext(ioDispatcher) {
+        repository.loadAgentConfig().fold(
+            onSuccess = { ConfigLoadOutcome.Ready(it) },
+            onFailure = { ConfigLoadOutcome.Failed(it) }
+        )
+    }
+
+    private suspend fun applyOrReport(mode: ConfigApplyMode, config: AgentConfig) {
+        try {
+            awaitPreviousShutdown()
+            apply(mode, config)
+            retryPolicy.reset()
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: Throwable) {
+            if (controller.isRunning) onReloadRejected(failure) else scheduleRetry(failure)
+        }
+    }
+
+    private suspend fun apply(mode: ConfigApplyMode, config: AgentConfig) = when (mode) {
+        ConfigApplyMode.RELOAD -> controller.reload(config)
+        ConfigApplyMode.CAPABILITIES_ONLY ->
+            controller.updateCapabilities(config.remoteCapabilities)
+    }
+
+    /** A live runtime keeps serving, so a configuration that cannot be read is not fatal yet. */
+    private fun reportConfigurationFailure(failure: Throwable) {
+        if (controller.isRunning) onReloadRejected(failure) else onConfigurationUnusable(failure)
+    }
+
+    private fun scheduleRetry(failure: Throwable) {
+        if (closed.get()) return
+        val retryDelayMillis = retryPolicy.nextDelayMillis()
+        onRuntimeUnavailable(failure, retryDelayMillis)
+        val scheduled = scope.launch {
+            delayBeforeRetry(retryDelayMillis)
+            enqueue(ConfigApplyMode.RELOAD)
+        }
+        synchronized(retryLock) { retryJob = scheduled }
+    }
+
+    private fun cancelPendingRetry() {
+        synchronized(retryLock) {
+            retryJob?.cancel()
+            retryJob = null
+        }
     }
 }

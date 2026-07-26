@@ -20,7 +20,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.runBlocking
 
 /**
  * Android lifecycle, foreground notification, and reload-command adapter.
@@ -38,15 +37,14 @@ class AgentService : Service() {
     )
 
     private lateinit var runtimeController: AgentRuntimeController
-    private lateinit var commandProcessor: AgentReloadCommandProcessor
+    private lateinit var commandProcessor: AgentConfigCommandProcessor
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         AgentServiceRunningState.onCreated()
-        startAgentForeground("正在读取连接配置...")
-
+        // Built before startForeground so onDestroy always finds initialized collaborators.
         runtimeController = AgentRuntimeController(
             factory = AgentRuntimeFactory { config ->
                 AgentRuntime(
@@ -61,47 +59,70 @@ class AgentService : Service() {
             finalCleanup = {
                 RootShell.shutdown()
                 Logger.i("AgentService: process-owned RootShell resources closed.")
+            },
+            onTeardownFailure = { failure ->
+                Logger.e("AgentService: 旧运行时清理未完成，已继续启动新连接", failure)
             }
         )
-        commandProcessor = AgentReloadCommandProcessor(
+        commandProcessor = AgentConfigCommandProcessor(
             scope = commandScope,
             repository = SharedPreferencesConfigRepository(applicationContext),
             controller = runtimeController,
             ioDispatcher = Dispatchers.IO,
-            onFailureWithoutRuntime = { failure ->
-                Logger.e("AgentService: configuration/runtime start failed; stopping service", failure)
+            onConfigurationUnusable = { failure ->
+                Logger.e("AgentService: 连接配置不可用，服务停止，等待用户修正配置", failure)
                 updateNotification("连接配置无效或不可用，服务已停止")
                 stopSelf()
             },
-            onFailureWithRuntime = { failure ->
-                Logger.e("AgentService: reload rejected; existing runtime remains active", failure)
+            onRuntimeUnavailable = { failure, retryDelayMillis ->
+                val retrySeconds = retryDelayMillis / MILLIS_PER_SECOND
+                Logger.e("AgentService: 探针启动失败，$retrySeconds 秒后重试", failure)
+                updateNotification("启动失败，$retrySeconds 秒后重试")
+            },
+            onReloadRejected = { failure ->
+                Logger.e("AgentService: 重载被拒绝，继续使用当前连接", failure)
                 updateNotification("重载失败，继续使用当前连接")
-            }
+            },
+            awaitPreviousShutdown = SHUTDOWN_GATE::awaitIdle
         )
+        startAgentForeground("正在读取连接配置...")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val decision = AgentServiceCommandPolicy.decide(intent?.action)
         when (decision.command) {
             AgentServiceCommand.START_OR_RELOAD,
-            AgentServiceCommand.RECOVER_LATEST -> commandProcessor.request()
+            AgentServiceCommand.RECOVER_LATEST -> commandProcessor.requestReload()
+            AgentServiceCommand.REFRESH_CAPABILITIES -> commandProcessor.requestCapabilityRefresh()
             AgentServiceCommand.IGNORE ->
                 Logger.i("AgentService: ignored unknown action ${intent?.action}")
         }
         return decision.startResult
     }
 
+    /**
+     * Hands teardown to [SHUTDOWN_GATE] instead of blocking the main thread.
+     *
+     * Joining stream sessions can take arbitrarily long because their socket reads do not observe
+     * coroutine cancellation; the gate keeps the next runtime from starting until this finishes.
+     *
+     * Closing the processor first cancels its worker, so a reload waiting on the gate unblocks
+     * instead of waiting for the shutdown it is itself part of.
+     */
     override fun onDestroy() {
         AgentServiceRunningState.onDestroyed()
-        try {
-            runBlocking(Dispatchers.IO) {
-                commandProcessor.close()
-                runtimeController.stop()
+        val processor = commandProcessor
+        val controller = runtimeController
+        val scope = commandScope
+        SHUTDOWN_GATE.submit {
+            try {
+                processor.close()
+                controller.stop()
+            } finally {
+                scope.cancel()
             }
-        } finally {
-            commandScope.cancel()
-            super.onDestroy()
         }
+        super.onDestroy()
     }
 
     private fun startAgentForeground(statusText: String) {
@@ -153,27 +174,47 @@ class AgentService : Service() {
     companion object {
         const val ACTION_START_OR_RELOAD =
             "com.nezhahq.agent.action.START_OR_RELOAD"
+        const val ACTION_REFRESH_CAPABILITIES =
+            "com.nezhahq.agent.action.REFRESH_CAPABILITIES"
 
         private const val NOTIFICATION_CHANNEL_ID = "nezha_agent_service"
         private const val NOTIFICATION_ID = 1001
-        fun startOrReload(context: Context) {
-            val intent = Intent(context, AgentService::class.java)
-                .setAction(ACTION_START_OR_RELOAD)
-            ContextCompat.startForegroundService(context, intent)
+        private const val MILLIS_PER_SECOND = 1_000L
+
+        /** Outlives any single service instance so a restart waits for the previous teardown. */
+        private val SHUTDOWN_GATE = RuntimeShutdownGate { failure ->
+            Logger.e("AgentService: 停机未完全成功，已继续释放其余资源", failure)
         }
+
+        fun startOrReload(context: Context) = send(context, ACTION_START_OR_RELOAD)
 
         /**
          * Requests a persisted-config reload only when this process owns a live service instance.
          */
-        fun requestReloadIfRunning(context: Context): Boolean {
-            if (!AgentServiceRunningState.canRequestReload()) return false
-            val intent = Intent(context, AgentService::class.java)
-                .setAction(ACTION_START_OR_RELOAD)
-            ContextCompat.startForegroundService(context, intent)
-            return true
-        }
+        fun requestReloadIfRunning(context: Context): Boolean =
+            sendIfRunning(context, ACTION_START_OR_RELOAD)
+
+        /**
+         * Applies changed remote capability grants to the live runtime without reconnecting.
+         *
+         * Returns false when no service instance is running, in which case the next start already
+         * picks the grants up from storage.
+         */
+        fun requestCapabilityRefreshIfRunning(context: Context): Boolean =
+            sendIfRunning(context, ACTION_REFRESH_CAPABILITIES)
 
         internal fun isRunningInProcess(): Boolean =
             AgentServiceRunningState.canRequestReload()
+
+        private fun sendIfRunning(context: Context, action: String): Boolean {
+            if (!AgentServiceRunningState.canRequestReload()) return false
+            send(context, action)
+            return true
+        }
+
+        private fun send(context: Context, action: String) {
+            val intent = Intent(context, AgentService::class.java).setAction(action)
+            ContextCompat.startForegroundService(context, intent)
+        }
     }
 }

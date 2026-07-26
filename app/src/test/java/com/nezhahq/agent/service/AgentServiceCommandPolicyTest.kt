@@ -25,6 +25,14 @@ class AgentServiceCommandPolicyTest {
     }
 
     @Test
+    fun capabilityActionRefreshesGrantsWithoutReloading() {
+        val decision = AgentServiceCommandPolicy.decide(AgentService.ACTION_REFRESH_CAPABILITIES)
+
+        assertEquals(AgentServiceCommand.REFRESH_CAPABILITIES, decision.command)
+        assertEquals(Service.START_STICKY, decision.startResult)
+    }
+
+    @Test
     fun unknownActionDoesNotStartBusinessWork() {
         val decision = AgentServiceCommandPolicy.decide("unexpected")
 

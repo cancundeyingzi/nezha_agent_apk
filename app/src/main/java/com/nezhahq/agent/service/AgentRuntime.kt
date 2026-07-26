@@ -174,17 +174,23 @@ internal class AgentRuntime(
         this.capabilities.set(capabilities)
     }
 
+    /**
+     * Stops this runtime, and may be called again after a failed attempt.
+     *
+     * [RuntimeShutdownCoordinator] skips the phases that already succeeded, so a retry resumes at
+     * the failed one. Only a fully successful teardown is terminal; a caller arriving while another
+     * teardown is in flight waits for it instead of returning while resources are still held.
+     */
     override suspend fun stop() {
-        val shouldStop = synchronized(lifecycleLock) {
-            when (state) {
-                LifecycleState.STOPPING, LifecycleState.STOPPED -> false
-                else -> {
-                    state = LifecycleState.STOPPING
-                    true
-                }
+        val alreadyStopped = synchronized(lifecycleLock) {
+            if (state == LifecycleState.STOPPED) {
+                true
+            } else {
+                state = LifecycleState.STOPPING
+                false
             }
         }
-        if (!shouldStop) return
+        if (alreadyStopped) return
 
         shutdownCoordinator.close()
         synchronized(lifecycleLock) { state = LifecycleState.STOPPED }

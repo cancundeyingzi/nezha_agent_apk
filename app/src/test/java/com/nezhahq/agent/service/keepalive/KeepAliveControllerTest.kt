@@ -7,6 +7,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
@@ -405,7 +406,7 @@ class KeepAliveControllerTest {
     @Test
     fun overlayAddFailureClearsStateButRemovalFailureRetainsOwnershipForRetry() = runBlocking {
         val addFailingHost = FakeOverlayHost(failAdd = true)
-        val addFailingOverlay = OverlayKeepAlive(addFailingHost)
+        val addFailingOverlay = OverlayKeepAlive(addFailingHost, Dispatchers.Unconfined)
 
         addFailingOverlay.setEnabled(true)
         addFailingOverlay.setEnabled(true)
@@ -413,7 +414,7 @@ class KeepAliveControllerTest {
         assertEquals(2, addFailingHost.addCount)
 
         val removeFailingHost = FakeOverlayHost(removeFailuresRemaining = 1)
-        val removeFailingOverlay = OverlayKeepAlive(removeFailingHost)
+        val removeFailingOverlay = OverlayKeepAlive(removeFailingHost, Dispatchers.Unconfined)
         removeFailingOverlay.setEnabled(true)
         removeFailingOverlay.close()
         removeFailingOverlay.setEnabled(true)
@@ -426,6 +427,27 @@ class KeepAliveControllerTest {
 
         assertEquals(2, removeFailingHost.addCount)
         assertEquals(2, removeFailingHost.removeCount)
+    }
+
+    @Test
+    fun overlayWindowWorkStaysOnTheMainDispatcherWhateverThreadClosesIt() {
+        val mainExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, MAIN_THREAD_NAME)
+        }
+        val mainDispatcher = mainExecutor.asCoroutineDispatcher()
+        val host = ThreadRecordingOverlayHost()
+        val overlay = OverlayKeepAlive(host, mainDispatcher)
+
+        try {
+            // Enabling happens on the main thread in production, teardown on a background scope.
+            runBlocking(mainDispatcher) { overlay.setEnabled(true) }
+            runBlocking(Dispatchers.IO) { overlay.close() }
+
+            assertEquals(listOf(MAIN_THREAD_NAME, MAIN_THREAD_NAME), host.recordedThreads())
+        } finally {
+            mainDispatcher.close()
+            mainExecutor.shutdownNow()
+        }
     }
 
     @Test
@@ -737,6 +759,29 @@ class KeepAliveControllerTest {
         }
     }
 
+    /** Records which thread the window API was touched from; both calls must agree. */
+    private class ThreadRecordingOverlayHost : OverlayHost {
+        private val threads = mutableListOf<String>()
+
+        override fun hasPermission(): Boolean = true
+
+        override fun add(): OverlayHandle {
+            record()
+            return OverlayHandle {
+                record()
+                true
+            }
+        }
+
+        fun recordedThreads(): List<String> = synchronized(threads) { threads.toList() }
+
+        private fun record() {
+            // Coroutine debug mode appends " @coroutine#N" to the thread name; drop it.
+            val threadName = Thread.currentThread().name.substringBefore(" @")
+            synchronized(threads) { threads += threadName }
+        }
+    }
+
     private class FakeWakeLockLease : WakeLockLease {
         val acquireTimeouts = mutableListOf<Long>()
         var releaseCount = 0
@@ -788,6 +833,7 @@ class KeepAliveControllerTest {
     }
 
     private companion object {
+        const val MAIN_THREAD_NAME = "fake-main"
         const val TIMEOUT_SECONDS = 2L
     }
 }

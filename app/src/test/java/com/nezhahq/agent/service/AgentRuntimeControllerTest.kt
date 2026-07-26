@@ -92,6 +92,73 @@ class AgentRuntimeControllerTest {
         assertTrue(controller.isRunning)
     }
 
+    /**
+     * Teardown is terminal: nothing would retry it after the service is gone, so withholding the
+     * privileged shell because the runtime failed would leak it for the rest of the process.
+     */
+    @Test
+    fun stopReleasesProcessResourcesEvenWhenTheRuntimeFailsToStop() = runBlocking {
+        var finalCleanups = 0
+        val controller = AgentRuntimeController(
+            factory = AgentRuntimeFactory {
+                RecordingRuntime(onStop = { error("teardown failed") })
+            },
+            finalCleanup = { finalCleanups++ }
+        )
+        controller.reload(config("running"))
+
+        val failure = runCatching { controller.stop() }.exceptionOrNull()
+
+        assertEquals("teardown failed", failure?.message)
+        assertEquals(1, finalCleanups)
+        assertFalse(controller.isRunning)
+    }
+
+    @Test
+    fun stopReportsRuntimeAndCleanupFailuresTogether() = runBlocking {
+        val controller = AgentRuntimeController(
+            factory = AgentRuntimeFactory {
+                RecordingRuntime(onStop = { error("teardown failed") })
+            },
+            finalCleanup = { error("cleanup failed") }
+        )
+        controller.reload(config("running"))
+
+        val failure = runCatching { controller.stop() }.exceptionOrNull()
+
+        assertEquals("teardown failed", failure?.message)
+        assertEquals(
+            listOf("cleanup failed"),
+            failure?.suppressed?.map(Throwable::message)
+        )
+    }
+
+    /**
+     * Keep-alive must survive a botched cleanup: the replacement still starts, so the agent stays
+     * connected instead of the service stopping itself over a best-effort teardown.
+     */
+    @Test
+    fun reloadStillStartsTheReplacementWhenTheOldRuntimeFailsToStop() = runBlocking {
+        val started = mutableListOf<String>()
+        val teardownFailures = mutableListOf<Throwable>()
+        val controller = AgentRuntimeController(
+            factory = AgentRuntimeFactory { snapshot ->
+                RecordingRuntime(
+                    onStart = { started += snapshot.server },
+                    onStop = { error("teardown failed") }
+                )
+            },
+            onTeardownFailure = { teardownFailures += it }
+        )
+        controller.reload(config("first"))
+
+        controller.reload(config("second"))
+
+        assertEquals(listOf("first", "second"), started)
+        assertEquals(listOf("teardown failed"), teardownFailures.map(Throwable::message))
+        assertTrue(controller.isRunning)
+    }
+
     private class RecordingRuntime(
         private val onStart: suspend () -> Unit = {},
         private val onStop: suspend () -> Unit = {}

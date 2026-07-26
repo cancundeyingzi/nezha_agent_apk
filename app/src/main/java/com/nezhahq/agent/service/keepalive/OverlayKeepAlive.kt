@@ -10,6 +10,12 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import com.nezhahq.agent.util.Logger
 import kotlin.random.Random
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 internal fun interface OverlayHandle {
     /** Returns true only when the view is confirmed detached. */
@@ -21,47 +27,59 @@ internal interface OverlayHost {
     fun add(): OverlayHandle
 }
 
+/**
+ * Owns the keep-alive overlay window.
+ *
+ * [WindowManager] is main-thread only, and this resource is enabled from the main thread but torn
+ * down from a background cleanup scope. Confining every host call to [mainDispatcher] here keeps
+ * that asymmetry from reaching the window API, where a wrong-thread removal would leak the window.
+ */
 internal class OverlayKeepAlive(
-    private val host: OverlayHost
+    private val host: OverlayHost,
+    private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate
 ) : KeepAliveResource {
+    private val lifecycleMutex = Mutex()
     private var handle: OverlayHandle? = null
 
-    override suspend fun setEnabled(enabled: Boolean) = synchronized(this) {
+    override suspend fun setEnabled(enabled: Boolean) = lifecycleMutex.withLock {
         if (enabled) start() else remove()
     }
 
-    override suspend fun close() = synchronized(this) { remove() }
+    override suspend fun close() = lifecycleMutex.withLock { remove() }
 
-    private fun start() {
+    private suspend fun start() {
         if (handle != null) return
         if (!host.hasPermission()) {
             Logger.i("$TAG: 没有悬浮窗权限，跳过悬浮窗保活")
             return
         }
 
-        var added = false
-        try {
-            handle = host.add()
-            added = true
-            Logger.i("$TAG: 悬浮窗已添加")
+        handle = try {
+            withContext(mainDispatcher) { host.add() }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
         } catch (e: Exception) {
             Logger.e("$TAG: 添加悬浮窗失败", e)
-        } finally {
-            if (!added) handle = null
+            return
         }
+        Logger.i("$TAG: 悬浮窗已添加")
     }
 
-    private fun remove() {
+    private suspend fun remove() {
         val current = handle ?: return
-        try {
-            if (current.remove()) {
-                handle = null
-                Logger.i("$TAG: 悬浮窗已移除")
-            } else {
-                Logger.e("$TAG: 悬浮窗移除状态不确定，将保留所有权并重试")
-            }
+        val removed = try {
+            withContext(mainDispatcher) { current.remove() }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
         } catch (e: Exception) {
             Logger.e("$TAG: 移除悬浮窗失败", e)
+            return
+        }
+        if (removed) {
+            handle = null
+            Logger.i("$TAG: 悬浮窗已移除")
+        } else {
+            Logger.e("$TAG: 悬浮窗移除状态不确定，将保留所有权并重试")
         }
     }
 

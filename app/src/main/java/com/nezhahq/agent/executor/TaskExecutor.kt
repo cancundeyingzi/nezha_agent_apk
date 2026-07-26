@@ -337,13 +337,16 @@ object TaskExecutor {
     }
 
     /**
-     * 预配置的 OkHttpClient 实例。
+     * 仅供 HTTPGet 健康检查使用的 OkHttpClient。
      *
      * - 信任所有 SSL 证书（对齐官方探针行为，监控场景需要）
      * - 禁用主机名验证（允许 IP 直连和自签名证书）
      * - 10 秒连接/读取超时
+     *
+     * **禁止复用**：它不校验服务端身份，任何携带凭据的请求用它发送都等同于明文暴露。
+     * 需要安全传输的场景请另建默认配置的 OkHttpClient。
      */
-    private val client: OkHttpClient = run {
+    private val insecureMonitoringClient: OkHttpClient = run {
         val sslContext = SSLContext.getInstance("TLS")
         sslContext.init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
         OkHttpClient.Builder()
@@ -390,7 +393,7 @@ object TaskExecutor {
                     val request = Request.Builder().url(url).build()
                     // 使用 .use {} 确保 Response 在异常时也能正确释放，
                     // 防止 OkHttp 连接池泄漏（原 response.close() 在异常路径下不会执行）
-                    client.newCall(request).execute().use { response ->
+                    insecureMonitoringClient.newCall(request).execute().use { response ->
                         val delay = (System.currentTimeMillis() - start).toFloat()
 
                         // 提取 SSL 证书信息（仅 HTTPS 连接有 handshake）

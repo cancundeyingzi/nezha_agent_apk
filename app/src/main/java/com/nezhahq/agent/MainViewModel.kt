@@ -71,43 +71,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
         private set
 
-    init {
-        android.util.Log.i("LiquidGlass", "====== MainViewModel 开始初始化 ======")
-        android.util.Log.i("LiquidGlass", "  application = $application")
-    }
-
     // ══════════════════════════════════════════════════════════════════════════
     // 配置字段状态（Compose State，驱动 UI 重组）
     // ══════════════════════════════════════════════════════════════════════════
 
     /** 服务端 IP 或域名 */
-    var server by mutableStateOf(run {
-        android.util.Log.i("LiquidGlass", "  → 读取 server 配置")
-        val value = ConfigStore.getServer(application)
-        android.util.Log.i("LiquidGlass", "  ✓ server = $value")
-        value
-    })
+    var server by mutableStateOf(ConfigStore.getServer(application))
     /** gRPC 端口 */
-    var port by mutableStateOf(run {
-        android.util.Log.i("LiquidGlass", "  → 读取 port 配置")
-        val value = ConfigStore.getPort(application).toString()
-        android.util.Log.i("LiquidGlass", "  ✓ port = $value")
-        value
-    })
+    var port by mutableStateOf(ConfigStore.getPort(application).toString())
     /** 客户端密钥 */
-    var secret by mutableStateOf(run {
-        android.util.Log.i("LiquidGlass", "  → 读取 secret 配置")
-        val value = ConfigStore.getSecret(application)
-        android.util.Log.i("LiquidGlass", "  ✓ secret = ${if (value.isEmpty()) "(empty)" else "***"}")
-        value
-    })
+    var secret by mutableStateOf(ConfigStore.getSecret(application))
     /** 客户端 UUID */
-    var uuid by mutableStateOf(run {
-        android.util.Log.i("LiquidGlass", "  → 读取 uuid 配置")
-        val value = ConfigStore.getUuid(application)
-        android.util.Log.i("LiquidGlass", "  ✓ uuid = ${redactUuidForLog(value)}")
-        value
-    })
+    var uuid by mutableStateOf(ConfigStore.getUuid(application))
     /** gRPC 传输层安全开关；默认开启，只有用户显式关闭时才允许明文。 */
     var useTls by mutableStateOf(ConfigStore.getUseTls(application))
     /** Root/Shizuku 高权限模式 */
@@ -135,6 +110,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         get() = VpnTrafficCompatibility.isSupported(Build.VERSION.SDK_INT)
     /** 远程 Shell 开关：同时控制 TaskType 4 命令与新建交互终端。 */
     var enableRemoteCommand by mutableStateOf(ConfigStore.getEnableRemoteCommand(application))
+        private set
+    /** 远程文件管理开关：控制 TaskType 11 的浏览、下载与上传。 */
+    var enableRemoteFileManager by mutableStateOf(
+        ConfigStore.getEnableRemoteFileManager(application)
+    )
+        private set
+    /** 内网穿透开关：控制 TaskType 9 的 TCP 转发。 */
+    var enableRemoteNat by mutableStateOf(ConfigStore.getEnableRemoteNat(application))
         private set
 
     var isConfigWriteInProgress by mutableStateOf(false)
@@ -389,7 +372,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             action = "保存连接配置并启动探针",
             failureMessage = "连接配置保存失败，探针未启动",
             persistence = {
-                val currentAudioSetting = ConfigStore.getEnableKeepAliveAudio(ctx)
                 ConfigStore.saveConfig(
                     ctx,
                     serverToSave,
@@ -397,8 +379,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     secretToSave,
                     useTlsToSave,
                     uuidToSave,
-                    rootModeToSave,
-                    currentAudioSetting
+                    rootModeToSave
                 )
             },
             onSuccess = {
@@ -585,13 +566,48 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      *
      * 此开关与 Root/Shizuku 模式完全独立，同时控制静默命令和交互终端；
      * Root 模式只决定已授权 Shell 能否提权。
+     *
+     * 持久化成功后立即通知运行中的服务重读授权，兑现界面上「关闭后新请求立即生效」的承诺。
      */
     fun toggleRemoteCommand(enabled: Boolean) {
         persistOnIo(
             action = "保存远程命令设置",
             failureMessage = "远程命令设置保存失败",
             persistence = { ConfigStore.setEnableRemoteCommand(getApplication(), enabled) },
-            onSuccess = { enableRemoteCommand = enabled }
+            onSuccess = {
+                enableRemoteCommand = enabled
+                AgentService.requestCapabilityRefreshIfRunning(getApplication())
+            }
+        )
+    }
+
+    /**
+     * 切换远程文件管理开关（TaskType 11）。
+     *
+     * 本应用持有「所有文件访问」权限，开启后面板可读写设备上几乎全部文件。
+     */
+    fun toggleRemoteFileManager(enabled: Boolean) {
+        persistOnIo(
+            action = "保存文件管理设置",
+            failureMessage = "文件管理设置保存失败",
+            persistence = { ConfigStore.setEnableRemoteFileManager(getApplication(), enabled) },
+            onSuccess = {
+                enableRemoteFileManager = enabled
+                AgentService.requestCapabilityRefreshIfRunning(getApplication())
+            }
+        )
+    }
+
+    /** 切换内网穿透开关（TaskType 9）。 */
+    fun toggleRemoteNat(enabled: Boolean) {
+        persistOnIo(
+            action = "保存内网穿透设置",
+            failureMessage = "内网穿透设置保存失败",
+            persistence = { ConfigStore.setEnableRemoteNat(getApplication(), enabled) },
+            onSuccess = {
+                enableRemoteNat = enabled
+                AgentService.requestCapabilityRefreshIfRunning(getApplication())
+            }
         )
     }
 
@@ -930,6 +946,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             sdkInt = Build.VERSION.SDK_INT
         )
         enableRemoteCommand = ConfigStore.getEnableRemoteCommand(ctx)
+        enableRemoteFileManager = ConfigStore.getEnableRemoteFileManager(ctx)
+        enableRemoteNat = ConfigStore.getEnableRemoteNat(ctx)
         simulatorServer = ConfigStore.getSimulatorServer(ctx)
         simulatorPort = ConfigStore.getSimulatorPort(ctx).toString()
         simulatorSecret = ConfigStore.getSimulatorSecret(ctx)
@@ -952,11 +970,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
 private const val CONFIG_STORAGE_UNAVAILABLE_MESSAGE =
     "配置存储不可用，连接信息不会写入；请重置配置存储"
-
-internal fun redactUuidForLog(value: String): String {
-    if (value.isBlank()) return "(empty)"
-    return if (value.length <= 8) "***" else "${value.take(4)}...${value.takeLast(4)}"
-}
 
 private fun Throwable.toSimulatorMessage(): String {
     val message = generateSequence(this) { it.cause }

@@ -51,6 +51,12 @@ object ConfigStore {
         storageStatus != StorageStatus.UNAVAILABLE && getRootMode(context)
     }
 
+    /**
+     * Writes the connection settings together with the root-mode grant they were confirmed under.
+     *
+     * Tool settings are deliberately absent: they belong to [saveToolSettings], so a connection
+     * write can never clobber a concurrent tool-settings write.
+     */
     fun saveConfig(
         context: Context,
         server: String,
@@ -58,8 +64,7 @@ object ConfigStore {
         secret: String,
         useTLS: Boolean = true,
         uuid: String = "",
-        rootMode: Boolean = false,
-        enableKeepAliveAudio: Boolean = false
+        rootMode: Boolean = false
     ): Boolean = rootModeMutations.persistAndApply(rootMode) {
         commit(context) { editor ->
             editor.putString("server", server)
@@ -68,7 +73,6 @@ object ConfigStore {
             editor.putBoolean("use_tls", useTLS)
             editor.putString("uuid", uuid)
             editor.putBoolean("root_mode", rootMode)
-            editor.putBoolean("enable_keep_alive_audio", enableKeepAliveAudio)
         }
     }
 
