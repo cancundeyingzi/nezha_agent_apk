@@ -80,6 +80,7 @@ class AgentService : Service() {
         private const val MAX_FILE_MANAGER_SESSIONS = 2
         private const val MAX_STREAM_ID_BYTES = 256
         private const val MAX_NAT_HOST_BYTES = 1024
+        private const val KEEP_ALIVE_CLOSE_TIMEOUT_MILLIS = 750L
         private val TLS_FAILURE_MARKERS = listOf(
             "ssl",
             "tls",
@@ -718,8 +719,14 @@ class AgentService : Service() {
     override fun onDestroy() {
         Logger.i("Service is being destroyed globally by system or user intent.")
         super.onDestroy()
-        runBlocking {
-            keepAliveController?.close()
+        val keepAliveClosed = runBlocking {
+            withTimeoutOrNull(KEEP_ALIVE_CLOSE_TIMEOUT_MILLIS) {
+                keepAliveController?.close()
+                true
+            } ?: false
+        }
+        if (!keepAliveClosed) {
+            Logger.e("AgentService: 保活资源清理超时，继续其余服务清理")
         }
         keepAliveController = null
         job.cancel()

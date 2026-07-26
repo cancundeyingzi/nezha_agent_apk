@@ -10,13 +10,17 @@ import kotlin.math.sin
 import kotlin.random.Random
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 internal interface AudioOutput {
     val bufferSizeSamples: Int
@@ -30,67 +34,159 @@ internal fun interface AudioOutputFactory {
     fun create(): AudioOutput
 }
 
+internal fun interface AudioCleanupWaiter {
+    suspend fun await(jobs: List<Job>)
+}
+
 internal class AudioKeepAlive(
     private val scope: CoroutineScope,
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
-    private val outputFactory: AudioOutputFactory = AndroidAudioOutputFactory()
+    private val outputFactory: AudioOutputFactory = AndroidAudioOutputFactory(),
+    private val cleanupScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    private val cleanupWaiter: AudioCleanupWaiter = TimeoutAudioCleanupWaiter()
 ) : KeepAliveResource {
     private val lifecycleMutex = Mutex()
     private val stateLock = Any()
     private var writerJob: Job? = null
-    private var activeOutput: AudioOutput? = null
+    private var ownedOutput: OwnedOutput? = null
+    private var desiredEnabled = false
+    private var restartRequested = false
 
-    override suspend fun setEnabled(enabled: Boolean) {
-        if (enabled) start() else stop()
+    override suspend fun setEnabled(enabled: Boolean) = lifecycleMutex.withLock {
+        synchronized(stateLock) { desiredEnabled = enabled }
+        if (enabled) requestStart() else requestStop()
     }
 
-    override suspend fun close() = stop()
+    override suspend fun close() = lifecycleMutex.withLock {
+        synchronized(stateLock) {
+            desiredEnabled = false
+            restartRequested = false
+        }
+        requestStop()
+    }
 
-    private suspend fun start() = lifecycleMutex.withLock {
-        val current = synchronized(stateLock) { writerJob }
-        if (current?.isActive == true) return@withLock
-        current?.join()
+    private fun requestStart() {
+        val state = synchronized(stateLock) {
+            val writer = writerJob
+            val output = ownedOutput
+            when {
+                writer?.isActive == true && output?.cleanup == null -> StartState.RUNNING
+                writer != null || output != null -> {
+                    restartRequested = true
+                    StartState.CLEANING_UP
+                }
+                else -> StartState.IDLE
+            }
+        }
+        when (state) {
+            StartState.RUNNING -> Unit
+            StartState.CLEANING_UP -> {
+                synchronized(stateLock) {
+                    ownedOutput?.takeIf { it.cleanup == null }?.output
+                }?.let(::ensureCleanup)
+            }
+            StartState.IDLE -> launchWriter()
+        }
+    }
 
+    private fun launchWriter() {
         val launched = scope.launch(dispatcher) { runWriter() }
-        synchronized(stateLock) { writerJob = launched }
+        synchronized(stateLock) {
+            restartRequested = false
+            writerJob = launched
+        }
         launched.invokeOnCompletion {
             synchronized(stateLock) {
                 if (writerJob === launched) writerJob = null
+                if (writerJob == null && ownedOutput?.releaseSucceeded == true) {
+                    ownedOutput = null
+                }
             }
+            schedulePendingRestart()
         }
     }
 
-    private suspend fun stop() = lifecycleMutex.withLock {
-        val current = synchronized(stateLock) { writerJob } ?: return@withLock
-        current.cancel()
-        synchronized(stateLock) { activeOutput }?.let { output ->
-            runCatching { output.interrupt() }
-                .onFailure { Logger.e("$TAG: 中断音频写入异常", it) }
+    private suspend fun requestStop() {
+        val writer = synchronized(stateLock) {
+            restartRequested = false
+            writerJob
         }
-        current.cancelAndJoin()
-        synchronized(stateLock) {
-            if (writerJob === current) writerJob = null
-        }
+        writer?.cancel()
+        val cleanup = synchronized(stateLock) { ownedOutput?.output }?.let(::ensureCleanup)
+        cleanupWaiter.await(
+            listOfNotNull(writer, cleanup?.interruptJob, cleanup?.releaseJob)
+        )
     }
 
     private suspend fun runWriter() {
         var output: AudioOutput? = null
         try {
             output = outputFactory.create()
-            synchronized(stateLock) { activeOutput = output }
+            if (!kotlin.coroutines.coroutineContext.isActive) return
+            synchronized(stateLock) { ownedOutput = OwnedOutput(output) }
             output.start()
             writeAudio(output)
         } catch (e: Exception) {
             Logger.e("$TAG: 音频保活会话失败", e)
         } finally {
-            output?.let {
-                runCatching { it.interrupt() }
-                    .onFailure { error -> Logger.e("$TAG: 停止音频异常", error) }
-                runCatching { it.release() }
-                    .onFailure { error -> Logger.e("$TAG: 释放音频异常", error) }
+            output?.let { ensureCleanup(it) }
+        }
+    }
+
+    private fun ensureCleanup(output: AudioOutput): CleanupAttempt {
+        val cleanup = synchronized(stateLock) {
+            val owned = ownedOutput?.takeIf { it.output === output }
+            owned?.cleanup?.let { return it }
+            createCleanup(output).also { created ->
+                if (owned != null) owned.cleanup = created
             }
+        }
+        cleanupScope.launch {
+            val released = cleanup.releaseJob.await()
             synchronized(stateLock) {
-                if (activeOutput === output) activeOutput = null
+                ownedOutput?.takeIf { it.output === output }?.let { owned ->
+                    if (released) {
+                        owned.releaseSucceeded = true
+                        if (writerJob == null) ownedOutput = null
+                    } else if (owned.cleanup === cleanup) {
+                        owned.cleanup = null
+                    }
+                }
+            }
+            if (released) {
+                schedulePendingRestart()
+            }
+        }
+        return cleanup
+    }
+
+    private fun createCleanup(output: AudioOutput): CleanupAttempt {
+        val interruptJob = cleanupScope.launch {
+            runCatching { output.interrupt() }
+                .onFailure { Logger.e("$TAG: 中断音频写入异常", it) }
+        }
+        val releaseJob = cleanupScope.async {
+            runCatching {
+                output.release()
+                true
+            }.onFailure {
+                Logger.e("$TAG: 强制释放音频异常", it)
+            }.getOrDefault(false)
+        }
+        return CleanupAttempt(interruptJob, releaseJob)
+    }
+
+    private fun schedulePendingRestart() {
+        val shouldSchedule = synchronized(stateLock) {
+            desiredEnabled && restartRequested && writerJob == null && ownedOutput == null
+        }
+        if (!shouldSchedule) return
+        scope.launch {
+            lifecycleMutex.withLock {
+                val shouldRestart = synchronized(stateLock) {
+                    desiredEnabled && restartRequested
+                }
+                if (shouldRestart) requestStart()
             }
         }
     }
@@ -121,9 +217,34 @@ internal class AudioKeepAlive(
         return phase % (2.0 * PI)
     }
 
+    private class OwnedOutput(
+        val output: AudioOutput,
+        var cleanup: CleanupAttempt? = null,
+        var releaseSucceeded: Boolean = false
+    )
+
+    private data class CleanupAttempt(
+        val interruptJob: Job,
+        val releaseJob: Deferred<Boolean>
+    )
+
+    private enum class StartState {
+        IDLE,
+        RUNNING,
+        CLEANING_UP
+    }
+
     private companion object {
         const val TAG = "AudioKeepAlive"
         const val SAMPLE_RATE = 8_000
+    }
+}
+
+private class TimeoutAudioCleanupWaiter(
+    private val timeoutMillis: Long = 250L
+) : AudioCleanupWaiter {
+    override suspend fun await(jobs: List<Job>) {
+        withTimeoutOrNull(timeoutMillis) { jobs.joinAll() }
     }
 }
 

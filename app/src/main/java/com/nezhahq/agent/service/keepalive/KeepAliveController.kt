@@ -2,6 +2,7 @@ package com.nezhahq.agent.service.keepalive
 
 import android.content.Context
 import com.nezhahq.agent.core.model.KeepAliveSettings
+import com.nezhahq.agent.util.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -20,17 +21,18 @@ internal class KeepAliveController(
     private val lifecycleMutex = Mutex()
 
     suspend fun reconfigure(settings: KeepAliveSettings) = lifecycleMutex.withLock {
-        configureAudio(settings.audio)
-        configureOverlay(settings.overlay)
-        configureWakeLock()
-        configureVpn(settings.vpn)
+        attempt("audio reconfigure") { configureAudio(settings.audio) }
+        attempt("overlay reconfigure") { configureOverlay(settings.overlay) }
+        attempt("wake lock reconfigure") { configureWakeLock() }
+        attempt("VPN reconfigure") { configureVpn(settings.vpn) }
     }
 
     suspend fun close() = lifecycleMutex.withLock {
-        closeVpn()
-        closeWakeLock()
-        closeOverlay()
-        closeAudio()
+        // Start potentially slow audio teardown first; every later resource is still attempted.
+        attempt("audio close") { closeAudio() }
+        attempt("overlay close") { closeOverlay() }
+        attempt("VPN close") { closeVpn() }
+        attempt("wake lock close") { closeWakeLock() }
     }
 
     private suspend fun configureAudio(enabled: Boolean) = audio.setEnabled(enabled)
@@ -48,6 +50,11 @@ internal class KeepAliveController(
     private suspend fun closeWakeLock() = wakeLock.close()
 
     private suspend fun closeVpn() = vpn.close()
+
+    private suspend fun attempt(operation: String, action: suspend () -> Unit) {
+        runCatching { action() }
+            .onFailure { Logger.e("KeepAliveController: $operation failed", it) }
+    }
 
     companion object {
         fun create(context: Context, scope: CoroutineScope): KeepAliveController {

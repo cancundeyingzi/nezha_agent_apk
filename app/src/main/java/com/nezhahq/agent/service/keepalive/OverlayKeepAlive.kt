@@ -12,7 +12,8 @@ import com.nezhahq.agent.util.Logger
 import kotlin.random.Random
 
 internal fun interface OverlayHandle {
-    fun remove()
+    /** Returns true only when the view is confirmed detached. */
+    fun remove(): Boolean
 }
 
 internal interface OverlayHost {
@@ -53,12 +54,14 @@ internal class OverlayKeepAlive(
     private fun remove() {
         val current = handle ?: return
         try {
-            current.remove()
-            Logger.i("$TAG: 悬浮窗已移除")
+            if (current.remove()) {
+                handle = null
+                Logger.i("$TAG: 悬浮窗已移除")
+            } else {
+                Logger.e("$TAG: 悬浮窗移除状态不确定，将保留所有权并重试")
+            }
         } catch (e: Exception) {
             Logger.e("$TAG: 移除悬浮窗失败", e)
-        } finally {
-            handle = null
         }
     }
 
@@ -106,5 +109,21 @@ private class WindowOverlayHandle(
     private val windowManager: WindowManager,
     private val view: View
 ) : OverlayHandle {
-    override fun remove() = windowManager.removeView(view)
+    override fun remove(): Boolean {
+        try {
+            windowManager.removeView(view)
+            if (!view.isAttachedToWindow) return true
+        } catch (firstFailure: Exception) {
+            if (!view.isAttachedToWindow) return true
+            Logger.e("OverlayKeepAlive: 常规移除失败，尝试立即移除", firstFailure)
+        }
+
+        return try {
+            windowManager.removeViewImmediate(view)
+            true
+        } catch (fallbackFailure: Exception) {
+            Logger.e("OverlayKeepAlive: 立即移除失败", fallbackFailure)
+            !view.isAttachedToWindow
+        }
+    }
 }
