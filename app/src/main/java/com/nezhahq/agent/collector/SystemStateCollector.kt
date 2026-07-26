@@ -41,11 +41,12 @@ import java.io.File
  *  - 进程数：通过 [RootShell] 执行 `ps -A | wc -l` 获取全量进程数。
  *
  * ## 性能优化
- *  - 所有 Regex 均以伴生对象常量形式预编译（/proc/stat 分割）。
+ *  - Regex 均以文件级常量形式预编译，避免每拍重新编译。
  *  - /proc/meminfo 解析改用纯字符串操作，避免临时 Regex 对象和 GC。
  *  - /proc/net/ 等连接数统计改为字节缓冲区计换行符，无 String 对象分配。
- *  - Root 模式下的所有 shell 命令通过 [RootShell] 单例持久会话执行，
- *    彻底消除每 2 秒 fork 新 su 进程的性能灾难。
+ *  - Root 模式下的短命令通过 [RootShell] 单例持久会话执行，
+ *    彻底消除每 2 秒 fork 新 su 进程的性能灾难；只有慢命令（GPU 的 dumpsys 兜底）
+ *    才用独立进程，以免长时间占住那把全进程共用的会话锁。
  */
 class SystemStateCollector(
     private val context: Context,
@@ -54,25 +55,20 @@ class SystemStateCollector(
 ) {
 
     // ──────────────────────────────────────────────────────────────────────────
-    // 伴生对象：预编译 Regex 常量（避免每次调用时重新编译 JIT 开销）
+    // 伴生对象：与实例状态无关的常量
     // ──────────────────────────────────────────────────────────────────────────
     companion object {
-        /**
-         * 用于分割 /proc/stat 各字段的空白正则。
-         * 预编译后复用，避免频繁 GC。
-         */
-        private val WHITESPACE_RE = Regex("\\s+")
-
         /** /proc/net/tcp 等文件的字节读取缓冲区大小（8 KiB）。 */
         private const val NET_BUF_SIZE = 8192
+
+        /** 所有负载数据源都不可用时上报的安全默认值。 */
+        private val DEFAULT_LOAD_AVERAGE = Triple(0.0, 0.0, 0.0)
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // 状态变量：网络速度差值计算
+    // 状态变量：差值法采样器（各自持有自己的基线）
     // ──────────────────────────────────────────────────────────────────────────
-    private var lastRxBytes = -1L
-    private var lastTxBytes = -1L
-    private var lastTimeMs  = SystemClock.elapsedRealtime()
+    private val networkSpeedSampler = NetworkSpeedSampler()
 
     private val cpuUsageSampler = CpuUsageSampler()
 
@@ -91,7 +87,8 @@ class SystemStateCollector(
         collectState(isRootMode)
     }
 
-    private fun collectState(isRootMode: Boolean): State {
+    // suspend：GPU 的 dumpsys 兜底走独立进程（[RootShell.executeIsolated]），是挂起调用。
+    private suspend fun collectState(isRootMode: Boolean): State {
         // ── 1. RAM ─────────────────────────────────────────────────────────────
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memInfo = ActivityManager.MemoryInfo()
@@ -106,20 +103,10 @@ class SystemStateCollector(
         val diskUsed = diskInfo.usedBytes
 
         // ── 4. 网络速度与流量 ──────────────────────────────────────────────────
-        val (currentRx, currentTx) = readNetworkTrafficBytes(isRootMode)
-        val currentTime = SystemClock.elapsedRealtime()
-        val timeDiff    = currentTime - lastTimeMs
-
-        var rxSpeed = 0L
-        var txSpeed = 0L
-        // Ensure lastBytes is initialized properly (-1L) to avoid first tick huge speed
-        if (timeDiff > 0 && lastRxBytes >= 0 && lastTxBytes >= 0) {
-            rxSpeed = (currentRx - lastRxBytes) * 1000 / timeDiff
-            txSpeed = (currentTx - lastTxBytes) * 1000 / timeDiff
-        }
-        lastRxBytes = currentRx
-        lastTxBytes = currentTx
-        lastTimeMs  = currentTime
+        // 首拍没有基线、计数源在两拍之间被换掉、内核计数器回绕，都由采样器判为基线失效并报 0，
+        // 详见 [NetworkSpeedSampler]。
+        val traffic = readNetworkTrafficBytes(isRootMode)
+        val speed = networkSpeedSampler.sample(traffic, SystemClock.elapsedRealtime())
 
         // ── 5. 温度传感器（电池温度作为系统回退值）───────────────────────────
         val batteryIntent = context.registerReceiver(
@@ -159,10 +146,10 @@ class SystemStateCollector(
             .setMemUsed(memUsed)
             .setSwapUsed(swapUsed)
             .setDiskUsed(diskUsed)
-            .setNetInTransfer(currentRx)
-            .setNetOutTransfer(currentTx)
-            .setNetInSpeed(rxSpeed)
-            .setNetOutSpeed(txSpeed)
+            .setNetInTransfer(traffic.snapshot.rxBytes)
+            .setNetOutTransfer(traffic.snapshot.txBytes)
+            .setNetInSpeed(speed.rxBytesPerSecond)
+            .setNetOutSpeed(speed.txBytesPerSecond)
             .setUptime(SystemClock.elapsedRealtime() / 1000)
             .setLoad1(loadAvg.first)
             .setLoad5(loadAvg.second)
@@ -187,7 +174,7 @@ class SystemStateCollector(
      * - 普通模式（最低兜底）：使用 TrafficStats.getTotalRxBytes()，若被系统拦截或不支持则回退为 0。
      * - 所有普通策略均返回 0 时，直接尝试读取 `/proc/net/dev`。
      */
-    private fun readNetworkTrafficBytes(isRootMode: Boolean): Pair<Long, Long> {
+    private fun readNetworkTrafficBytes(isRootMode: Boolean): TrafficReading {
         var rx = -1L
         var tx = -1L
 
@@ -285,11 +272,10 @@ class SystemStateCollector(
         }
 
         // 任一方向缺失时整体切换到同一个 /proc 快照，避免混合不同计数域。
-        val selected = selectTrafficSnapshot(
+        return selectTrafficSnapshot(
             primary = TrafficSnapshot(rxBytes = rx, txBytes = tx),
             fallback = ProcNetDevReader::read
         )
-        return Pair(selected.rxBytes, selected.txBytes)
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -358,35 +344,39 @@ class SystemStateCollector(
      * 前三个字段分别为 1/5/15 分钟的 CPU 队列平均长度。
      *
      * ### 权限策略
-     * - **Root/Shizuku 模式**：通过 [RootShell] 执行 `cat /proc/loadavg`，
-     *   绕过 Android 9+ 的 SELinux 限制，保证数据可用。
+     * - **Root/Shizuku 模式**：先通过 [RootShell] 执行 `cat /proc/loadavg`，
+     *   绕过 Android 9+ 的 SELinux 限制；拿不到可解析结果时再退回直读文件。
      * - **普通模式**：直接读取 `/proc/loadavg`。
      *   Android 7~8 的内核通常允许读取此文件；
      *   Android 9+ 部分 OEM ROM 可能通过 SELinux 策略拒绝读取，
      *   此时返回 (0.0, 0.0, 0.0) 作为安全默认值。
      *
+     * 回退由 [firstParsableLoadAverage] 按"解析结果是否为空"判定，而不是靠 catch，
+     * 原因见该函数注释。
+     *
      * @param isRootMode 是否处于 Root/Shizuku 提权模式
-     * @return Triple(load1, load5, load15)，读取失败返回 (0.0, 0.0, 0.0)
+     * @return Triple(load1, load5, load15)，所有数据源都失败返回 (0.0, 0.0, 0.0)
      */
     private fun readLoadAverage(isRootMode: Boolean): Triple<Double, Double, Double> {
-        val defaultLoad = Triple(0.0, 0.0, 0.0)
+        return firstParsableLoadAverage(
+            { if (isRootMode) readLoadAvgRoot() else null },
+            ::readLoadAvgDirect
+        ) ?: DEFAULT_LOAD_AVERAGE
+    }
 
-        // 获取 /proc/loadavg 的原始内容
-        val content: String? = if (isRootMode) {
-            // Root/Shizuku 模式：通过持久 Shell 读取，绕过 SELinux 限制
-            try {
-                RootShell.executeFirstLine("cat /proc/loadavg")
-            } catch (e: Exception) {
-                Logger.e("StateCollector: Root 模式读取 /proc/loadavg 失败，回退到直接读取", e)
-                // Root Shell 异常时回退到直接读取
-                readLoadAvgDirect()
-            }
-        } else {
-            // 普通模式：直接读取文件
-            readLoadAvgDirect()
+    /**
+     * Root/Shizuku 模式下通过持久 Shell 读取 /proc/loadavg 首行。
+     *
+     * @return Shell 输出的首行；会话不可用时 [RootShell] 返回空串，异常时返回 null，
+     *         两者都会被上层判为"不可解析"从而触发直读回退
+     */
+    private fun readLoadAvgRoot(): String? {
+        return try {
+            RootShell.executeFirstLine("cat /proc/loadavg")
+        } catch (e: Exception) {
+            Logger.e("StateCollector: Root 模式读取 /proc/loadavg 异常，回退到直接读取", e)
+            null
         }
-
-        return parseLoadAvgLine(content) ?: defaultLoad
     }
 
     /**
@@ -403,30 +393,11 @@ class SystemStateCollector(
         } catch (e: Exception) {
             // Android 9+ SELinux 拒绝属已知的不可恢复限制，只在首次失败时打印一次警告
             if (!loadAvgWarningLogged) {
-                Logger.i("StateCollector: 普通模式无法读取 /proc/loadavg（SELinux 限制），Load 数据不可用")
+                Logger.i("StateCollector: 无法直接读取 /proc/loadavg（SELinux 限制），Load 数据不可用")
                 loadAvgWarningLogged = true
             }
             null
         }
-    }
-
-    /**
-     * 解析 /proc/loadavg 的一行内容，提取前三个浮点数。
-     *
-     * 行格式：`0.34 0.28 0.22 1/345 12345`
-     * 使用纯字符串操作提取，避免正则分配。
-     *
-     * @param line /proc/loadavg 的第一行，null 返回 null
-     * @return Triple(load1, load5, load15)，格式不匹配返回 null
-     */
-    private fun parseLoadAvgLine(line: String?): Triple<Double, Double, Double>? {
-        if (line.isNullOrBlank()) return null
-        val parts = line.trim().split(WHITESPACE_RE)
-        if (parts.size < 3) return null
-        val load1  = parts[0].toDoubleOrNull() ?: return null
-        val load5  = parts[1].toDoubleOrNull() ?: return null
-        val load15 = parts[2].toDoubleOrNull() ?: return null
-        return Triple(load1, load5, load15)
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -559,24 +530,21 @@ class SystemStateCollector(
      * Root 模式：通过持久 [RootShell] 执行 `ss` 统计全系统 TCP/UDP 连接数。
      *
      * 每次调用共使用 **2 次** shell 写入（不创建新进程），极低开销。
-     * 若 `ss` 命令不存在，自动回退到 /proc/net 字节统计法。
+     * `ss` 不可用时由 [parseSsConnectionCounts] 判定并回退到 /proc/net 字节统计法；
+     * 这里的 catch 只是兜底，真正生效的是显式判空，原因见该函数注释。
      */
     private fun readConnectionCountsRoot(): Pair<Long, Long> {
-        return try {
+        val counts = try {
             // ss -tn: TCP 连接，不解析主机名；tail -n +2 跳过标题行
-            val tcpRaw = RootShell.executeFirstLine(
-                "ss -tn 2>/dev/null | tail -n +2 | wc -l"
+            parseSsConnectionCounts(
+                tcpRaw = RootShell.executeFirstLine("ss -tn 2>/dev/null | tail -n +2 | wc -l"),
+                udpRaw = RootShell.executeFirstLine("ss -un 2>/dev/null | tail -n +2 | wc -l")
             )
-            val udpRaw = RootShell.executeFirstLine(
-                "ss -un 2>/dev/null | tail -n +2 | wc -l"
-            )
-            val tcp = tcpRaw?.trim()?.toLongOrNull() ?: 0L
-            val udp = udpRaw?.trim()?.toLongOrNull() ?: 0L
-            Pair(tcp, udp)
         } catch (e: Exception) {
-            Logger.e("StateCollector: Root 模式 ss 失败，回退到 /proc/net", e)
-            readConnectionCountsFromProc()
+            Logger.e("StateCollector: Root 模式 ss 异常，回退到 /proc/net", e)
+            null
         }
+        return counts ?: readConnectionCountsFromProc()
     }
 
     /**
@@ -638,3 +606,70 @@ class SystemStateCollector(
         return total
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 提权数据源的回退判定（纯函数，脱离 Android 运行时可单测）
+//
+// 这一节存在的共同理由：RootShell.execute 在会话建不起来、命令超时或 root 授权被撤销时
+// **返回空串而不抛异常**。历史上这些回退都写在 catch 里，于是永远不可达，面板长期显示
+// 0 连接 / 0.00 负载而没有任何告警。所有降级都必须按"结果是否可解析"显式判定。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 分割 /proc/loadavg 各字段的空白正则，预编译后复用，避免每拍重新编译。 */
+private val LOAD_AVERAGE_SEPARATOR = Regex("\\s+")
+
+/**
+ * 依次尝试各数据源，返回第一个能解析出 1/5/15 分钟负载的结果，全部失败返回 null。
+ *
+ * 数据源传的是惰性 lambda 而不是已读好的字符串：前一个数据源成功时，后面的就不该再白付
+ * 一次 /proc 文件 IO。
+ */
+internal fun firstParsableLoadAverage(
+    vararg sources: () -> String?
+): Triple<Double, Double, Double>? {
+    for (source in sources) {
+        parseLoadAvgLine(source())?.let { return it }
+    }
+    return null
+}
+
+/**
+ * 解析 /proc/loadavg 的一行内容，提取前三个浮点数。
+ *
+ * 行格式：`0.34 0.28 0.22 1/345 12345`
+ *
+ * @param line /proc/loadavg 的第一行；null 与空串（Shell 不可用时的返回值）都视为无数据
+ * @return Triple(load1, load5, load15)，格式不匹配返回 null
+ */
+internal fun parseLoadAvgLine(line: String?): Triple<Double, Double, Double>? {
+    if (line.isNullOrBlank()) return null
+    val parts = line.trim().split(LOAD_AVERAGE_SEPARATOR)
+    if (parts.size < 3) return null
+    val load1  = parts[0].toDoubleOrNull() ?: return null
+    val load5  = parts[1].toDoubleOrNull() ?: return null
+    val load15 = parts[2].toDoubleOrNull() ?: return null
+    return Triple(load1, load5, load15)
+}
+
+/**
+ * 解析 `ss ... | wc -l` 两路输出，判定 root 侧连接数统计是否可用。
+ *
+ * 判空必须显式做，而且不能只看"是否为空串"：设备上没有 `ss` 二进制时，管道末端的 `wc -l`
+ * 照样会输出 "0"，既不抛异常也不是空串。旧代码的 `?: 0L` 因此把它当成"真的没有连接"。
+ *
+ * 判定规则与本文件的 readProcessCount 一致——两路都拿不到正数才算不可用。只要任意一路有
+ * 正数，就说明 `ss` 工作正常，另一路的 0 是真实值（例如设备上确实没有 UDP 套接字），
+ * 应当照原样上报而不是回退。
+ *
+ * @return Pair(tcp, udp)；返回 null 表示这条路走不通，调用方应回退到 /proc/net 统计
+ */
+internal fun parseSsConnectionCounts(tcpRaw: String?, udpRaw: String?): Pair<Long, Long>? {
+    val tcp = parseConnectionCount(tcpRaw)
+    val udp = parseConnectionCount(udpRaw)
+    if (tcp <= 0L && udp <= 0L) return null
+    return Pair(tcp, udp)
+}
+
+/** 把 `wc -l` 的输出解析为非负计数，不可解析或为负一律按 0 处理。 */
+private fun parseConnectionCount(raw: String?): Long =
+    raw?.trim()?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L

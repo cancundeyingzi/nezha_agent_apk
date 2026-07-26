@@ -7,18 +7,39 @@ internal data class TrafficSnapshot(
     val txBytes: Long
 )
 
+/**
+ * 累计计数的来源域。
+ *
+ * 两个域的基数完全不同（TrafficStats 是设备口径，/proc/net/dev 是全部接口的累计值，
+ * 通常大得多），所以跨域的两次读数相减没有物理意义——差值可能是巨大的正数，也可能是负数。
+ * [NetworkSpeedSampler] 靠这个标识判断基线是否还能用。
+ */
+internal enum class TrafficSource { PRIMARY, PROC_NET_DEV }
+
+/** 一次流量读数，连同它来自哪个计数域。 */
+internal data class TrafficReading(
+    val snapshot: TrafficSnapshot,
+    val source: TrafficSource
+)
+
 /** Keeps both counters in one source domain when a primary snapshot is incomplete. */
 internal fun selectTrafficSnapshot(
     primary: TrafficSnapshot,
     fallback: () -> TrafficSnapshot?
-): TrafficSnapshot {
-    if (primary.rxBytes > 0L && primary.txBytes > 0L) return primary
+): TrafficReading {
+    if (primary.rxBytes > 0L && primary.txBytes > 0L) {
+        return TrafficReading(primary, TrafficSource.PRIMARY)
+    }
 
-    val candidate = fallback() ?: return primary
+    val candidate = fallback() ?: return TrafficReading(primary, TrafficSource.PRIMARY)
     val suppliesMissingDirection =
         (primary.rxBytes <= 0L && candidate.rxBytes > 0L) ||
             (primary.txBytes <= 0L && candidate.txBytes > 0L)
-    return if (suppliesMissingDirection) candidate else primary
+    return if (suppliesMissingDirection) {
+        TrafficReading(candidate, TrafficSource.PROC_NET_DEV)
+    } else {
+        TrafficReading(primary, TrafficSource.PRIMARY)
+    }
 }
 
 /** Reads and aggregates physical network counters exposed by `/proc/net/dev`. */
@@ -62,7 +83,4 @@ internal object ProcNetDevReader {
 
     private fun shouldIgnore(interfaceName: String): Boolean =
         interfaceName == "lo" || interfaceName.startsWith("tun")
-
-    private fun addWithoutOverflow(left: Long, right: Long): Long? =
-        if (right > Long.MAX_VALUE - left) null else left + right
 }

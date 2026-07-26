@@ -326,13 +326,9 @@ internal class DiskUsageCalculator(
 
     private operator fun DiskInfo.plus(other: DiskInfo): DiskInfo {
         return DiskInfo(
-            totalBytes = safeAdd(totalBytes, other.totalBytes),
-            usedBytes = safeAdd(usedBytes, other.usedBytes)
+            totalBytes = addSaturating(totalBytes, other.totalBytes),
+            usedBytes = addSaturating(usedBytes, other.usedBytes)
         )
-    }
-
-    private fun safeAdd(left: Long, right: Long): Long {
-        return if (Long.MAX_VALUE - left < right) Long.MAX_VALUE else left + right
     }
 
     private data class MountEntry(

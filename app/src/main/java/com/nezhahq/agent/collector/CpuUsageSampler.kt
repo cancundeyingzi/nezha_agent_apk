@@ -43,10 +43,14 @@ internal class CpuUsageSampler {
         return CpuCounters(values, total, idle)
     }
 
-    private fun addWithoutOverflow(left: Long, right: Long): Long? =
-        if (right > Long.MAX_VALUE - left) null else left + right
-
-    private data class CpuCounters(
+    /**
+     * Deliberately not a data class: `LongArray` compares by identity, so the structural equality a
+     * data class advertises would silently degrade to reference equality. Nothing here needs
+     * equality, hashing or `copy` — one instance is built per sample and only its fields are read —
+     * so a plain class states the truth instead of promising semantics the array cannot honour.
+     * The array is kept over a `List<Long>` to avoid boxing eight values on the 2-second path.
+     */
+    private class CpuCounters(
         val values: LongArray,
         val total: Long,
         val idle: Long

@@ -64,6 +64,9 @@ class ProcNetDevReaderTest {
         assertEquals(TrafficSnapshot(rxBytes = 0L, txBytes = 24L), ProcNetDevReader.parse(transmitOnly))
     }
 
+    // 每个用例都连同来源域一起断言：NetworkSpeedSampler 拿它判断基线是否跨域失效，
+    // 只断言数值的话，选错来源标签也不会被发现。
+
     @Test
     fun `selection replaces receive-only primary with one fallback snapshot`() {
         val fallback = TrafficSnapshot(rxBytes = 12L, txBytes = 34L)
@@ -72,7 +75,7 @@ class ProcNetDevReaderTest {
             fallback
         }
 
-        assertEquals(fallback, selected)
+        assertEquals(TrafficReading(fallback, TrafficSource.PROC_NET_DEV), selected)
     }
 
     @Test
@@ -83,7 +86,7 @@ class ProcNetDevReaderTest {
             fallback
         }
 
-        assertEquals(fallback, selected)
+        assertEquals(TrafficReading(fallback, TrafficSource.PROC_NET_DEV), selected)
     }
 
     @Test
@@ -94,7 +97,7 @@ class ProcNetDevReaderTest {
             TrafficSnapshot(rxBytes = 0L, txBytes = 0L)
         }
 
-        assertEquals(primary, selected)
+        assertEquals(TrafficReading(primary, TrafficSource.PRIMARY), selected)
     }
 
     @Test
@@ -105,6 +108,15 @@ class ProcNetDevReaderTest {
             TrafficSnapshot(rxBytes = 0L, txBytes = 0L)
         }
 
-        assertEquals(primary, selected)
+        assertEquals(TrafficReading(primary, TrafficSource.PRIMARY), selected)
+    }
+
+    @Test
+    fun `selection reports the primary source when the fallback is unavailable`() {
+        val primary = TrafficSnapshot(rxBytes = 0L, txBytes = 0L)
+
+        val selected = selectTrafficSnapshot(primary) { null }
+
+        assertEquals(TrafficReading(primary, TrafficSource.PRIMARY), selected)
     }
 }
