@@ -2,6 +2,7 @@ package com.nezhahq.agent.executor
 
 import android.os.Build
 import androidx.annotation.RequiresApi
+import com.nezhahq.agent.core.model.RemoteCapabilities
 import com.nezhahq.agent.util.Logger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
@@ -361,18 +362,18 @@ object TaskExecutor {
      * 执行面板下发的任务并返回结果。
      *
      * @param task              面板下发的任务描述（含类型、ID、数据）
-     * @param isRemoteShellEnabled 是否允许执行远程命令与交互终端 Shell
+     * @param capabilities locally granted remote task capabilities
      * @return TaskResult       包含延时、成功状态和数据的执行结果
      */
     suspend fun executeTask(
         task: Task,
-        isRemoteShellEnabled: Boolean
+        capabilities: RemoteCapabilities
     ): TaskResult = withContext(Dispatchers.IO) {
         val resultBuilder = TaskResult.newBuilder()
             .setId(task.id)
             .setType(task.type)
 
-        TaskAuthorizationPolicy.denialReason(task.type, isRemoteShellEnabled)?.let { reason ->
+        RemoteCapabilityPolicy.denialReason(task.type, capabilities)?.let { reason ->
             return@withContext resultBuilder
                 .setSuccessful(false)
                 .setData(reason)

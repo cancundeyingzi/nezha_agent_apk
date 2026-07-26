@@ -1,5 +1,7 @@
 package com.nezhahq.agent.simulator
 
+import com.nezhahq.agent.core.model.SimulatedDeviceConfig
+
 import com.nezhahq.agent.grpc.GrpcChannelFactory
 import com.nezhahq.agent.grpc.GrpcTransportMode
 import com.nezhahq.agent.service.DashboardSessionWatchdog

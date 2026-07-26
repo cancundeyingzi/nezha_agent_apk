@@ -17,9 +17,10 @@ import androidx.core.app.NotificationCompat
 import com.nezhahq.agent.collector.GeoIpCollector
 import com.nezhahq.agent.collector.SystemInfoCollector
 import com.nezhahq.agent.collector.SystemStateCollector
+import com.nezhahq.agent.core.model.RemoteCapabilities
 import com.nezhahq.agent.executor.FileManager
 import com.nezhahq.agent.executor.NatManager
-import com.nezhahq.agent.executor.TaskAuthorizationPolicy
+import com.nezhahq.agent.executor.RemoteCapabilityPolicy
 import com.nezhahq.agent.executor.TaskTypes
 import com.nezhahq.agent.executor.TaskExecutor
 import com.nezhahq.agent.executor.TerminalManager
@@ -391,10 +392,10 @@ class AgentService : Service() {
         resultChannel: SendChannel<TaskResult>,
         streamSessions: StreamSessionRegistry
     ) {
-        val remoteShellEnabled = ConfigStore.getEnableRemoteCommand(this@AgentService)
-        val denialReason = TaskAuthorizationPolicy.denialReason(
+        val capabilities = loadRemoteCapabilities()
+        val denialReason = RemoteCapabilityPolicy.denialReason(
             taskType = task.type,
-            remoteShellEnabled = remoteShellEnabled
+            capabilities = capabilities
         )
         if (denialReason != null) {
             Logger.i(
@@ -576,13 +577,19 @@ class AgentService : Service() {
         resultChannel: SendChannel<TaskResult>
     ) {
         // Recheck immediately before execution so disabling the setting also rejects queued commands.
-        val remoteShellEnabled = ConfigStore.getEnableRemoteCommand(this@AgentService)
+        val capabilities = loadRemoteCapabilities()
         val result = TaskExecutor.executeTask(
             task,
-            isRemoteShellEnabled = remoteShellEnabled
+            capabilities = capabilities
         )
         resultChannel.send(result)
     }
+
+    private fun loadRemoteCapabilities(): RemoteCapabilities = RemoteCapabilities(
+        shellEnabled = ConfigStore.getEnableRemoteCommand(this),
+        fileManagerEnabled = ConfigStore.getEnableRemoteFileManager(this),
+        natEnabled = ConfigStore.getEnableRemoteNat(this)
+    )
 
     private fun showConnectingStatus() {
         if (GrpcManager.isPlaintextModeActive()) {

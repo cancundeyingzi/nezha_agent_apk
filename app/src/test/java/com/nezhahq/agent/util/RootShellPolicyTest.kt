@@ -1,5 +1,6 @@
 package com.nezhahq.agent.util
 
+import com.nezhahq.agent.core.security.PrivilegedAccessController
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -7,32 +8,41 @@ import org.junit.Test
 
 class RootShellPolicyTest {
     @Test
-    fun deniedAccessRevokesResourcesOncePerAllowedTransition() {
-        var allowed = true
+    fun disableRevokesResourcesOncePerEnabledTransition() {
         var revocations = 0
-        val gate = PrivilegedAccessGate(
-            isAllowed = { allowed },
-            onRevoked = { revocations += 1 }
+        val controller = PrivilegedAccessController(
+            cleanup = { revocations += 1 }
         )
 
-        assertTrue(gate.authorize())
-        allowed = false
+        assertFalse(controller.isEnabled())
+        controller.enable()
+        assertTrue(controller.isEnabled())
 
-        assertFalse(gate.authorize())
-        assertFalse(gate.authorize())
+        controller.disableAndRevoke()
+        controller.disableAndRevoke()
+
+        assertFalse(controller.isEnabled())
         assertEquals(1, revocations)
+
+        controller.enable()
+        controller.disableAndRevoke()
+        assertEquals(2, revocations)
     }
 
     @Test
-    fun explicitRevokeAlwaysClosesResources() {
-        var revocations = 0
-        val gate = PrivilegedAccessGate(
-            isAllowed = { true },
-            onRevoked = { revocations += 1 }
+    fun disableFailsClosedBeforeSynchronousCleanup() {
+        lateinit var controller: PrivilegedAccessController
+        var cleanupCompleted = false
+        controller = PrivilegedAccessController(
+            cleanup = {
+                assertFalse(controller.isEnabled())
+                cleanupCompleted = true
+            }
         )
+        controller.enable()
 
-        gate.revoke()
+        controller.disableAndRevoke()
 
-        assertEquals(1, revocations)
+        assertTrue(cleanupCompleted)
     }
 }

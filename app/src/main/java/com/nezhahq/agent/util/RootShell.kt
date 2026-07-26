@@ -1,7 +1,7 @@
 package com.nezhahq.agent.util
 
-import android.content.Context
 import android.content.pm.PackageManager
+import com.nezhahq.agent.core.security.PrivilegedAccessController
 import java.io.File
 import java.io.InputStream
 import java.security.SecureRandom
@@ -11,17 +11,14 @@ import rikka.shizuku.Shizuku
 /**
  * Process-wide privileged-shell boundary.
  *
- * Every su/Shizuku entry point checks the persisted root-mode setting here. Callers may still
- * choose whether a privileged strategy is useful, but they cannot bypass the authorization
+ * Every su/Shizuku entry point checks the process-local authorization controller. Callers may
+ * still choose whether a privileged strategy is useful, but they cannot bypass the authorization
  * decision by invoking a lower-level process API.
  */
 object RootShell {
     private const val RETRY_COOLDOWN_MS = 30_000L
     private const val MARKER_RANDOM_BYTES = 24
     private val markerRandom = SecureRandom()
-
-    @Volatile
-    private var applicationContext: Context? = null
 
     private val managedProcessLock = Any()
     private val managedProcesses = mutableSetOf<ManagedProcess>()
@@ -39,21 +36,22 @@ object RootShell {
         }
     )
 
-    private val accessGate = PrivilegedAccessGate(
-        isAllowed = {
-            applicationContext?.let { ConfigStore.getRootMode(it) } == true
-        },
-        onRevoked = ::closePrivilegedResources
+    private val accessController = PrivilegedAccessController(
+        cleanup = ::closePrivilegedResources
     )
 
-    /** Binds the application context used by the central root-mode policy. */
-    fun initialize(context: Context) {
-        applicationContext = context.applicationContext
+    /** Applies the persisted process-level root authorization state. */
+    fun configureAuthorization(enabled: Boolean) {
+        if (enabled) {
+            accessController.enable()
+        } else {
+            accessController.disableAndRevoke()
+        }
     }
 
     /** Executes [command], returning at most 4 MiB of merged stdout/stderr. */
     fun execute(command: String, timeoutMs: Long = DEFAULT_SHELL_TIMEOUT_MS): String {
-        if (!accessGate.authorize()) return ""
+        if (!accessController.isEnabled()) return ""
         return persistentShell.execute(command, timeoutMs)
     }
 
@@ -92,21 +90,21 @@ object RootShell {
 
     /** Closes the process and reader executor. A later call to [execute] can start them again. */
     fun shutdown() {
-        accessGate.revoke()
+        closePrivilegedResources()
     }
 
-    fun isAlive(): Boolean = accessGate.authorize() && persistentShell.isAlive()
+    fun isAlive(): Boolean = accessController.isEnabled() && persistentShell.isAlive()
 
     fun getSessionType(): String? {
-        if (!accessGate.authorize()) return null
+        if (!accessController.isEnabled()) return null
         return persistentShell.sessionType()
     }
 
     /** Tries su first, then an authorized Shizuku shell. */
     private fun startSession(): ShellSession? {
-        if (!accessGate.authorize()) return null
+        if (!accessController.isEnabled()) return null
         val launched = startShellProcess(workingDirectory = null) ?: return null
-        if (!accessGate.authorize()) {
+        if (!accessController.isEnabled()) {
             ShellSession.destroyProcess(launched.process)
             return null
         }
@@ -119,9 +117,9 @@ object RootShell {
     }
 
     private fun startManagedShell(workingDirectory: File?): ManagedProcess? {
-        if (!accessGate.authorize()) return null
+        if (!accessController.isEnabled()) return null
         val launched = startShellProcess(workingDirectory) ?: return null
-        if (!accessGate.authorize()) {
+        if (!accessController.isEnabled()) {
             ShellSession.destroyProcess(launched.process)
             return null
         }
@@ -136,7 +134,7 @@ object RootShell {
             synchronized(managedProcessLock) {
                 managedProcesses += managed
             }
-            if (!accessGate.authorize()) {
+            if (!accessController.isEnabled()) {
                 managed.close()
                 null
             } else {
@@ -150,7 +148,7 @@ object RootShell {
     }
 
     private fun startShellProcess(workingDirectory: File?): LaunchedShell? {
-        if (!accessGate.authorize()) return null
+        if (!accessController.isEnabled()) return null
         var temporarySuProcess: Process? = null
         try {
             temporarySuProcess = ProcessBuilder("su")
@@ -294,31 +292,5 @@ object RootShell {
         override fun close() {
             managedProcess.close()
         }
-    }
-}
-
-/**
- * Tracks authorization transitions so already-issued privileged resources are revoked once when
- * access changes from allowed to denied.
- */
-internal class PrivilegedAccessGate(
-    private val isAllowed: () -> Boolean,
-    private val onRevoked: () -> Unit
-) {
-    private val previouslyAllowed = AtomicBoolean()
-
-    fun authorize(): Boolean {
-        val allowed = isAllowed()
-        if (allowed) {
-            previouslyAllowed.set(true)
-        } else if (previouslyAllowed.getAndSet(false)) {
-            onRevoked()
-        }
-        return allowed
-    }
-
-    fun revoke() {
-        previouslyAllowed.set(false)
-        onRevoked()
     }
 }

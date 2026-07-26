@@ -1,5 +1,6 @@
 package com.nezhahq.agent.executor
 
+import com.nezhahq.agent.core.model.RemoteCapabilities
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
@@ -32,7 +33,7 @@ class TaskExecutorTest {
     fun keepaliveReturnsSuccessfulEmptyResult() = runBlocking {
         val task = Task.newBuilder().setId(7L).setType(TaskTypes.KEEPALIVE).build()
 
-        val result = TaskExecutor.executeTask(task, isRemoteShellEnabled = false)
+        val result = TaskExecutor.executeTask(task, RemoteCapabilities())
 
         assertEquals(7L, result.id)
         assertEquals(TaskTypes.KEEPALIVE, result.type)
@@ -44,7 +45,7 @@ class TaskExecutorTest {
     fun unsupportedMcpTypesReturnExplicitFailure() = runBlocking {
         val task = Task.newBuilder().setId(16L).setType(TaskTypes.FS_LIST).build()
 
-        val result = TaskExecutor.executeTask(task, isRemoteShellEnabled = false)
+        val result = TaskExecutor.executeTask(task, RemoteCapabilities())
 
         assertEquals(TaskTypes.FS_LIST, result.type)
         assertFalse(result.successful)
@@ -52,31 +53,36 @@ class TaskExecutorTest {
     }
 
     @Test
-    fun remoteShellPolicyCoversCommandsAndInteractiveTerminalsOnly() {
+    fun remoteCapabilityPolicyCoversPrivilegedRemoteTools() {
         assertTrue(
-            TaskAuthorizationPolicy.denialReason(
+            RemoteCapabilityPolicy.denialReason(
                 TaskTypes.COMMAND,
-                remoteShellEnabled = false
+                RemoteCapabilities()
             ) != null
         )
         assertTrue(
-            TaskAuthorizationPolicy.denialReason(
+            RemoteCapabilityPolicy.denialReason(
                 TaskTypes.TERMINAL,
-                remoteShellEnabled = false
+                RemoteCapabilities()
+            ) != null
+        )
+        assertTrue(
+            RemoteCapabilityPolicy.denialReason(
+                TaskTypes.NAT,
+                RemoteCapabilities()
+            ) != null
+        )
+        assertTrue(
+            RemoteCapabilityPolicy.denialReason(
+                TaskTypes.FILE_MANAGER,
+                RemoteCapabilities()
             ) != null
         )
         assertEquals(
             null,
-            TaskAuthorizationPolicy.denialReason(
-                TaskTypes.NAT,
-                remoteShellEnabled = false
-            )
-        )
-        assertEquals(
-            null,
-            TaskAuthorizationPolicy.denialReason(
-                TaskTypes.FILE_MANAGER,
-                remoteShellEnabled = false
+            RemoteCapabilityPolicy.denialReason(
+                TaskTypes.HTTP_GET,
+                RemoteCapabilities()
             )
         )
     }
@@ -85,7 +91,7 @@ class TaskExecutorTest {
     fun disabledRemoteShellRejectsInteractiveTerminal() = runBlocking {
         val task = Task.newBuilder().setId(8L).setType(TaskTypes.TERMINAL).build()
 
-        val result = TaskExecutor.executeTask(task, isRemoteShellEnabled = false)
+        val result = TaskExecutor.executeTask(task, RemoteCapabilities())
 
         assertEquals(8L, result.id)
         assertEquals(TaskTypes.TERMINAL, result.type)

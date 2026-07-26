@@ -6,7 +6,7 @@ import android.content.SharedPreferences
 import android.os.Build
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
-import com.nezhahq.agent.simulator.SimulatedDeviceConfig
+import com.nezhahq.agent.core.model.SimulatedDeviceConfig
 import java.io.File
 
 /**
@@ -54,6 +54,21 @@ object ConfigStore {
         editor.putBoolean("enable_keep_alive_audio", enableKeepAliveAudio)
     }
 
+    fun saveConnectionConfig(
+        context: Context,
+        server: String,
+        port: Int,
+        secret: String,
+        uuid: String,
+        useTls: Boolean
+    ): Boolean = commit(context) { editor ->
+        editor.putString("server", server)
+        editor.putInt("port", port)
+        editor.putString("secret", secret)
+        editor.putString("uuid", uuid)
+        editor.putBoolean("use_tls", useTls)
+    }
+
     fun getServer(context: Context): String = read(context, "") {
         it.getString("server", "") ?: ""
     }
@@ -98,6 +113,14 @@ object ConfigStore {
 
     fun getEnableRemoteCommand(context: Context): Boolean = read(context, false) {
         it.getBoolean("enable_remote_command", false)
+    }
+
+    fun getEnableRemoteFileManager(context: Context): Boolean = read(context, false) {
+        it.getBoolean("enable_remote_file_manager", false)
+    }
+
+    fun getEnableRemoteNat(context: Context): Boolean = read(context, false) {
+        it.getBoolean("enable_remote_nat", false)
     }
 
     fun hasSimulatorConfig(context: Context): Boolean = read(context, false) {
@@ -182,6 +205,18 @@ object ConfigStore {
 
     fun setEnableRemoteCommand(context: Context, enable: Boolean): Boolean = commit(context) {
         it.putBoolean("enable_remote_command", enable)
+    }
+
+    fun setEnableRemoteFileManager(context: Context, enable: Boolean): Boolean = commit(context) {
+        it.putBoolean("enable_remote_file_manager", enable)
+    }
+
+    fun setEnableRemoteNat(context: Context, enable: Boolean): Boolean = commit(context) {
+        it.putBoolean("enable_remote_nat", enable)
+    }
+
+    fun setRootMode(context: Context, enable: Boolean): Boolean = commit(context) {
+        it.putBoolean("root_mode", enable)
     }
 
     fun saveToolSettings(

@@ -1,5 +1,7 @@
 package com.nezhahq.agent.simulator
 
+import com.nezhahq.agent.core.model.SimulatedDeviceConfig
+
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay

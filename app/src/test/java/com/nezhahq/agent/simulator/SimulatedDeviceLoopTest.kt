@@ -1,5 +1,7 @@
 package com.nezhahq.agent.simulator
 
+import com.nezhahq.agent.core.model.SimulatedDeviceConfig
+
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals

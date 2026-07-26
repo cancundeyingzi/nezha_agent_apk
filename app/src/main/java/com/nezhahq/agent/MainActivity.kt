@@ -67,7 +67,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nezhahq.agent.grpc.GrpcConnectionState
-import com.nezhahq.agent.simulator.SimulatedDeviceConfig
+import com.nezhahq.agent.core.model.SimulatedDeviceConfig
 import com.nezhahq.agent.util.StorageStatus
 import kotlin.math.PI
 import kotlin.math.abs
