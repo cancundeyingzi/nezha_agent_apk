@@ -15,6 +15,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.nezhahq.agent.collector.GpuCollector
+import com.nezhahq.agent.collector.SystemInfoCollector
 import com.nezhahq.agent.collector.SystemStateCollector
 import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.grpc.GrpcManager
@@ -674,14 +676,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         instantTestResult = "⏳ 正在采样网速中..."
         viewModelScope.launch {
             try {
-                val result = withContext(Dispatchers.Default) {
+                val result = withContext(Dispatchers.IO) {
                     val ctx = getApplication<Application>()
-                    val collector = SystemStateCollector(ctx)
+                    val gpuCollector = GpuCollector()
+                    val collector = SystemStateCollector(ctx, gpuCollector, Dispatchers.IO)
+                    val isPrivileged = RootShell.isAuthorized()
 
                     // ── 第 1 次采样：建立差值基准 ──────────────────────────────
                     // 网络速度和 CPU 使用率均基于差值法（两次采样的变化量 / 时间差），
                     // 首次调用时无历史基准，差值必然为 0，因此需先"预热"一次。
-                    collector.getState()
+                    collector.getState(isPrivileged)
 
                     // ── 等待采样间隔 ──────────────────────────────────────────
                     // 1.5 秒足以让 /proc/stat 和网络流量产生可测量的变化量，
@@ -689,8 +693,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     delay(1500L)
 
                     // ── 第 2 次采样：获取真实差值数据 ──────────────────────────
-                    val state = collector.getState()
-                    val hostInfo = com.nezhahq.agent.collector.SystemInfoCollector.getHostInfo(ctx, "test")
+                    val state = collector.getState(isPrivileged)
+                    val hostInfo = SystemInfoCollector.getHostInfo(
+                        context = ctx,
+                        appVersion = "test",
+                        gpuCollector = gpuCollector,
+                        isRootMode = isPrivileged
+                    )
                     // 从 CPU 显示名称中提取真实核心数
                     // CPU 名称格式为 "{SoC名称} {核心数} {Physical/Virtual} Core"
                     val cpuDisplayName = hostInfo.cpuList.firstOrNull() ?: "N/A"
@@ -711,7 +720,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         appendLine("▸ 进程数: ${state.processCount}")
                         appendLine("▸ 温度: ${state.temperaturesList.firstOrNull()?.let { "${it.name} ${it.temperature}°C" } ?: "N/A"}")
                         // GPU 信息
-                        val gpuName = com.nezhahq.agent.collector.GpuCollector.getGpuNames().firstOrNull()
+                        val gpuName = gpuCollector.getGpuNames().firstOrNull()
                         appendLine("▸ GPU: ${gpuName ?: "N/A"}")
                         val gpuUsages = state.gpuList
                         appendLine("▸ GPU 使用率: ${

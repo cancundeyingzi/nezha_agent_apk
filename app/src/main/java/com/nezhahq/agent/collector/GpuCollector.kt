@@ -35,14 +35,73 @@ import java.io.File
  * - sysfs 路径：首次采集时探测并缓存，后续直接读取
  * - P2 dumpsys：内部时间戳节流，5 秒内复用上次结果
  */
-object GpuCollector {
+internal enum class GpuCollectionStrategy {
+    DIRECT,
+    SHELL_FS,
+    DUMPSYS,
+    UNAVAILABLE
+}
+
+internal data class GpuProbeResult(
+    val strategy: GpuCollectionStrategy,
+    val usages: List<Double>
+)
+
+/**
+ * Keeps normal and privileged strategy decisions independent for one collector instance.
+ */
+internal class GpuModeStrategyCache {
+    private var normalStrategy: GpuCollectionStrategy? = null
+    private var privilegedStrategy: GpuCollectionStrategy? = null
+
+    fun collect(
+        isPrivileged: Boolean,
+        readCached: (GpuCollectionStrategy) -> List<Double>,
+        probe: () -> GpuProbeResult
+    ): List<Double> = synchronized(this) {
+        strategyFor(isPrivileged)?.let(readCached) ?: probe().let { result ->
+            setStrategy(isPrivileged, result.strategy)
+            result.usages
+        }
+    }
+
+    fun current(isPrivileged: Boolean): GpuCollectionStrategy? = synchronized(this) {
+        strategyFor(isPrivileged)
+    }
+
+    fun clear(isPrivileged: Boolean) = synchronized(this) {
+        setStrategy(isPrivileged, null)
+    }
+
+    fun clearAll() = synchronized(this) {
+        normalStrategy = null
+        privilegedStrategy = null
+    }
+
+    private fun strategyFor(isPrivileged: Boolean): GpuCollectionStrategy? {
+        return if (isPrivileged) privilegedStrategy else normalStrategy
+    }
+
+    private fun setStrategy(
+        isPrivileged: Boolean,
+        strategy: GpuCollectionStrategy?
+    ) {
+        if (isPrivileged) {
+            privilegedStrategy = strategy
+        } else {
+            normalStrategy = strategy
+        }
+    }
+}
+
+class GpuCollector {
 
     // ══════════════════════════════════════════════════════════════════════════
     // 常量
     // ══════════════════════════════════════════════════════════════════════════
 
     /** P2 dumpsys 节流间隔（毫秒）：dumpsys 单次耗时 50~200ms，不宜高频调用 */
-    private const val DUMPSYS_THROTTLE_MS = 5000L
+    private val dumpsysThrottleMs = 5000L
 
     /**
      * 已知 GPU 厂商路径数据库。
@@ -119,18 +178,6 @@ object GpuCollector {
     // 策略枚举
     // ══════════════════════════════════════════════════════════════════════════
 
-    /** GPU 使用率采集策略，标识当前使用的回退级别 */
-    private enum class Strategy {
-        /** P0: 普通模式直接 File.readText() */
-        DIRECT,
-        /** P1/P1.5: 通过 RootShell cat sysfs 路径 */
-        SHELL_FS,
-        /** P2: 通过 RootShell 执行 dumpsys gpu */
-        DUMPSYS,
-        /** P3: 所有方案均失败，不可用 */
-        UNAVAILABLE
-    }
-
     // ══════════════════════════════════════════════════════════════════════════
     // 缓存字段（@Volatile 保证多线程可见性）
     // ══════════════════════════════════════════════════════════════════════════
@@ -141,29 +188,19 @@ object GpuCollector {
     /** 缓存的 GPU 厂商名称（GL_VENDOR），如 "Qualcomm"，用于路径优先匹配 */
     @Volatile private var cachedGpuVendor: String? = null
 
-    /** 缓存的可用 sysfs 路径 */
-    @Volatile private var cachedSysfsPath: String? = null
+    private class ModeState {
+        @Volatile var sysfsPath: String? = null
+        @Volatile var parser: ((String) -> Double?)? = null
+        @Volatile var directReadFailed = false
+        @Volatile var probeCompleted = false
+        @Volatile var unavailableWarned = false
+        @Volatile var lastDumpsysTimeMs = 0L
+        @Volatile var lastDumpsysResult: Double? = null
+    }
 
-    /** 缓存的 sysfs 路径对应的解析函数 */
-    @Volatile private var cachedParser: ((String) -> Double?)? = null
-
-    /** 缓存的当前策略级别 */
-    @Volatile private var cachedStrategy: Strategy? = null
-
-    /** P0 直读是否已确认失败（true 后永久跳过 P0） */
-    @Volatile private var directReadFailed = false
-
-    /** sysfs 路径探测是否已完成（防止重复探测） */
-    @Volatile private var probeCompleted = false
-
-    /** P3 不可用警告是否已打印（日志去重） */
-    @Volatile private var gpuUnavailableWarned = false
-
-    /** P2 dumpsys 上次执行的时间戳（用于节流） */
-    @Volatile private var lastDumpsysTimeMs = 0L
-
-    /** P2 dumpsys 上次缓存的结果 */
-    @Volatile private var lastDumpsysResult: Double? = null
+    private val normalState = ModeState()
+    private val privilegedState = ModeState()
+    private val strategyCache = GpuModeStrategyCache()
 
     // ══════════════════════════════════════════════════════════════════════════
     // 公开 API：GPU 型号名称
@@ -208,29 +245,24 @@ object GpuCollector {
      * @return GPU 使用率列表，不可用时返回空列表
      */
     fun getGpuUsages(isRootMode: Boolean): List<Double> {
-        // ── 已缓存策略：直接执行 ──────────────────────────────────────────
-        cachedStrategy?.let { strategy ->
-            return when (strategy) {
-                Strategy.DIRECT -> readDirect()
-                Strategy.SHELL_FS -> readShellFs()
-                Strategy.DUMPSYS -> readDumpsys()
-                Strategy.UNAVAILABLE -> emptyList()
-            }
-        }
+        val state = stateFor(isRootMode)
+        return strategyCache.collect(
+            isPrivileged = isRootMode,
+            readCached = { strategy -> readUsing(strategy, state, isRootMode) },
+            probe = { probeAndRead(isRootMode, state) }
+        )
+    }
 
-        // ── 首次调用：启动探测链 ──────────────────────────────────────────
-        synchronized(this) {
-            // 双重检查锁
-            cachedStrategy?.let { strategy ->
-                return when (strategy) {
-                    Strategy.DIRECT -> readDirect()
-                    Strategy.SHELL_FS -> readShellFs()
-                    Strategy.DUMPSYS -> readDumpsys()
-                    Strategy.UNAVAILABLE -> emptyList()
-                }
-            }
-
-            return probeAndRead(isRootMode)
+    private fun readUsing(
+        strategy: GpuCollectionStrategy,
+        state: ModeState,
+        isPrivileged: Boolean
+    ): List<Double> {
+        return when (strategy) {
+            GpuCollectionStrategy.DIRECT -> readDirect(state, isPrivileged)
+            GpuCollectionStrategy.SHELL_FS -> readShellFs(state)
+            GpuCollectionStrategy.DUMPSYS -> readDumpsys(state)
+            GpuCollectionStrategy.UNAVAILABLE -> emptyList()
         }
     }
 
@@ -241,10 +273,12 @@ object GpuCollector {
      * - P2:    5000ms（降频，减少 dumpsys 开销）
      * - P3:    Long.MAX_VALUE（不采集）
      */
-    fun getRecommendedIntervalMs(): Long = when (cachedStrategy) {
-        Strategy.DIRECT, Strategy.SHELL_FS -> 2000L
-        Strategy.DUMPSYS -> DUMPSYS_THROTTLE_MS
-        Strategy.UNAVAILABLE, null -> Long.MAX_VALUE
+    fun getRecommendedIntervalMs(isRootMode: Boolean): Long = when (
+        strategyCache.current(isRootMode)
+    ) {
+        GpuCollectionStrategy.DIRECT, GpuCollectionStrategy.SHELL_FS -> 2000L
+        GpuCollectionStrategy.DUMPSYS -> dumpsysThrottleMs
+        GpuCollectionStrategy.UNAVAILABLE, null -> Long.MAX_VALUE
     }
 
     /**
@@ -255,15 +289,24 @@ object GpuCollector {
      */
     fun resetCache() {
         // 型号名称不清理（硬件不变），仅清理路径和策略缓存
-        cachedSysfsPath = null
-        cachedParser = null
-        cachedStrategy = null
-        directReadFailed = false
-        probeCompleted = false
-        gpuUnavailableWarned = false
-        lastDumpsysTimeMs = 0L
-        lastDumpsysResult = null
+        resetModeState(normalState)
+        resetModeState(privilegedState)
+        strategyCache.clearAll()
         Logger.i("GpuCollector: 缓存已重置")
+    }
+
+    private fun resetModeState(state: ModeState) {
+        state.sysfsPath = null
+        state.parser = null
+        state.directReadFailed = false
+        state.probeCompleted = false
+        state.unavailableWarned = false
+        state.lastDumpsysTimeMs = 0L
+        state.lastDumpsysResult = null
+    }
+
+    private fun stateFor(isPrivileged: Boolean): ModeState {
+        return if (isPrivileged) privilegedState else normalState
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -381,64 +424,59 @@ object GpuCollector {
      * @param isRootMode 是否处于 Root/Shizuku 提权模式
      * @return 本次探测的 GPU 使用率列表
      */
-    private fun probeAndRead(isRootMode: Boolean): List<Double> {
+    private fun probeAndRead(isRootMode: Boolean, state: ModeState): GpuProbeResult {
         // ── P0: Direct sysfs 直读（极速通道）──────────────────────────────
         // 仅在 Android 9 以下（SELinux untrusted_app 限制较松）时尝试
-        if (!directReadFailed && Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-            val result = probeDirectRead()
+        if (!state.directReadFailed && Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            val result = probeDirectRead(state)
             if (result != null) {
-                Logger.i("GpuCollector: P0 直读成功 (路径=${cachedSysfsPath})")
-                return listOf(result)
+                Logger.i("GpuCollector: P0 直读成功 (路径=${state.sysfsPath})")
+                return GpuProbeResult(GpuCollectionStrategy.DIRECT, listOf(result))
             }
             // P0 失败，标记后永久跳过
-            directReadFailed = true
-        } else if (!directReadFailed) {
+            state.directReadFailed = true
+        } else if (!state.directReadFailed) {
             // Android 9+，直接标记跳过 P0
-            directReadFailed = true
+            state.directReadFailed = true
         }
 
         // 以下策略均需要 Root/Shizuku
         if (!isRootMode) {
-            cachedStrategy = Strategy.UNAVAILABLE
-            if (!gpuUnavailableWarned) {
+            if (!state.unavailableWarned) {
                 Logger.i("GpuCollector: 普通模式下 GPU 使用率不可用（需 Root/Shizuku）")
-                gpuUnavailableWarned = true
+                state.unavailableWarned = true
             }
-            return emptyList()
+            return GpuProbeResult(GpuCollectionStrategy.UNAVAILABLE, emptyList())
         }
 
         // ── P1: Shell-FS 已知厂商路径 ────────────────────────────────────
-        val p1Result = probeKnownPaths()
+        val p1Result = probeKnownPaths(state)
         if (p1Result != null) {
-            cachedStrategy = Strategy.SHELL_FS
-            Logger.i("GpuCollector: P1 已知路径命中 (路径=${cachedSysfsPath})")
-            return listOf(p1Result)
+            Logger.i("GpuCollector: P1 已知路径命中 (路径=${state.sysfsPath})")
+            return GpuProbeResult(GpuCollectionStrategy.SHELL_FS, listOf(p1Result))
         }
 
         // ── P1.5: 动态扫描 /sys ──────────────────────────────────────────
-        val p15Result = probeDynamicScan()
+        val p15Result = probeDynamicScan(state)
         if (p15Result != null) {
-            cachedStrategy = Strategy.SHELL_FS
-            Logger.i("GpuCollector: P1.5 动态扫描命中 (路径=${cachedSysfsPath})")
-            return listOf(p15Result)
+            Logger.i("GpuCollector: P1.5 动态扫描命中 (路径=${state.sysfsPath})")
+            return GpuProbeResult(GpuCollectionStrategy.SHELL_FS, listOf(p15Result))
         }
 
         // ── P2: dumpsys gpu 兜底 ─────────────────────────────────────────
         val p2Result = readDumpsysInternal()
         if (p2Result != null) {
-            cachedStrategy = Strategy.DUMPSYS
             Logger.i("GpuCollector: P2 dumpsys 解析成功")
-            return listOf(p2Result)
+            return GpuProbeResult(GpuCollectionStrategy.DUMPSYS, listOf(p2Result))
         }
 
         // ── P3: 不可用 ──────────────────────────────────────────────────
-        cachedStrategy = Strategy.UNAVAILABLE
-        probeCompleted = true
-        if (!gpuUnavailableWarned) {
+        state.probeCompleted = true
+        if (!state.unavailableWarned) {
             Logger.i("GpuCollector: 当前设备不兼容 GPU 硬件级监控，GPU 使用率不可用")
-            gpuUnavailableWarned = true
+            state.unavailableWarned = true
         }
-        return emptyList()
+        return GpuProbeResult(GpuCollectionStrategy.UNAVAILABLE, emptyList())
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -453,7 +491,7 @@ object GpuCollector {
      *
      * @return 解析出的 GPU 使用率，所有路径均不可读返回 null
      */
-    private fun probeDirectRead(): Double? {
+    private fun probeDirectRead(state: ModeState): Double? {
         for (entry in KNOWN_SYSFS_ENTRIES) {
             try {
                 val file = File(entry.path)
@@ -461,9 +499,8 @@ object GpuCollector {
                     val raw = file.readText()
                     val value = entry.parser(raw)
                     if (value != null) {
-                        cachedSysfsPath = entry.path
-                        cachedParser = entry.parser
-                        cachedStrategy = Strategy.DIRECT
+                        state.sysfsPath = entry.path
+                        state.parser = entry.parser
                         return value.coerceIn(0.0, 100.0)
                     }
                 }
@@ -478,9 +515,9 @@ object GpuCollector {
      * 使用缓存的 P0 策略直接读取 sysfs。
      * 读取失败时自动降级（清除缓存，下次重新探测）。
      */
-    private fun readDirect(): List<Double> {
-        val path = cachedSysfsPath ?: return emptyList()
-        val parser = cachedParser ?: return emptyList()
+    private fun readDirect(state: ModeState, isPrivileged: Boolean): List<Double> {
+        val path = state.sysfsPath ?: return emptyList()
+        val parser = state.parser ?: return emptyList()
         return try {
             val raw = File(path).readText()
             val value = parser(raw)
@@ -488,8 +525,8 @@ object GpuCollector {
         } catch (_: Exception) {
             // 权限可能在系统更新后被收紧，降级处理
             Logger.i("GpuCollector: P0 直读失败，清除缓存以便重新探测")
-            cachedStrategy = null
-            directReadFailed = true
+            strategyCache.clear(isPrivileged)
+            state.directReadFailed = true
             emptyList()
         }
     }
@@ -506,7 +543,7 @@ object GpuCollector {
      *
      * @return 解析出的 GPU 使用率，所有路径均失败返回 null
      */
-    private fun probeKnownPaths(): Double? {
+    private fun probeKnownPaths(state: ModeState): Double? {
         val vendor = cachedGpuVendor?.lowercase() ?: ""
 
         // 优先匹配 GL_VENDOR 对应的路径
@@ -520,8 +557,8 @@ object GpuCollector {
                 if (!raw.isNullOrBlank()) {
                     val value = entry.parser(raw)
                     if (value != null) {
-                        cachedSysfsPath = entry.path
-                        cachedParser = entry.parser
+                        state.sysfsPath = entry.path
+                        state.parser = entry.parser
                         return value.coerceIn(0.0, 100.0)
                     }
                 }
@@ -536,9 +573,9 @@ object GpuCollector {
      * 使用缓存的 P1/P1.5 策略通过 RootShell 读取 sysfs。
      * 读取失败时自动降级。
      */
-    private fun readShellFs(): List<Double> {
-        val path = cachedSysfsPath ?: return emptyList()
-        val parser = cachedParser ?: return emptyList()
+    private fun readShellFs(state: ModeState): List<Double> {
+        val path = state.sysfsPath ?: return emptyList()
+        val parser = state.parser ?: return emptyList()
         return try {
             val raw = RootShell.executeFirstLine("cat $path 2>/dev/null")
             if (!raw.isNullOrBlank()) {
@@ -564,8 +601,8 @@ object GpuCollector {
      *
      * @return 解析出的 GPU 使用率，未找到或解析失败返回 null
      */
-    private fun probeDynamicScan(): Double? {
-        if (probeCompleted) return null // 已扫描过，不重复
+    private fun probeDynamicScan(state: ModeState): Double? {
+        if (state.probeCompleted) return null // 已扫描过，不重复
 
         try {
             val scanCmd = "find /sys -maxdepth 6 -type f \\( " +
@@ -587,10 +624,10 @@ object GpuCollector {
                     if (!raw.isNullOrBlank()) {
                         val value = tryGenericParse(raw, trimmed)
                         if (value != null) {
-                            cachedSysfsPath = trimmed
+                            state.sysfsPath = trimmed
                             // 缓存通用 parser
-                            cachedParser = { r -> tryGenericParse(r, trimmed) }
-                            probeCompleted = true
+                            state.parser = { r -> tryGenericParse(r, trimmed) }
+                            state.probeCompleted = true
                             return value.coerceIn(0.0, 100.0)
                         }
                     }
@@ -600,7 +637,7 @@ object GpuCollector {
             Logger.e("GpuCollector: P1.5 动态扫描异常", e)
         }
 
-        probeCompleted = true
+        state.probeCompleted = true
         return null
     }
 
@@ -660,16 +697,16 @@ object GpuCollector {
      * 距上次调用不足 5 秒时直接返回上次的缓存值，
      * 避免高频 dumpsys 调用（单次耗时 50~200ms）。
      */
-    private fun readDumpsys(): List<Double> {
+    private fun readDumpsys(state: ModeState): List<Double> {
         val now = System.currentTimeMillis()
-        if (now - lastDumpsysTimeMs < DUMPSYS_THROTTLE_MS) {
+        if (now - state.lastDumpsysTimeMs < dumpsysThrottleMs) {
             // 节流期内，返回上次缓存的值
-            return lastDumpsysResult?.let { listOf(it) } ?: emptyList()
+            return state.lastDumpsysResult?.let { listOf(it) } ?: emptyList()
         }
 
         val result = readDumpsysInternal()
-        lastDumpsysTimeMs = now
-        lastDumpsysResult = result
+        state.lastDumpsysTimeMs = now
+        state.lastDumpsysResult = result
         return result?.let { listOf(it) } ?: emptyList()
     }
 

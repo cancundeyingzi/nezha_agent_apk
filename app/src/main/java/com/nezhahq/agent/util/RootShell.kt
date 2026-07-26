@@ -49,6 +49,9 @@ object RootShell {
         }
     }
 
+    /** Returns whether privileged operations are currently authorized for this process. */
+    fun isAuthorized(): Boolean = accessController.isEnabled()
+
     /** Executes [command], returning at most 4 MiB of merged stdout/stderr. */
     fun execute(command: String, timeoutMs: Long = DEFAULT_SHELL_TIMEOUT_MS): String {
         if (!accessController.isEnabled()) return ""

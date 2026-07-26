@@ -7,9 +7,11 @@ import android.content.IntentFilter
 import android.net.TrafficStats
 import android.os.BatteryManager
 import android.os.SystemClock
-import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import proto.Nezha.State
 import proto.Nezha.State_SensorTemperature
 import java.io.File
@@ -45,7 +47,11 @@ import java.io.File
  *  - Root 模式下的所有 shell 命令通过 [RootShell] 单例持久会话执行，
  *    彻底消除每 2 秒 fork 新 su 进程的性能灾难。
  */
-class SystemStateCollector(private val context: Context) {
+class SystemStateCollector(
+    private val context: Context,
+    private val gpuCollector: GpuCollector,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+) {
 
     // ──────────────────────────────────────────────────────────────────────────
     // 伴生对象：预编译 Regex 常量（避免每次调用时重新编译 JIT 开销）
@@ -81,9 +87,11 @@ class SystemStateCollector(private val context: Context) {
     // 公开采集入口
     // ──────────────────────────────────────────────────────────────────────────
 
-    fun getState(): State {
-        val isRootMode = ConfigStore.getRootMode(context)
+    suspend fun getState(isRootMode: Boolean): State = withContext(ioDispatcher) {
+        collectState(isRootMode)
+    }
 
+    private fun collectState(isRootMode: Boolean): State {
         // ── 1. RAM ─────────────────────────────────────────────────────────────
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memInfo = ActivityManager.MemoryInfo()
@@ -144,7 +152,7 @@ class SystemStateCollector(private val context: Context) {
         val loadAvg = readLoadAverage(isRootMode)
 
         // ── 8. GPU 使用率（Root/Shizuku 模式可用）────────────────────────────
-        val gpuUsages = GpuCollector.getGpuUsages(isRootMode)
+        val gpuUsages = gpuCollector.getGpuUsages(isRootMode)
 
         return State.newBuilder()
             .setCpu(cpuUsage)

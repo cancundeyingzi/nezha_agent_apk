@@ -4,7 +4,6 @@ import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
 import android.os.SystemClock
-import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
 import com.nezhahq.agent.util.VirtualizationDetector
@@ -30,15 +29,20 @@ object SystemInfoCollector {
     /**
      * 采集并返回宿主机静态信息。
      *
-     * @param context    Android Context，用于获取系统服务和读取配置
+     * @param context    Android Context，用于获取系统服务
      * @param appVersion 当前探针 APK 版本号字符串
+     * @param gpuCollector 当前采集流程拥有的 GPU 采集器
+     * @param isRootMode 当前是否已授权 Root/Shizuku 采集
      */
-    fun getHostInfo(context: Context, appVersion: String): Host {
+    fun getHostInfo(
+        context: Context,
+        appVersion: String,
+        gpuCollector: GpuCollector,
+        isRootMode: Boolean
+    ): Host {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memInfo = ActivityManager.MemoryInfo()
         am.getMemoryInfo(memInfo)
-
-        val isRootMode = ConfigStore.getRootMode(context)
 
         // ── 磁盘总量（/data 基准 + 附加存储扫描）────────────────────────────
         val diskTotal = DiskCollector.getDiskInfo(isRootMode).totalBytes
@@ -67,7 +71,7 @@ object SystemInfoCollector {
             .setPlatform("Android")
             .setPlatformVersion(Build.VERSION.RELEASE)
             .addAllCpu(cpuList)
-            .addAllGpu(GpuCollector.getGpuNames())
+            .addAllGpu(gpuCollector.getGpuNames())
             .setMemTotal(memInfo.totalMem)
             .setDiskTotal(diskTotal)
             .setSwapTotal(swapTotal)

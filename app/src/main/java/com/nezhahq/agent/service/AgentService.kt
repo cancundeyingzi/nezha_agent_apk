@@ -15,6 +15,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.nezhahq.agent.collector.GeoIpCollector
+import com.nezhahq.agent.collector.GpuCollector
 import com.nezhahq.agent.collector.SystemInfoCollector
 import com.nezhahq.agent.collector.SystemStateCollector
 import com.nezhahq.agent.core.model.RemoteCapabilities
@@ -59,7 +60,10 @@ class AgentService : Service() {
     private val scope = CoroutineScope(Dispatchers.IO + job + exceptionHandler)
     
     private var wakeLock: PowerManager.WakeLock? = null
-    private val stateCollector by lazy { SystemStateCollector(this) }
+    private val gpuCollector = GpuCollector()
+    private val stateCollector by lazy {
+        SystemStateCollector(this, gpuCollector, Dispatchers.IO)
+    }
     private val audioPlayer = KeepAliveAudioPlayer()
 
     // ── [修复问题5] 保存 NetworkCallback 引用，以便在 onDestroy 中注销 ──────
@@ -286,7 +290,12 @@ class AgentService : Service() {
 
     private suspend fun reportInitialDashboardInfo(stub: NezhaServiceCoroutineStub) {
         Logger.i("Sending Static Host Information (ReportSystemInfo2)...")
-        val hostInfo = SystemInfoCollector.getHostInfo(this@AgentService, getAppVersionName())
+        val hostInfo = SystemInfoCollector.getHostInfo(
+            context = this@AgentService,
+            appVersion = getAppVersionName(),
+            gpuCollector = gpuCollector,
+            isRootMode = RootShell.isAuthorized()
+        )
         DashboardSessionWatchdog.callWithin(
             DashboardSessionWatchdog.HANDSHAKE_TIMEOUT_MS,
             "ReportSystemInfo2"
@@ -312,9 +321,7 @@ class AgentService : Service() {
     ) = coroutineScope {
         val stateFlow = flow {
             while (currentCoroutineContext().isActive) {
-                emit(withContext(Dispatchers.Default) {
-                    stateCollector.getState()
-                })
+                emit(stateCollector.getState(RootShell.isAuthorized()))
                 delay(DashboardSessionWatchdog.STATE_REPORT_INTERVAL_MS)
             }
         }
@@ -762,8 +769,6 @@ class AgentService : Service() {
         connectivityManager = null
 
         GrpcManager.shutdown()
-        // 清理 GPU 采集器缓存，确保服务重启时重新探测 sysfs 路径
-        com.nezhahq.agent.collector.GpuCollector.resetCache()
         // 关闭持久化 Root Shell 会话，释放后台 su 进程资源，防止进程泄漏
         RootShell.shutdown()
         Logger.i("RootShell persistent session closed.")
