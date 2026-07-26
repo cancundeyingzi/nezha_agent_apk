@@ -3,10 +3,9 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:accessibilityEventTypes="typeWindowStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagDefault|flagRequestFilterKeyEvents"
+    android:accessibilityFlags="flagDefault"
     android:canTakeScreenshot="true"
     android:canRetrieveWindowContent="false"
-    android:canRequestFilterKeyEvents="true"
     android:description="@string/accessibility_desc"
     android:notificationTimeout="100"
     tools:targetApi="30" />

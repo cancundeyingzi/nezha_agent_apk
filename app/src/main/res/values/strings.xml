@@ -1,4 +1,10 @@
 <resources>
     <string name="app_name">Nezha Agent</string>
-    <string name="accessibility_desc">哪吒探针保活辅助服务：开启此服务可大幅提升探针在后台的存活率，防止系统杀后台。本服务不会读取或收集您的屏幕内容。</string>
+    <!--
+        Shown in the system accessibility dialog at the moment the user grants the service, so it
+        must state every capability the service actually holds. It previously promised that screen
+        content was never collected while the service both declared canTakeScreenshot and
+        implemented the `@agent screenshot` command.
+    -->
+    <string name="accessibility_desc">哪吒探针保活辅助服务：开启此服务可大幅提升探针在后台的存活率，防止系统杀后台。\n\n请注意：本服务同时为面板的「@agent screenshot」远程截图指令提供截屏能力，该指令仅在你开启了「允许面板远程执行命令」后可用。本服务不读取窗口内容，也不记录按键。</string>
 </resources>

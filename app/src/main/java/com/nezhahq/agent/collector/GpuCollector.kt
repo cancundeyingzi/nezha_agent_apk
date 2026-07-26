@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.SystemClock
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
+import com.nezhahq.agent.util.shellEscape
 import java.io.File
 
 private const val DUMPSYS_THROTTLE_MS = 5_000L
@@ -630,7 +631,7 @@ class GpuCollector internal constructor(
 
         for (entry in sortedEntries) {
             try {
-                val raw = RootShell.executeFirstLine("cat ${entry.path} 2>/dev/null")
+                val raw = RootShell.executeFirstLine("cat ${shellEscape(entry.path)} 2>/dev/null")
                 if (!raw.isNullOrBlank()) {
                     val value = entry.parser(raw)
                     if (value != null) {
@@ -654,7 +655,7 @@ class GpuCollector internal constructor(
         val path = state.sysfsPath ?: return emptyList()
         val parser = state.parser ?: return emptyList()
         return try {
-            val raw = RootShell.executeFirstLine("cat $path 2>/dev/null")
+            val raw = RootShell.executeFirstLine("cat ${shellEscape(path)} 2>/dev/null")
             if (!raw.isNullOrBlank()) {
                 val value = parser(raw)
                 if (value != null) return listOf(value.coerceIn(0.0, 100.0))
@@ -697,7 +698,7 @@ class GpuCollector internal constructor(
                     if (trimmed.isEmpty()) continue
 
                     // 尝试读取并用通用 parser 解析
-                    val raw = RootShell.executeFirstLine("cat $trimmed 2>/dev/null")
+                    val raw = RootShell.executeFirstLine("cat ${shellEscape(trimmed)} 2>/dev/null")
                     if (!raw.isNullOrBlank()) {
                         val value = tryGenericParse(raw, trimmed)
                         if (value != null) {

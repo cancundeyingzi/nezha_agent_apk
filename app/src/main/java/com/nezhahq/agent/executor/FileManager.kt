@@ -3,6 +3,7 @@ package com.nezhahq.agent.executor
 import android.content.Context
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
+import com.nezhahq.agent.util.shellEscape
 import com.google.protobuf.ByteString
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -429,7 +430,9 @@ class FileManager internal constructor(
                 val command = buildList {
                     if (parentDir.isNotEmpty()) add("mkdir -p ${shellEscape(parentDir)}")
                     add("cp ${shellEscape(sourceFile.absolutePath)} ${shellEscape(targetPath)}")
-                    add("chmod 666 ${shellEscape(targetPath)}")
+                    // Owner-only: the copy runs as root, and 666 would leave anything uploaded
+                    // into a private directory writable by every app on the device.
+                    add("chmod 600 ${shellEscape(targetPath)}")
                 }.joinToString(" && ")
                 RootShell.execute(command, timeoutMs = 120_000)
             }
@@ -557,9 +560,6 @@ class FileManager internal constructor(
         outputChannel.close()
     }
 
-    private fun shellEscape(input: String): String {
-        return "'" + input.replace("'", "'\\''") + "'"
-    }
 
 }
 

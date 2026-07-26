@@ -544,7 +544,11 @@ object TaskExecutor {
 
                 is ProcessExecutionResult.TimedOut -> {
                     val elapsed = (System.currentTimeMillis() - startTime) / 1000
-                    Logger.i("TaskExecutor: 命令执行超时（${elapsed}s），已终止: ${command.take(100)}")
+                    // The task id, not the command: dashboard-supplied commands routinely carry
+                    // credentials, and the in-app log view and logcat are both readable.
+                    Logger.i(
+                        "TaskExecutor: 命令执行超时（${elapsed}s），已终止 (TaskID=${resultBuilder.id})"
+                    )
                     resultBuilder
                         .setData("Command execution timed out after ${elapsed}s.\n${execution.output}")
                         .setDelay((System.currentTimeMillis() - startTime).toFloat())

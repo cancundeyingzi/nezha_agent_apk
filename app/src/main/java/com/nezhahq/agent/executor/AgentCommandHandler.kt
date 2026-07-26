@@ -11,6 +11,7 @@ import androidx.core.content.ContextCompat
 import com.nezhahq.agent.service.KeepAliveAccessibilityService
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
+import com.nezhahq.agent.util.shellEscape
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -285,7 +286,12 @@ class AgentCommandHandler(private val context: Context) {
      * Root/Shizuku 高权限模式，则回退到系统 screencap 命令。
      */
     private suspend fun executeScreenshot(pathArg: String): String {
-        val targetPath = normalizeScreenshotPath(pathArg)
+        val targetPath = normalizeScreenshotPath(pathArg) ?: return buildString {
+            append("\r\n")
+            append("❌ 截图路径无效\r\n")
+            append("相对路径不能越出默认目录 ${defaultScreenshotDir()}；如需写到别处请给出绝对路径。\r\n")
+            append("\r\n")
+        }
 
         when (val result = KeepAliveAccessibilityService.saveScreenshot(targetPath)) {
             is KeepAliveAccessibilityService.ScreenshotSaveResult.Success -> {
@@ -370,21 +376,11 @@ class AgentCommandHandler(private val context: Context) {
             ShellScreenshotResult.Failure("screencap 退出码 $exitCode: $detail")
         }
 
-    private fun normalizeScreenshotPath(pathArg: String): String {
-        val rawPath = pathArg.stripWrappingQuotes()
-        val generatedName = "nezha_screenshot_${screenshotDateFormat.format(Date())}.png"
-        val defaultDir = defaultScreenshotDir()
-        if (rawPath.isBlank()) return "$defaultDir/$generatedName"
-
-        val normalized = rawPath.replace('\\', '/')
-        if (normalized.endsWith("/")) return normalized + generatedName
-
-        return if (File(normalized).isAbsolute) {
-            normalized
-        } else {
-            "$defaultDir/$normalized"
-        }
-    }
+    private fun normalizeScreenshotPath(pathArg: String): String? = resolveScreenshotPath(
+        requestedPath = pathArg.stripWrappingQuotes(),
+        defaultDirectory = defaultScreenshotDir(),
+        generatedFileName = "nezha_screenshot_${screenshotDateFormat.format(Date())}.png"
+    )
 
     private fun defaultScreenshotDir(): String {
         return Environment.getExternalStorageDirectory().absolutePath
@@ -413,9 +409,6 @@ class AgentCommandHandler(private val context: Context) {
         }
     }
 
-    private fun shellEscape(input: String): String {
-        return "'" + input.replace("'", "'\\''") + "'"
-    }
 
     private fun formatBytes(bytes: Long?): String {
         bytes ?: return "未知"
