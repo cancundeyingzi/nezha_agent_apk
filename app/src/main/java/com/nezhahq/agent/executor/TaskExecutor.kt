@@ -6,6 +6,7 @@ import com.nezhahq.agent.core.model.RemoteCapabilities
 import com.nezhahq.agent.core.task.RemoteCapabilityPolicy
 import com.nezhahq.agent.core.task.TaskTypes
 import com.nezhahq.agent.util.Logger
+import com.nezhahq.agent.util.readLimitedUtf8
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -251,42 +252,6 @@ private suspend fun <T> runCancellableBlocking(
 
 private fun hasReachedDeadline(nowNanos: Long, deadlineNanos: Long): Boolean =
     nowNanos - deadlineNanos >= 0
-
-/**
- * Retains at most [maxBytes], but keeps draining [inputStream] so a full pipe cannot stall the
- * child process. Decoding happens once after collection, preserving UTF-8 sequences split across
- * read boundaries.
- */
-internal fun readLimitedUtf8(inputStream: InputStream, maxBytes: Int): String {
-    require(maxBytes >= 0) { "maxBytes must not be negative" }
-
-    val retained = ByteArray(maxBytes)
-    val readBuffer = ByteArray(PROCESS_READ_BUFFER_BYTES)
-    var retainedBytes = 0
-    try {
-        while (true) {
-            val bytesRead = inputStream.read(readBuffer)
-            if (bytesRead == -1) break
-            if (bytesRead == 0) continue
-
-            val bytesToRetain = minOf(bytesRead, maxBytes - retainedBytes)
-            if (bytesToRetain > 0) {
-                readBuffer.copyInto(
-                    destination = retained,
-                    destinationOffset = retainedBytes,
-                    startIndex = 0,
-                    endIndex = bytesToRetain
-                )
-                retainedBytes += bytesToRetain
-            }
-        }
-    } catch (_: IOException) {
-        // Process termination closes the pipe; return the bytes retained before it closed.
-    }
-    return String(retained, 0, retainedBytes, Charsets.UTF_8)
-}
-
-private const val PROCESS_READ_BUFFER_BYTES = 8 * 1024
 
 /**
  * 任务执行器：处理面板下发的各类监控任务。

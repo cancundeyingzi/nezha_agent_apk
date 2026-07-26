@@ -8,6 +8,7 @@ import java.io.IOException
 import kotlin.math.PI
 import kotlin.math.sin
 import kotlin.random.Random
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -126,6 +127,10 @@ internal class AudioKeepAlive(
             if (!kotlin.coroutines.coroutineContext.isActive) return
             output.start()
             writeAudio(output)
+        } catch (cancellation: CancellationException) {
+            // Stopping the writer is routine; reporting it as a session failure buried the real
+            // ones. Cleanup still runs in the finally below.
+            throw cancellation
         } catch (e: Exception) {
             Logger.e("$TAG: 音频保活会话失败", e)
         } finally {

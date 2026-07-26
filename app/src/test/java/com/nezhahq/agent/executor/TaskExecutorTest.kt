@@ -4,6 +4,7 @@ import com.nezhahq.agent.SilentLoggerRule
 import com.nezhahq.agent.core.model.RemoteCapabilities
 import com.nezhahq.agent.core.task.RemoteCapabilityPolicy
 import com.nezhahq.agent.core.task.TaskTypes
+import com.nezhahq.agent.util.readLimitedUtf8
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation

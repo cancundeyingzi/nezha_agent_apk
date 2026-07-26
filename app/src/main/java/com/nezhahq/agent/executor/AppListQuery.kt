@@ -55,7 +55,9 @@ class AppListQuery(private val context: Context) {
     suspend fun getUserAppProcesses(): ProcessQueryResult = withContext(Dispatchers.IO) {
         val apps = loadInstalledUserApps()
         val appByPackage = apps.associateBy { it.packageName }
-        val output = RootShell.execute(
+        // Isolated: two full dumpsys passes routinely run for seconds, and the metrics loop shares
+        // the other shell.
+        val output = RootShell.executeIsolated(
             command = """
             dumpsys activity processes 2>/dev/null
             echo $MEMINFO_MARKER

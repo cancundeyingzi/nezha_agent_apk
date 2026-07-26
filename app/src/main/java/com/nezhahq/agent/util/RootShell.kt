@@ -6,6 +6,12 @@ import java.io.File
 import java.io.InputStream
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 
 /**
@@ -52,10 +58,71 @@ object RootShell {
     /** Returns whether privileged operations are currently authorized for this process. */
     fun isAuthorized(): Boolean = accessController.isEnabled()
 
-    /** Executes [command], returning at most 4 MiB of merged stdout/stderr. */
+    /**
+     * Executes [command] on the shared session, returning at most 4 MiB of merged stdout/stderr.
+     *
+     * Every caller is serialized through one long-lived shell, and a command holds it for its whole
+     * timeout. That is the right trade for the short `/proc` reads the metrics loop issues twice a
+     * second; anything that can run for seconds must use [executeIsolated] instead.
+     */
     fun execute(command: String, timeoutMs: Long = DEFAULT_SHELL_TIMEOUT_MS): String {
         if (!accessController.isEnabled()) return ""
         return persistentShell.execute(command, timeoutMs)
+    }
+
+    /**
+     * Executes [command] on a dedicated process that no other caller waits behind.
+     *
+     * Holding the shared session for longer than the dashboard's state-report timeout stalls the
+     * metrics stream; the dashboard then tears the connection down, taking with it the very
+     * transfer that was holding the shell. A 120-second upload copy made that a certainty, so slow
+     * work gets its own process and the metrics loop keeps reporting throughout.
+     *
+     * Returns the output, or an empty string if the shell could not start, the command failed, or
+     * it timed out — truncated output is never returned as if it were complete. Destroying the
+     * process is what ends a read that has hung: interrupting the thread does not reliably wake a
+     * blocked process stream, so both the timeout and cancellation of the caller route through it.
+     */
+    suspend fun executeIsolated(
+        command: String,
+        timeoutMs: Long = DEFAULT_SHELL_TIMEOUT_MS
+    ): String = withContext(Dispatchers.IO) {
+        if (!accessController.isEnabled()) return@withContext ""
+        val managed = startManagedShell(workingDirectory = null) ?: return@withContext ""
+        val timedOut = AtomicBoolean(false)
+
+        coroutineScope {
+            val destroyer = launch {
+                try {
+                    delay(timeoutMs)
+                    timedOut.set(true)
+                    Logger.e("RootShell: 隔离命令超时（${timeoutMs}ms），已终止其专用进程")
+                } finally {
+                    // Also reached when the caller is cancelled, which is what unblocks the read.
+                    // close(), not forceClose(): whichever of the two paths destroys the process
+                    // first is the one that must also drop it from the registry, and the loser
+                    // returns early.
+                    managed.close()
+                }
+            }
+
+            try {
+                managed.process.outputStream.apply {
+                    write("$command\nexit\n".toByteArray(Charsets.UTF_8))
+                    flush()
+                }
+                val output = readLimitedUtf8(managed.process.inputStream, MAX_SHELL_OUTPUT_BYTES)
+                if (timedOut.get()) "" else output
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (exception: Exception) {
+                Logger.e("RootShell: 隔离命令执行失败", exception)
+                ""
+            } finally {
+                destroyer.cancel()
+                managed.close()
+            }
+        }
     }
 
     /** Executes [command] and returns its first non-blank output line. */

@@ -9,12 +9,18 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -135,8 +141,16 @@ class KeepAliveControllerTest {
         assertTrue(cancellation != null)
     }
 
+    /**
+     * The overlay is released before any resource that can hang.
+     *
+     * It is the only one whose loss is permanent: an abandoned `TYPE_APPLICATION_OVERLAY` survives
+     * the runtime that created it and nothing can reach it afterwards, whereas a wake lock or an
+     * audio track dies with the process. So it goes first, and a stuck audio teardown must find it
+     * already gone.
+     */
     @Test
-    fun boundedCloseReturnsWhileIndependentCleanupContinues() = runBlocking {
+    fun boundedCloseReleasesTheOverlayBeforeAnythingThatCanHang() = runBlocking {
         val cleanupExecutor = Executors.newSingleThreadExecutor()
         val cleanupDispatcher = cleanupExecutor.asCoroutineDispatcher()
         val cleanupScope = CoroutineScope(SupervisorJob() + cleanupDispatcher)
@@ -159,21 +173,34 @@ class KeepAliveControllerTest {
 
         try {
             assertFalse(controller.closeWithin(750L))
-            assertEquals(0, overlay.closeCount)
-            assertEquals(0, vpn.closeCount)
-            assertEquals(0, wakeLock.closeCount)
-
-            blocker.unblock()
-
-            assertTrue(wakeLock.closed.await(TIMEOUT_SECONDS, TimeUnit.SECONDS))
             assertEquals(1, overlay.closeCount)
-            assertEquals(1, vpn.closeCount)
-            assertEquals(1, wakeLock.closeCount)
         } finally {
             blocker.unblock()
             cleanupScope.cancel()
             cleanupDispatcher.close()
         }
+    }
+
+    /**
+     * One resource overrunning its budget must not consume the whole deadline.
+     *
+     * A single shared budget meant the first slow release used all of it and every later resource
+     * was cancelled without being attempted even once.
+     */
+    @Test
+    fun aResourceThatOverrunsItsBudgetDoesNotStarveTheOnesAfterIt() = runBlocking {
+        val overlay = SuspendingCloseResource()
+        val audio = RecordingResource()
+        val vpn = RecordingResource()
+        val wakeLock = RecordingResource()
+        val controller = KeepAliveController(audio, overlay, wakeLock, vpn)
+
+        controller.close(perResourceTimeoutMillis = 50L)
+
+        assertTrue(overlay.closeStarted)
+        assertEquals(1, audio.closeCount)
+        assertEquals(1, vpn.closeCount)
+        assertEquals(1, wakeLock.closeCount)
     }
 
     @Test
@@ -435,6 +462,63 @@ class KeepAliveControllerTest {
         assertEquals(2, removeFailingHost.removeCount)
     }
 
+    /**
+     * A cancelled teardown still gets the window off the screen.
+     *
+     * Removal has to run on the main thread. When that thread was busy, the teardown deadline used
+     * to cancel the removal mid-suspend and drop the handle with it, stranding one overlay window
+     * per reload with nothing left holding a reference to it. Cancellation must now hand the
+     * removal to the main looper rather than abandon it.
+     */
+    /**
+     * A cancelled teardown still gets the window off the screen.
+     *
+     * Removal has to run on the main thread. When that thread was busy, the teardown deadline
+     * cancelled the removal mid-suspend and dropped the handle with it, stranding one
+     * `TYPE_APPLICATION_OVERLAY` per reload with nothing left holding a reference to it.
+     * Cancellation must hand the removal off instead of abandoning it.
+     *
+     * The main thread is occupied, the deadline gives up and cancels, and only then does the main
+     * thread free up — the order that matters, because a suspended `withContext` cannot even
+     * unwind until its dispatcher runs again.
+     */
+    @Test
+    fun cancellingTheOverlayTeardownStillHandsOffTheRemoval() {
+        val mainExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, MAIN_THREAD_NAME)
+        }
+        val mainDispatcher = mainExecutor.asCoroutineDispatcher()
+        val mainThreadBusy = CountDownLatch(1)
+        val host = FakeOverlayHost()
+        val overlay = OverlayKeepAlive(host, mainDispatcher)
+
+        try {
+            runBlocking {
+                overlay.setEnabled(true)
+                val handle = host.lastHandle!!
+                assertEquals(0, handle.deferredRemovals)
+
+                mainExecutor.submit { mainThreadBusy.await() }
+
+                val closing = launch(Dispatchers.Default) { overlay.close() }
+                // Parked waiting for the main thread, exactly where the deadline used to strand it.
+                assertNull(withTimeoutOrNull(TIMEOUT_MILLIS) { closing.join() })
+
+                closing.cancel()
+                mainThreadBusy.countDown()
+                closing.join()
+
+                // Handed to the looper rather than abandoned, and the window really does go away.
+                assertEquals(1, handle.deferredRemovals)
+                assertEquals(1, host.removeCount)
+            }
+        } finally {
+            mainThreadBusy.countDown()
+            mainDispatcher.close()
+            mainExecutor.shutdownNow()
+        }
+    }
+
     @Test
     fun overlayWindowWorkStaysOnTheMainDispatcherWhateverThreadClosesIt() {
         val mainExecutor = Executors.newSingleThreadExecutor { runnable ->
@@ -574,6 +658,19 @@ class KeepAliveControllerTest {
 
         fun unblock() {
             gate.countDown()
+        }
+    }
+
+    /** Hangs at a suspension point, so a per-resource timeout can actually cut it short. */
+    private class SuspendingCloseResource : KeepAliveResource {
+        @Volatile var closeStarted = false
+            private set
+
+        override suspend fun setEnabled(enabled: Boolean) = Unit
+
+        override suspend fun close() {
+            closeStarted = true
+            awaitCancellation()
         }
     }
 
@@ -742,26 +839,44 @@ class KeepAliveControllerTest {
         }
     }
 
+    /**
+     * Runs the deferred removal inline instead of posting it, so a test can observe that the
+     * overlay was handed off rather than dropped.
+     */
+    private class FakeOverlayHandle(private val onRemove: () -> Boolean) : OverlayHandle {
+        var deferredRemovals = 0
+            private set
+
+        override fun remove(): Boolean = onRemove()
+
+        override fun removeWhenMainThreadIsFree() {
+            deferredRemovals++
+            onRemove()
+        }
+    }
+
     private class FakeOverlayHost(
         private val failAdd: Boolean = false,
         private var removeFailuresRemaining: Int = 0
     ) : OverlayHost {
         var addCount = 0
         var removeCount = 0
+        var lastHandle: FakeOverlayHandle? = null
+            private set
 
         override fun hasPermission(): Boolean = true
 
         override fun add(): OverlayHandle {
             addCount++
             if (failAdd) throw IllegalStateException("add failed")
-            return OverlayHandle {
+            return FakeOverlayHandle {
                 removeCount++
                 if (removeFailuresRemaining > 0) {
                     removeFailuresRemaining--
                     throw IllegalStateException("remove failed")
                 }
                 true
-            }
+            }.also { lastHandle = it }
         }
     }
 
@@ -773,7 +888,7 @@ class KeepAliveControllerTest {
 
         override fun add(): OverlayHandle {
             record()
-            return OverlayHandle {
+            return FakeOverlayHandle {
                 record()
                 true
             }
@@ -841,5 +956,6 @@ class KeepAliveControllerTest {
     private companion object {
         const val MAIN_THREAD_NAME = "fake-main"
         const val TIMEOUT_SECONDS = 2L
+        const val TIMEOUT_MILLIS = 200L
     }
 }

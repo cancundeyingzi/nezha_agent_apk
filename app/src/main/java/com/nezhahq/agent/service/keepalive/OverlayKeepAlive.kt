@@ -3,6 +3,8 @@ package com.nezhahq.agent.service.keepalive
 import android.content.Context
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -17,9 +19,17 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-internal fun interface OverlayHandle {
-    /** Returns true only when the view is confirmed detached. */
+internal interface OverlayHandle {
+    /** Returns true only when the view is confirmed detached. Must run on the main thread. */
     fun remove(): Boolean
+
+    /**
+     * Schedules [remove] on the main thread and returns immediately.
+     *
+     * Used when the caller is being cancelled and can no longer wait for the main thread. See
+     * [OverlayKeepAlive.close].
+     */
+    fun removeWhenMainThreadIsFree()
 }
 
 internal interface OverlayHost {
@@ -39,13 +49,35 @@ internal class OverlayKeepAlive(
     private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate
 ) : KeepAliveResource {
     private val lifecycleMutex = Mutex()
+
+    /** Volatile because [close]'s cancellation path reads it from outside [lifecycleMutex]. */
+    @Volatile
     private var handle: OverlayHandle? = null
 
     override suspend fun setEnabled(enabled: Boolean) = lifecycleMutex.withLock {
         if (enabled) start() else remove()
     }
 
-    override suspend fun close() = lifecycleMutex.withLock { remove() }
+    /**
+     * Removes the window, handing the work to the main looper if this coroutine is cut short.
+     *
+     * Removal has to happen on the main thread, and teardown runs under a deadline. When the main
+     * thread is busy, that deadline used to cancel the removal mid-suspend and drop the handle with
+     * it, stranding a `TYPE_APPLICATION_OVERLAY` window that nothing could reach again — one more
+     * per reload. Posting it instead means a cancelled teardown still ends with the window gone.
+     */
+    override suspend fun close() {
+        try {
+            lifecycleMutex.withLock { remove() }
+        } catch (cancellation: CancellationException) {
+            // Outside the lock on purpose: cancellation can also strike while waiting for it, and
+            // an abandoned window has to be handed off from either point. Racing a concurrent
+            // removal is harmless — removing a detached view reports success.
+            handle?.removeWhenMainThreadIsFree()
+            handle = null
+            throw cancellation
+        }
+    }
 
     private suspend fun start() {
         if (handle != null) return
@@ -142,6 +174,19 @@ private class WindowOverlayHandle(
         } catch (fallbackFailure: Exception) {
             Logger.e("OverlayKeepAlive: 立即移除失败", fallbackFailure)
             !view.isAttachedToWindow
+        }
+    }
+
+    /**
+     * Queues the removal on the main looper without waiting for it.
+     *
+     * The window belongs to the process, not to the coroutine that asked for it to go away, so the
+     * last-resort teardown must survive that coroutine being cancelled. Nothing observes the
+     * result: by the time this is used, the caller has already run out of time to react.
+     */
+    override fun removeWhenMainThreadIsFree() {
+        Handler(Looper.getMainLooper()).post {
+            if (remove()) Logger.i("OverlayKeepAlive: 悬浮窗已在主线程空闲后移除")
         }
     }
 }

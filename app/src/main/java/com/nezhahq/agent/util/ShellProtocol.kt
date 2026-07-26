@@ -4,7 +4,18 @@ import java.io.IOException
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
 
-internal const val DEFAULT_SHELL_TIMEOUT_MS = 15_000L
+/**
+ * How long one command may hold the shared privileged shell.
+ *
+ * This has to stay well under the dashboard's state-receipt timeout. The metrics loop reads `/proc`
+ * through that shell every two seconds, so a command holding it for longer delays the next state
+ * report by the same amount, and once the dashboard stops receiving them it drops the whole
+ * connection. `RootShell.executeIsolated` exists for work that cannot fit in this budget.
+ *
+ * `ShellTimeoutBudgetTest` pins the relationship; the constant it compares against lives in
+ * `:app`'s service layer, which this module must not depend on.
+ */
+internal const val DEFAULT_SHELL_TIMEOUT_MS = 5_000L
 internal const val MAX_SHELL_OUTPUT_BYTES = 4 * 1024 * 1024
 
 /** Per-command framing values. The token is deliberately restricted to shell-safe ASCII. */

@@ -35,18 +35,25 @@ internal class KeepAliveController(
     private val lifecycleMutex = Mutex()
 
     suspend fun reconfigure(settings: KeepAliveSettings) = lifecycleMutex.withLock {
-        attempt("audio reconfigure") { configureAudio(settings.audio) }
-        attempt("overlay reconfigure") { configureOverlay(settings.overlay) }
-        attempt("wake lock reconfigure") { configureWakeLock() }
-        attempt("VPN reconfigure") { configureVpn(settings.vpn) }
+        attempt("audio reconfigure", NO_TIMEOUT) { configureAudio(settings.audio) }
+        attempt("overlay reconfigure", NO_TIMEOUT) { configureOverlay(settings.overlay) }
+        attempt("wake lock reconfigure", NO_TIMEOUT) { configureWakeLock() }
+        attempt("VPN reconfigure", NO_TIMEOUT) { configureVpn(settings.vpn) }
     }
 
-    suspend fun close() = lifecycleMutex.withLock {
-        // Start potentially slow audio teardown first; every later resource is still attempted.
-        attempt("audio close") { closeAudio() }
-        attempt("overlay close") { closeOverlay() }
-        attempt("VPN close") { closeVpn() }
-        attempt("wake lock close") { closeWakeLock() }
+    /**
+     * Releases every resource, each under its own share of the deadline.
+     *
+     * One budget for all four meant a slow release consumed the whole thing and the rest were
+     * cancelled without ever being attempted. The order puts the overlay first because it is the
+     * only resource whose loss is permanent — an abandoned window survives the process that owns
+     * it, while a leaked wake lock or audio track does not.
+     */
+    suspend fun close(perResourceTimeoutMillis: Long = NO_TIMEOUT) = lifecycleMutex.withLock {
+        attempt("overlay close", perResourceTimeoutMillis) { closeOverlay() }
+        attempt("audio close", perResourceTimeoutMillis) { closeAudio() }
+        attempt("VPN close", perResourceTimeoutMillis) { closeVpn() }
+        attempt("wake lock close", perResourceTimeoutMillis) { closeWakeLock() }
     }
 
     /**
@@ -54,9 +61,12 @@ internal class KeepAliveController(
      *
      * Cancelling on timeout is deliberate: a replacement runtime may already be acquiring the same
      * audio and window resources, so an unfinished teardown must not keep running against them.
+     * [timeoutMillis] is the overall deadline; each resource gets an equal share of it so that
+     * exhausting one does not silently skip the others.
      */
     suspend fun closeWithin(timeoutMillis: Long): Boolean {
-        val closeJob = cleanupScope.launch { close() }
+        val perResource = (timeoutMillis / RESOURCE_COUNT).coerceAtLeast(1L)
+        val closeJob = cleanupScope.launch { close(perResource) }
         val closed = closeWaiter.await(closeJob, timeoutMillis)
         cleanupScope.cancel()
         return closed
@@ -78,9 +88,24 @@ internal class KeepAliveController(
 
     private suspend fun closeVpn() = vpn.close()
 
-    private suspend fun attempt(operation: String, action: suspend () -> Unit) {
+    /**
+     * Runs one teardown step, absorbing its failure and its overrun.
+     *
+     * A step that exceeds [timeoutMillis] is cancelled and reported, but the ones after it still
+     * run — the point of bounding each step separately. Cancellation of the whole teardown still
+     * propagates, so the caller's deadline remains in charge.
+     */
+    private suspend fun attempt(
+        operation: String,
+        timeoutMillis: Long,
+        action: suspend () -> Unit
+    ) {
         try {
-            action()
+            if (timeoutMillis == NO_TIMEOUT) {
+                action()
+            } else if (withTimeoutOrNull(timeoutMillis) { action() } == null) {
+                Logger.e("KeepAliveController: $operation timed out after ${timeoutMillis}ms")
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -89,6 +114,12 @@ internal class KeepAliveController(
     }
 
     companion object {
+        /** Reconfiguration runs without a deadline; only teardown is bounded. */
+        internal const val NO_TIMEOUT = Long.MAX_VALUE
+
+        /** How many resources [close] walks, used to divide the teardown deadline. */
+        internal const val RESOURCE_COUNT = 4
+
         /**
          * Builds one runtime's keep-alive resources around a single cleanup scope.
          *

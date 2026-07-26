@@ -266,6 +266,8 @@ class TerminalManager(
         val cmd = if (line == AGENT_CMD_EXACT) "" else line.removePrefix(AGENT_CMD_PREFIX).trim()
         try {
             sendOutput(commandHandler.execute(cmd))
+        } catch (cancellation: CancellationException) {
+            throw cancellation
         } catch (e: Exception) {
             Logger.e("TerminalManager: 虚拟指令执行异常", e)
             sendOutput("❌ 指令执行异常: ${e.message}\r\n")

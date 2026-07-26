@@ -349,7 +349,9 @@ class AgentCommandHandler(private val context: Context) {
                 fi
             """.trimIndent()
 
-            val output = RootShell.execute(command, timeoutMs = 30_000)
+            // Isolated: a screencap of a large display can outlast the state-report timeout, and
+            // the metrics loop must keep reporting while it runs.
+            val output = RootShell.executeIsolated(command, timeoutMs = 30_000)
             if (output.isBlank()) {
                 return@withContext ShellScreenshotResult.Failure("Root/Shizuku shell 不可用或无输出")
             }

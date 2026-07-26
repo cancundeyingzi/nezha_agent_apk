@@ -207,7 +207,10 @@ internal class AgentRuntime(
                 Logger.i("AgentRuntime: 清理残留临时文件: ${staleFile.name}")
                 staleFile.delete()
             }
-        } catch (_: Exception) {
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (exception: Exception) {
+            Logger.e("AgentRuntime: 清理残留上传临时文件失败", exception)
         }
     }
 
@@ -215,7 +218,12 @@ internal class AgentRuntime(
         Logger.i("Network dynamically available, polling full GeoIP metadata...")
         scope.launch {
             try {
-                val geoIp = GeoIpCollector.fetchGeoIP()
+                val geoIp = DashboardSessionWatchdog.callWithin(
+                    DashboardSessionWatchdog.HANDSHAKE_TIMEOUT_MS,
+                    "NetworkCallback FetchGeoIP"
+                ) {
+                    GeoIpCollector.fetchGeoIP()
+                }
                 val stub = grpcConnection.stub
                 if (geoIp != null && stub != null) {
                     DashboardSessionWatchdog.callWithin(
@@ -225,12 +233,24 @@ internal class AgentRuntime(
                         stub.reportGeoIP(geoIp)
                     }
                 }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
             } catch (exception: Exception) {
                 Logger.e("GeoIP 上报失败（将在下次连接成功后重试）", exception)
             }
         }
     }
 
+    /**
+     * Reconnects until cancelled, and never exits for any other reason.
+     *
+     * Anything that escapes this loop leaves the runtime looking healthy while it is doing nothing:
+     * the service stays in the foreground, its notification stays up, and `isRunning` stays true,
+     * so nothing retries and the agent is offline until the user notices. That includes a failure
+     * inside [handleConnectionFailure] itself, which is why the backoff is inside the guard rather
+     * than beside it, and an [Error] such as OutOfMemoryError, which is logged and retried rather
+     * than allowed to end the loop silently.
+     */
     private suspend fun runConnectionLoop() {
         while (currentCoroutineContext().isActive) {
             try {
@@ -244,8 +264,15 @@ internal class AgentRuntime(
                 }
             } catch (cancellation: CancellationException) {
                 throw cancellation
-            } catch (exception: Exception) {
-                handleConnectionFailure(exception)
+            } catch (failure: Throwable) {
+                try {
+                    handleConnectionFailure(failure)
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (secondary: Throwable) {
+                    Logger.e("AgentRuntime: 连接失败处理自身异常，仍将继续重连", secondary)
+                    delay(DashboardSessionWatchdog.RECONNECT_BACKOFF_MS)
+                }
             }
         }
     }
@@ -263,12 +290,21 @@ internal class AgentRuntime(
         ) {
             stub.reportSystemInfo2(hostInfo)
         }
-        GeoIpCollector.fetchGeoIP()?.let { geoIp ->
+        // Bounded like every other handshake step. Probing four endpoints can otherwise run for
+        // forty seconds, during which neither the state stream nor the task stream has started and
+        // the dashboard shows the device as offline.
+        val geoIp = DashboardSessionWatchdog.callWithin(
+            DashboardSessionWatchdog.HANDSHAKE_TIMEOUT_MS,
+            "FetchGeoIP"
+        ) {
+            GeoIpCollector.fetchGeoIP()
+        }
+        geoIp?.let {
             DashboardSessionWatchdog.callWithin(
                 DashboardSessionWatchdog.HANDSHAKE_TIMEOUT_MS,
                 "ReportGeoIP"
             ) {
-                stub.reportGeoIP(geoIp)
+                stub.reportGeoIP(it)
             }
         }
     }
@@ -488,18 +524,18 @@ internal class AgentRuntime(
         }
     }
 
-    private suspend fun handleConnectionFailure(exception: Exception) {
-        if (isAuthenticationFailure(exception)) {
+    private suspend fun handleConnectionFailure(failure: Throwable) {
+        if (isAuthenticationFailure(failure)) {
             statusSink(GrpcConnectionState.AUTH_FAILED, "认证失败，请检查密钥和 UUID")
-            Logger.e("AgentRuntime: 认证失败，请检查密钥和 UUID 配置", exception)
+            Logger.e("AgentRuntime: 认证失败，请检查密钥和 UUID 配置", failure)
         } else {
             if (grpcConnection.transportMode == GrpcTransportMode.TLS &&
-                isGenuineTlsFailure(exception)
+                isGenuineTlsFailure(failure)
             ) {
-                Logger.e("Grpc: TLS 连接失败，将继续按 TLS 重试，不自动切换明文", exception)
+                Logger.e("Grpc: TLS 连接失败，将继续按 TLS 重试，不自动切换明文", failure)
             }
             showReconnectStatus()
-            Logger.e("AgentRuntime: 连接中断，关闭通道后重试", exception)
+            Logger.e("AgentRuntime: 连接中断，关闭通道后重试", failure)
         }
         grpcConnection.disconnect(preserveConnectionState = true)
         delay(DashboardSessionWatchdog.RECONNECT_BACKOFF_MS)

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import com.nezhahq.agent.service.AgentService
 import com.nezhahq.agent.util.Logger
+import kotlin.concurrent.thread
 
 /**
  * 开机自启与应用更新后自动恢复的广播接收器。
@@ -24,6 +25,14 @@ import com.nezhahq.agent.util.Logger
  */
 class BootReceiver : BroadcastReceiver() {
 
+    /**
+     * Decides off the main thread, because reading the configuration can be slow.
+     *
+     * The first read opens the store, which on an upgraded install migrates the legacy encrypted
+     * preferences and builds an Android Keystore master key. `onReceive` runs on the main thread
+     * with roughly ten seconds before the receiver is killed, and boot is exactly when the device
+     * is slowest, so doing that work inline risked losing the auto-start it was meant to perform.
+     */
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
 
@@ -32,6 +41,20 @@ class BootReceiver : BroadcastReceiver() {
             action != Intent.ACTION_MY_PACKAGE_REPLACED
         ) return
 
+        val appContext = context.applicationContext
+        val pendingResult = goAsync()
+        thread(name = "nezha-boot-receiver", isDaemon = true) {
+            try {
+                startAgentIfConfigured(appContext, action)
+            } catch (failure: Throwable) {
+                Logger.e("BootReceiver: 自动启动判定失败", failure)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
+    private fun startAgentIfConfigured(context: Context, action: String) {
         val repository = context.appContainer.configRepository
         if (!repository.storageStatus().isUsable) {
             Logger.e("BootReceiver: 收到 $action，但配置存储不可用，拒绝自动启动。")

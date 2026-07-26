@@ -434,7 +434,10 @@ class FileManager internal constructor(
                     // into a private directory writable by every app on the device.
                     add("chmod 600 ${shellEscape(targetPath)}")
                 }.joinToString(" && ")
-                RootShell.execute(command, timeoutMs = 120_000)
+                // Isolated: copying a large file takes far longer than the dashboard's
+                // state-report timeout, and holding the shared shell that long stalls the metrics
+                // stream until the dashboard drops the connection carrying this very transfer.
+                RootShell.executeIsolated(command, timeoutMs = 120_000)
             }
             if (withContext(Dispatchers.IO) { getFileSize(targetPath) } == sourceFile.length()) {
                 return true

@@ -1,11 +1,20 @@
 package com.nezhahq.agent.collector
 
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
+import java.io.IOException
 import proto.Nezha.GeoIP
 import proto.Nezha.IP
 import java.net.Inet4Address
@@ -74,28 +83,66 @@ object GeoIpCollector {
             .build()
     }
 
-    private fun fetchIp(family: IpFamily, client: OkHttpClient): FetchResult? {
+    /**
+     * Tries each endpoint in turn until one answers.
+     *
+     * A caller that gives up must not keep the agent waiting: four endpoints at a ten-second call
+     * timeout is forty seconds, and this runs both on the connect handshake and inside runtime
+     * teardown. Cancellation now aborts the in-flight call and stops the loop rather than being
+     * discovered only after the last endpoint has timed out.
+     */
+    private suspend fun fetchIp(family: IpFamily, client: OkHttpClient): FetchResult? {
         for (endpoint in traceEndpoints) {
-            val result = runCatching {
-                val request = Request.Builder()
-                    .url(endpoint)
-                    .header("User-Agent", MACOS_CHROME_UA)
-                    .build()
+            currentCoroutineContext().ensureActive()
 
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) return@use null
-
-                    val body = response.body?.string() ?: return@use null
-                    val trace = parseTraceBody(body)
-                    val ip = validateIpForFamily(trace.ip, family) ?: return@use null
-                    FetchResult(ip, trace.countryCode)
-                }
-            }.getOrNull()
+            val result = try {
+                requestTrace(endpoint, family, client)
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (_: Exception) {
+                null
+            }
 
             if (result != null) return result
         }
 
         return null
+    }
+
+    /** Enqueues rather than blocking, so no thread is held for the duration of the call. */
+    private suspend fun requestTrace(
+        endpoint: String,
+        family: IpFamily,
+        client: OkHttpClient
+    ): FetchResult? {
+        val request = Request.Builder()
+            .url(endpoint)
+            .header("User-Agent", MACOS_CHROME_UA)
+            .build()
+
+        return suspendCancellableCoroutine { continuation ->
+            val call = client.newCall(request)
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    continuation.resumeWithException(e)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    continuation.resumeWith(
+                        runCatching {
+                            response.use {
+                                if (!it.isSuccessful) return@use null
+                                val trace = it.body?.string()?.let(::parseTraceBody)
+                                    ?: return@use null
+                                validateIpForFamily(trace.ip, family)
+                                    ?.let { ip -> FetchResult(ip, trace.countryCode) }
+                            }
+                        }
+                    )
+                }
+            })
+        }
     }
 
     internal fun parseTraceBody(body: String): TraceBody {
