@@ -1,5 +1,6 @@
 package com.nezhahq.agent.service.keepalive
 
+import com.nezhahq.agent.SilentLoggerRule
 import com.nezhahq.agent.core.model.KeepAliveSettings
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CancellationException
@@ -15,10 +16,15 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
 import java.util.concurrent.Executors
 
 class KeepAliveControllerTest {
+
+    @get:Rule
+    val silentLogger = SilentLoggerRule()
+
     @Test
     fun reconfigureAndCloseAreRepeatableAndSettingsTransitionIndependently() = runBlocking {
         val audio = RecordingResource()

@@ -1,5 +1,6 @@
 package com.nezhahq.agent.executor
 
+import com.nezhahq.agent.SilentLoggerRule
 import com.nezhahq.agent.core.model.RemoteCapabilities
 import com.nezhahq.agent.core.task.RemoteCapabilityPolicy
 import com.nezhahq.agent.core.task.TaskTypes
@@ -14,6 +15,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
 import proto.Nezha.Task
 import java.io.ByteArrayInputStream
@@ -26,6 +28,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class TaskExecutorTest {
+
+    @get:Rule
+    val silentLogger = SilentLoggerRule()
     @After
     fun clearInterruptedStatus() {
         Thread.interrupted()

@@ -1,6 +1,8 @@
 package com.nezhahq.agent.collector
 
+import com.nezhahq.agent.SilentLoggerRule
 import org.junit.Assert.assertEquals
+import org.junit.Rule
 import org.junit.Test
 
 /**
@@ -8,6 +10,10 @@ import org.junit.Test
  * device as roughly 8 GB. Every case below is a mount layout that used to be able to cause it.
  */
 class DiskUsageCalculatorTest {
+
+    @get:Rule
+    val silentLogger = SilentLoggerRule()
+
     @Test
     fun theDataPartitionIsTheInternalBaselineAndSystemMountsAreIgnored() {
         val calculator = calculator(

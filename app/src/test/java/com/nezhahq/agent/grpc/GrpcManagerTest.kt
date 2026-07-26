@@ -1,5 +1,6 @@
 package com.nezhahq.agent.grpc
 
+import com.nezhahq.agent.SilentLoggerRule
 import com.nezhahq.agent.core.model.AgentConfig
 import io.grpc.CallOptions
 import io.grpc.ClientCall
@@ -10,9 +11,14 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
 
 class GrpcManagerTest {
+
+    @get:Rule
+    val silentLogger = SilentLoggerRule()
+
     @Test
     fun resolveTransportModeUsesExplicitTlsConfig() {
         assertEquals(GrpcTransportMode.TLS, GrpcManager.resolveTransportMode(useTls = true))

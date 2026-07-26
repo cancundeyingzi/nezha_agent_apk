@@ -41,7 +41,10 @@ android {
         compose = true
     }
     testOptions {
-        unitTests.isReturnDefaultValues = true
+        // An unmocked Android call fails the test instead of quietly returning 0/false/null, so a
+        // unit test cannot pass against behaviour the device would never produce. Tests whose code
+        // path logs need SilentLoggerRule; see its documentation.
+        unitTests.isReturnDefaultValues = false
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.8"

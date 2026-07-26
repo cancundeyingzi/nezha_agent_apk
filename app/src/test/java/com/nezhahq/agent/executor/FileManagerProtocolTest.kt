@@ -1,5 +1,6 @@
 package com.nezhahq.agent.executor
 
+import com.nezhahq.agent.SilentLoggerRule
 import android.content.ContextWrapper
 import com.google.protobuf.ByteString
 import kotlinx.coroutines.CompletableDeferred
@@ -19,6 +20,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
 import proto.Nezha
 import java.io.ByteArrayInputStream
@@ -32,6 +34,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class FileManagerProtocolTest {
+
+    @get:Rule
+    val silentLogger = SilentLoggerRule()
 
     @Test
     fun `second header follows all bytes declared by first header`() = runBlocking {
