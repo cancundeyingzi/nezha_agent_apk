@@ -326,11 +326,11 @@ private fun MainPagesContent(
                 .blur(120.dp)
         ) {
         }
-        // The background above stays full-bleed; only the content is inset.
+        // Not padded here: padding outside a scrollable clips its viewport, leaving the inset strip
+        // permanently blank and cutting content off at its edge. Each screen folds the inset into
+        // its own scrollable content instead, so the list scrolls under the status bar.
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(contentPadding)
+            modifier = Modifier.fillMaxSize()
         ) {
             Box(
                 modifier = Modifier
@@ -338,7 +338,7 @@ private fun MainPagesContent(
                     .zIndex(if (selectedTab == 0) 1f else 0f)
                     .alpha(if (selectedTab == 0) 1f else 0f)
             ) {
-                ConfigScreenContent(vm, shizukuRequestCode)
+                ConfigScreenContent(vm, shizukuRequestCode, contentPadding)
             }
             Box(
                 modifier = Modifier
@@ -346,7 +346,7 @@ private fun MainPagesContent(
                     .zIndex(if (selectedTab == 1) 1f else 0f)
                     .alpha(if (selectedTab == 1) 1f else 0f)
             ) {
-                ToolsScreenContent(vm)
+                ToolsScreenContent(vm, contentPadding)
             }
         }
     }

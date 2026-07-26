@@ -39,7 +39,8 @@ import com.nezhahq.agent.MainViewModel
 @Composable
 fun ConfigScreenContent(
     vm: MainViewModel,
-    shizukuRequestCode: Int = 19527
+    shizukuRequestCode: Int = 19527,
+    contentPadding: PaddingValues = PaddingValues()
 ) {
     val context = LocalContext.current
     val scrollState = rememberScrollState()
@@ -67,8 +68,15 @@ fun ConfigScreenContent(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 16.dp, vertical = 16.dp)
-            .verticalScroll(scrollState),
+            // Padding after verticalScroll, so it belongs to the scrolled content: the list slides
+            // under the status bar instead of being clipped at a permanently blank strip.
+            .verticalScroll(scrollState)
+            .padding(
+                start = 16.dp,
+                end = 16.dp,
+                top = contentPadding.calculateTopPadding() + 16.dp,
+                bottom = 16.dp
+            ),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         // ── 标题 ──

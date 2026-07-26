@@ -37,7 +37,10 @@ import com.nezhahq.agent.MainViewModel
 // 工具页与配置页，以及它们共用的权限行和系统跳转工具。
 
 @Composable
-fun ToolsScreenContent(vm: MainViewModel) {
+fun ToolsScreenContent(
+    vm: MainViewModel,
+    contentPadding: PaddingValues = PaddingValues()
+) {
     val context = LocalContext.current
     val scrollState = rememberScrollState()
 
@@ -75,8 +78,14 @@ fun ToolsScreenContent(vm: MainViewModel) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 16.dp, vertical = 16.dp)
-            .verticalScroll(scrollState),
+            // See ConfigScreenContent: padding after verticalScroll keeps it inside the scroll.
+            .verticalScroll(scrollState)
+            .padding(
+                start = 16.dp,
+                end = 16.dp,
+                top = contentPadding.calculateTopPadding() + 16.dp,
+                bottom = 16.dp
+            ),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         Text("工具与设置", style = MaterialTheme.typography.headlineMedium)
