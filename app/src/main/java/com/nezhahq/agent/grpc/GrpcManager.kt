@@ -33,18 +33,21 @@ enum class GrpcTransportMode {
 }
 
 /**
- * Temporary process-level state facade used by the current UI.
+ * The connection state the service publishes and the UI observes.
  *
- * It intentionally has no channel, stub, Context, or persisted-config access.
+ * Held by the application container rather than a global object, so the dependency is visible at
+ * both ends and a test can observe a holder it owns. It carries no channel, stub, or Context.
  */
-object GrpcManager {
+class ConnectionStateHolder {
     private val _connectionState = MutableStateFlow(GrpcConnectionState.IDLE)
     val connectionState: StateFlow<GrpcConnectionState> = _connectionState.asStateFlow()
 
     fun updateState(state: GrpcConnectionState) {
         _connectionState.value = state
     }
+}
 
+object GrpcManager {
     fun resolveTransportMode(useTls: Boolean): GrpcTransportMode =
         if (useTls) GrpcTransportMode.TLS else GrpcTransportMode.PLAINTEXT
 }
@@ -66,7 +69,7 @@ internal interface GrpcConnection : AutoCloseable {
  */
 internal class ManagedGrpcConnection(
     private val config: AgentConfig,
-    private val stateSink: (GrpcConnectionState) -> Unit = GrpcManager::updateState,
+    private val stateSink: (GrpcConnectionState) -> Unit = {},
     private val channelFactory: GrpcManagedChannelFactory =
         GrpcManagedChannelFactory { snapshot, mode ->
             GrpcChannelFactory.create(

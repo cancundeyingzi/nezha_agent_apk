@@ -6,6 +6,19 @@ import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
 import java.io.File
 
+/** 磁盘容量信息，单位为字节。 */
+data class DiskInfo(val totalBytes: Long, val usedBytes: Long)
+
+/** Supplies `/proc/mounts` lines, privileged or not. */
+internal fun interface MountTableSource {
+    fun readMountLines(privileged: Boolean): List<String>
+}
+
+/** Reports a mount point's capacity, or null when it cannot be measured. */
+internal fun interface PathCapacityProbe {
+    fun capacityOf(path: String): DiskInfo?
+}
+
 /**
  * 磁盘容量采集器。
  *
@@ -23,77 +36,13 @@ import java.io.File
  * 这样可以避免普通模式只扫到几个系统分区时，把 256GB 设备误报成约 8GB。
  */
 object DiskCollector {
-
-    /**
-     * 磁盘容量信息，单位为字节。
-     */
-    data class DiskInfo(val totalBytes: Long, val usedBytes: Long)
-
-    private val MOUNT_FIELD_SEPARATOR = Regex("\\s+")
-
-    private val INTERNAL_FS_TYPES = setOf(
-        "ext4", "ext3", "ext2",
-        "f2fs"
-    )
-
-    private val EXTERNAL_FS_TYPES = setOf(
-        "vfat", "exfat",
-        "ntfs", "fuseblk",
-        "fuse", "sdcardfs"
-    )
-
-    private val FALLBACK_BLOCK_FS_TYPES = INTERNAL_FS_TYPES + EXTERNAL_FS_TYPES + setOf(
-        "xfs", "btrfs"
-    )
-
-    private val SYSTEM_MOUNT_PREFIXES = arrayOf(
-        "/system",
-        "/system_ext",
-        "/vendor",
-        "/product",
-        "/odm",
-        "/oem",
-        "/apex",
-        "/metadata",
-        "/firmware"
-    )
-
-    private val SKIP_MOUNT_PREFIXES = arrayOf(
-        "/mnt/vendor/",
-        "/vendor/firmware",
-        "/vendor/bt_"
-    )
-
-    private val INTERNAL_VOLUME_IDS = setOf(
-        "emulated",
-        "self",
-        "primary",
-        "obb"
-    )
-
-    private data class MountEntry(
-        val device: String,
-        val mountPoint: String,
-        val fsType: String
-    )
-
-    private data class ScannedPartition(
-        val entry: MountEntry,
-        val info: DiskInfo,
-        val role: PartitionRole
-    )
-
-    private enum class PartitionRole {
-        INTERNAL,
-        EXTERNAL,
-        FALLBACK_BLOCK
+    private val calculator by lazy {
+        DiskUsageCalculator(
+            mountTable = AndroidMountTableSource,
+            capacityProbe = AndroidPathCapacityProbe,
+            internalStoragePath = Environment.getDataDirectory().path
+        )
     }
-
-    private data class ScanResult(
-        val internal: DiskInfo = DiskInfo(0L, 0L),
-        val external: DiskInfo = DiskInfo(0L, 0L),
-        val fallbackBlock: DiskInfo = DiskInfo(0L, 0L)
-    )
 
     /**
      * 获取设备磁盘容量。
@@ -101,8 +50,69 @@ object DiskCollector {
      * @param isRootMode 是否允许通过 Root/Shizuku shell 读取挂载表。即使为 true，也不会
      *                   通过 shell 执行容量计算，容量仍由公开 API `StatFs` 读取。
      */
+    fun getDiskInfo(isRootMode: Boolean): DiskInfo = calculator.getDiskInfo(isRootMode)
+}
+
+private object AndroidMountTableSource : MountTableSource {
+    override fun readMountLines(privileged: Boolean): List<String> =
+        if (privileged) readByRoot().ifEmpty { readDirect() } else readDirect()
+
+    private fun readByRoot(): List<String> = try {
+        RootShell.execute("cat /proc/mounts")
+            .lineSequence()
+            .filter { it.isNotBlank() }
+            .toList()
+    } catch (e: Exception) {
+        Logger.e("DiskCollector: Root 模式读取 /proc/mounts 失败，回退到普通读取", e)
+        emptyList()
+    }
+
+    private fun readDirect(): List<String> = try {
+        File("/proc/mounts").useLines { lines ->
+            lines.filter { it.isNotBlank() }.toList()
+        }
+    } catch (e: Exception) {
+        Logger.e("DiskCollector: 读取 /proc/mounts 失败", e)
+        emptyList()
+    }
+}
+
+private object AndroidPathCapacityProbe : PathCapacityProbe {
+    override fun capacityOf(path: String): DiskInfo? = try {
+        val stat = StatFs(path)
+        val blockSize = stat.blockSizeLong
+        val total = safeMultiply(stat.blockCountLong, blockSize)
+        val available = safeMultiply(stat.availableBlocksLong, blockSize)
+        val used = (total - available).coerceIn(0L, total)
+
+        if (total > 0L) DiskInfo(total, used) else null
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun safeMultiply(left: Long, right: Long): Long {
+        if (left <= 0L || right <= 0L) return 0L
+        return if (left > Long.MAX_VALUE / right) Long.MAX_VALUE else left * right
+    }
+}
+
+/**
+ * Mount-table classification and capacity merging, with the two platform touch points injected.
+ *
+ * Extracting this follows the pattern the collector package already uses for [ProcNetDevReader]
+ * and [CpuUsageSampler]: the rules deciding what counts as user-visible storage are worth testing,
+ * and they need no device to run.
+ */
+internal class DiskUsageCalculator(
+    private val mountTable: MountTableSource,
+    private val capacityProbe: PathCapacityProbe,
+    private val internalStoragePath: String
+) {
     fun getDiskInfo(isRootMode: Boolean): DiskInfo {
-        val dataPartition = getDataPartitionInfo()
+        val dataPartition = capacityProbe.capacityOf(internalStoragePath) ?: run {
+            Logger.e("DiskCollector: 读取 /data 分区容量失败")
+            DiskInfo(0L, 0L)
+        }
         val mountScan = try {
             scanMounts(isRootMode)
         } catch (e: Exception) {
@@ -110,11 +120,7 @@ object DiskCollector {
             ScanResult()
         }
 
-        val internal = if (dataPartition.totalBytes > 0L) {
-            dataPartition
-        } else {
-            mountScan.internal
-        }
+        val internal = if (dataPartition.totalBytes > 0L) dataPartition else mountScan.internal
 
         val userVisibleStorage = internal + mountScan.external
         if (userVisibleStorage.totalBytes > 0L) {
@@ -127,7 +133,7 @@ object DiskCollector {
     private fun scanMounts(isRootMode: Boolean): ScanResult {
         val partitions = readMountEntries(isRootMode).mapNotNull { entry ->
             val role = classifyMount(entry) ?: return@mapNotNull null
-            val info = statFsOrNull(entry.mountPoint) ?: return@mapNotNull null
+            val info = capacityProbe.capacityOf(entry.mountPoint) ?: return@mapNotNull null
             ScannedPartition(entry, info, role)
         }
 
@@ -138,38 +144,8 @@ object DiskCollector {
         )
     }
 
-    private fun readMountEntries(isRootMode: Boolean): List<MountEntry> {
-        val lines = if (isRootMode) {
-            readMountLinesByRoot().ifEmpty { readMountLinesDirect() }
-        } else {
-            readMountLinesDirect()
-        }
-
-        return lines.mapNotNull(::parseMountLine)
-    }
-
-    private fun readMountLinesByRoot(): List<String> {
-        return try {
-            RootShell.execute("cat /proc/mounts")
-                .lineSequence()
-                .filter { it.isNotBlank() }
-                .toList()
-        } catch (e: Exception) {
-            Logger.e("DiskCollector: Root 模式读取 /proc/mounts 失败，回退到普通读取", e)
-            emptyList()
-        }
-    }
-
-    private fun readMountLinesDirect(): List<String> {
-        return try {
-            File("/proc/mounts").useLines { lines ->
-                lines.filter { it.isNotBlank() }.toList()
-            }
-        } catch (e: Exception) {
-            Logger.e("DiskCollector: 读取 /proc/mounts 失败", e)
-            emptyList()
-        }
-    }
+    private fun readMountEntries(isRootMode: Boolean): List<MountEntry> =
+        mountTable.readMountLines(isRootMode).mapNotNull(::parseMountLine)
 
     private fun parseMountLine(line: String): MountEntry? {
         val parts = line.trim().split(MOUNT_FIELD_SEPARATOR, limit = 4)
@@ -309,30 +285,6 @@ object DiskCollector {
         }?.takeIf { it.isNotBlank() }
     }
 
-    private fun statFsOrNull(path: String): DiskInfo? {
-        return try {
-            val stat = StatFs(path)
-            val blockSize = stat.blockSizeLong
-            val total = safeMultiply(stat.blockCountLong, blockSize)
-            val available = safeMultiply(stat.availableBlocksLong, blockSize)
-            val used = (total - available).coerceIn(0L, total)
-
-            if (total > 0L) DiskInfo(total, used) else null
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    /**
-     * 获取 `/data` 分区容量。它是 Android 内部存储容量最可靠的普通权限来源。
-     */
-    private fun getDataPartitionInfo(): DiskInfo {
-        return statFsOrNull(Environment.getDataDirectory().path) ?: run {
-            Logger.e("DiskCollector: 读取 /data 分区容量失败")
-            DiskInfo(0L, 0L)
-        }
-    }
-
     private fun decodeMountField(value: String): String {
         if ('\\' !in value) return value
 
@@ -383,8 +335,61 @@ object DiskCollector {
         return if (Long.MAX_VALUE - left < right) Long.MAX_VALUE else left + right
     }
 
-    private fun safeMultiply(left: Long, right: Long): Long {
-        if (left <= 0L || right <= 0L) return 0L
-        return if (left > Long.MAX_VALUE / right) Long.MAX_VALUE else left * right
+    private data class MountEntry(
+        val device: String,
+        val mountPoint: String,
+        val fsType: String
+    )
+
+    private data class ScannedPartition(
+        val entry: MountEntry,
+        val info: DiskInfo,
+        val role: PartitionRole
+    )
+
+    private enum class PartitionRole {
+        INTERNAL,
+        EXTERNAL,
+        FALLBACK_BLOCK
+    }
+
+    private data class ScanResult(
+        val internal: DiskInfo = DiskInfo(0L, 0L),
+        val external: DiskInfo = DiskInfo(0L, 0L),
+        val fallbackBlock: DiskInfo = DiskInfo(0L, 0L)
+    )
+
+    private companion object {
+        val MOUNT_FIELD_SEPARATOR = Regex("\\s+")
+
+        val INTERNAL_FS_TYPES = setOf("ext4", "ext3", "ext2", "f2fs")
+
+        val EXTERNAL_FS_TYPES = setOf(
+            "vfat", "exfat",
+            "ntfs", "fuseblk",
+            "fuse", "sdcardfs"
+        )
+
+        val FALLBACK_BLOCK_FS_TYPES = INTERNAL_FS_TYPES + EXTERNAL_FS_TYPES + setOf("xfs", "btrfs")
+
+        val SYSTEM_MOUNT_PREFIXES = arrayOf(
+            "/system",
+            "/system_ext",
+            "/vendor",
+            "/product",
+            "/odm",
+            "/oem",
+            "/apex",
+            "/metadata",
+            "/firmware"
+        )
+
+        val SKIP_MOUNT_PREFIXES = arrayOf(
+            "/mnt/vendor/",
+            "/vendor/firmware",
+            "/vendor/bt_"
+        )
+
+        val INTERNAL_VOLUME_IDS = setOf("emulated", "self", "primary", "obb")
     }
 }

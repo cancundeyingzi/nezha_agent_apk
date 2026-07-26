@@ -48,21 +48,24 @@ class GrpcManagerTest {
     @Test
     fun closeIsIdempotentAndClearsStubAndUiState() {
         var channelCloses = 0
+        // Its own holder rather than a global, so this test cannot be perturbed by another one.
+        val connectionState = ConnectionStateHolder()
         val connection = ManagedGrpcConnection(
             config = config(useTls = false),
+            stateSink = connectionState::updateState,
             channelFactory = GrpcManagedChannelFactory { _, _ ->
                 FakeManagedChannel { channelCloses++ }
             }
         )
         connection.connect()
-        GrpcManager.updateState(GrpcConnectionState.PLAINTEXT_CONNECTED)
+        connectionState.updateState(GrpcConnectionState.PLAINTEXT_CONNECTED)
 
         connection.close()
         connection.close()
 
         assertEquals(1, channelCloses)
         assertNull(connection.stub)
-        assertEquals(GrpcConnectionState.IDLE, GrpcManager.connectionState.value)
+        assertEquals(GrpcConnectionState.IDLE, connectionState.connectionState.value)
         assertEquals(GrpcTransportMode.PLAINTEXT, connection.transportMode)
     }
 

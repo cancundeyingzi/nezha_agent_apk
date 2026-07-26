@@ -9,7 +9,6 @@ import android.os.Environment
 import android.provider.Telephony
 import androidx.core.content.ContextCompat
 import com.nezhahq.agent.service.KeepAliveAccessibilityService
-import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
 import java.io.File
@@ -145,7 +144,7 @@ class AgentCommandHandler(private val context: Context) {
     }
 
     private suspend fun executeAppProcesses(): String {
-        if (!ConfigStore.getRootMode(context)) {
+        if (!RootShell.isAuthorized()) {
             Logger.i("AgentCommandHandler: 跳过用户应用进程查询，Root/Shizuku 模式未开启")
             return buildString {
                 append("\r\n")
@@ -295,7 +294,7 @@ class AgentCommandHandler(private val context: Context) {
             }
             is KeepAliveAccessibilityService.ScreenshotSaveResult.Failure -> {
                 Logger.i("AgentCommandHandler: 无障碍截图不可用，准备尝试高权限兜底: ${result.reason}")
-                val rootMode = ConfigStore.getRootMode(context)
+                val rootMode = RootShell.isAuthorized()
                 if (!rootMode) {
                     return buildString {
                         append("\r\n")

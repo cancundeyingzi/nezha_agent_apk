@@ -8,6 +8,30 @@ import java.util.Date
 import java.util.Locale
 
 /**
+ * Where [Logger] writes once it has buffered a line for the UI.
+ *
+ * Logging is ambient — 25 files call [Logger] — so it stays a global façade rather than a
+ * constructor parameter threaded everywhere. Only the platform write is swappable, which is what a
+ * JVM test needs when `android.util.Log` is not stubbed.
+ */
+interface PlatformLogSink {
+    fun info(message: String)
+    fun error(message: String, throwable: Throwable?)
+}
+
+private object AndroidLogSink : PlatformLogSink {
+    private const val TAG = "NezhaAgent"
+
+    override fun info(message: String) {
+        android.util.Log.i(TAG, message)
+    }
+
+    override fun error(message: String, throwable: Throwable?) {
+        android.util.Log.e(TAG, message, throwable)
+    }
+}
+
+/**
  * 全局日志管理器（单例），为 UI 层提供日志流，同时写入 Android Log。
  *
  * ## 去重/节流机制
@@ -63,6 +87,10 @@ object Logger {
 
     private val dateFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
+    /** Swapped by tests that must not reach `android.util.Log`. */
+    @Volatile
+    internal var platformSink: PlatformLogSink = AndroidLogSink
+
     // ══════════════════════════════════════════════════════════════════════════
     // 公开 API
     // ══════════════════════════════════════════════════════════════════════════
@@ -79,7 +107,7 @@ object Logger {
             "[$time] $message"
         }
         addLogWithDedup(formattedLog, message)
-        android.util.Log.i("NezhaAgent", message)
+        platformSink.info(message)
     }
 
     /**
@@ -97,7 +125,7 @@ object Logger {
         }
         // 去重仅基于主消息，忽略异常详情（同一个方法产生的异常消息通常相同）
         addLogWithDedup(formattedLog, message)
-        android.util.Log.e("NezhaAgent", message, throwable)
+        platformSink.error(message, throwable)
     }
 
     /**

@@ -27,6 +27,7 @@ internal fun interface AgentRuntimeFactory {
  */
 internal class AgentRuntimeController(
     private val factory: AgentRuntimeFactory,
+    private val applyPrivilegedAccess: (Boolean) -> Unit = {},
     private val finalCleanup: () -> Unit = {},
     private val onTeardownFailure: (Throwable) -> Unit = {}
 ) {
@@ -50,6 +51,10 @@ internal class AgentRuntimeController(
 
             // A service-destruction cancellation arriving during teardown must win before creation.
             currentCoroutineContext().ensureActive()
+
+            // Applied before the runtime exists: its collectors query the privileged shell as soon
+            // as they start, and the release side lives in this class too so both ends are visible.
+            applyPrivilegedAccess(config.rootMode)
 
             val replacement = factory.create(config)
             startOrDiscard(replacement)

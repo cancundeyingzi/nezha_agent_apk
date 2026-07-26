@@ -31,12 +31,10 @@ import com.nezhahq.agent.core.model.SimulatedDeviceConfig
 import com.nezhahq.agent.core.model.SimulatorDraft
 import com.nezhahq.agent.core.platform.VpnTrafficCompatibility
 import com.nezhahq.agent.grpc.GrpcConnectionState
-import com.nezhahq.agent.grpc.GrpcManager
 import com.nezhahq.agent.service.AgentService
 import com.nezhahq.agent.simulator.GrpcSimulatedDeviceReporter
 import com.nezhahq.agent.simulator.SimulatedDeviceLoop
 import com.nezhahq.agent.util.RootShell
-import com.nezhahq.agent.util.SharedPreferencesConfigRepository
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -174,7 +172,8 @@ class MainViewModel(
     // ══════════════════════════════════════════════════════════════════════════
 
     /** gRPC 连接状态 StateFlow，供 UI 层 collectAsState */
-    val grpcConnectionState: StateFlow<GrpcConnectionState> = GrpcManager.connectionState
+    val grpcConnectionState: StateFlow<GrpcConnectionState> =
+        application.appContainer.connectionState.connectionState
 
     // ══════════════════════════════════════════════════════════════════════════
     // 即时测试采集
@@ -963,7 +962,7 @@ class MainViewModel(
                 val application = checkNotNull(
                     this[ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY]
                 )
-                MainViewModel(application, SharedPreferencesConfigRepository(application))
+                MainViewModel(application, application.appContainer.configRepository)
             }
         }
     }

@@ -11,10 +11,10 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import com.nezhahq.agent.grpc.GrpcManager
+import com.nezhahq.agent.appContainer
+import com.nezhahq.agent.grpc.ManagedGrpcConnection
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
-import com.nezhahq.agent.util.SharedPreferencesConfigRepository
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -45,17 +45,24 @@ class AgentService : Service() {
         super.onCreate()
         AgentServiceRunningState.onCreated()
         // Built before startForeground so onDestroy always finds initialized collaborators.
+        val container = applicationContext.appContainer
+        val connectionState = container.connectionState
         runtimeController = AgentRuntimeController(
             factory = AgentRuntimeFactory { config ->
                 AgentRuntime(
                     context = applicationContext,
                     config = config,
                     statusSink = { state, message ->
-                        GrpcManager.updateState(state)
+                        connectionState.updateState(state)
                         updateNotification(message)
-                    }
+                    },
+                    grpcConnection = ManagedGrpcConnection(
+                        config,
+                        connectionState::updateState
+                    )
                 )
             },
+            applyPrivilegedAccess = RootShell::configureAuthorization,
             finalCleanup = {
                 RootShell.shutdown()
                 Logger.i("AgentService: process-owned RootShell resources closed.")
@@ -66,7 +73,7 @@ class AgentService : Service() {
         )
         commandProcessor = AgentConfigCommandProcessor(
             scope = commandScope,
-            repository = SharedPreferencesConfigRepository(applicationContext),
+            repository = container.configRepository,
             controller = runtimeController,
             ioDispatcher = Dispatchers.IO,
             onConfigurationUnusable = { failure ->

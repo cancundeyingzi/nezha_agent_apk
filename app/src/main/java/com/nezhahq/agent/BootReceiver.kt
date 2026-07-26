@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.Intent
 import com.nezhahq.agent.service.AgentService
 import com.nezhahq.agent.util.Logger
-import com.nezhahq.agent.util.SharedPreferencesConfigRepository
 
 /**
  * 开机自启与应用更新后自动恢复的广播接收器。
@@ -33,7 +32,7 @@ class BootReceiver : BroadcastReceiver() {
             action != Intent.ACTION_MY_PACKAGE_REPLACED
         ) return
 
-        val repository = SharedPreferencesConfigRepository(context)
+        val repository = context.appContainer.configRepository
         if (!repository.storageStatus().isUsable) {
             Logger.e("BootReceiver: 收到 $action，但配置存储不可用，拒绝自动启动。")
             return

@@ -109,7 +109,9 @@ internal class AgentRuntime(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
     private val statusSink: (GrpcConnectionState, String) -> Unit,
-    private val grpcConnection: GrpcConnection = ManagedGrpcConnection(config),
+    // No default: a connection built here would have no state sink, and the UI would never learn
+    // that the runtime went idle. The composition point wires it to the observable holder.
+    private val grpcConnection: GrpcConnection,
     private val networkRegistrar: RuntimeNetworkRegistrar =
         AndroidRuntimeNetworkRegistrar(context.applicationContext),
     keepAliveFactory: RuntimeKeepAliveFactory =
@@ -159,7 +161,8 @@ internal class AgentRuntime(
             }
         }
 
-        RootShell.configureAuthorization(config.rootMode)
+        // Privileged authorization is applied by AgentRuntimeController before this runs, so that
+        // acquiring and releasing it stay in one place rather than split across two classes.
         grpcConnection.connect()
         withContext(mainDispatcher) {
             keepAliveController.reconfigure(config.keepAlive)

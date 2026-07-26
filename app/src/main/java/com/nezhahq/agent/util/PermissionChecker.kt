@@ -9,6 +9,7 @@ import android.os.PowerManager
 import android.os.Process
 import android.provider.Settings
 import androidx.core.app.NotificationManagerCompat
+import com.nezhahq.agent.appContainer
 import androidx.core.content.ContextCompat
 
 /**
@@ -79,7 +80,7 @@ object PermissionChecker {
             PermissionItem(
                 name = "开机自启动",
                 key = "auto_start",
-                granted = ConfigStore.getEnableAutoStart(context)
+                granted = context.appContainer.configRepository.loadAutoStartState().enabled
             ),
             PermissionItem(
                 name = "所有文件访问",

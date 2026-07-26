@@ -1,7 +1,6 @@
 package com.nezhahq.agent.executor
 
 import android.content.Context
-import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
 import com.google.protobuf.ByteString
@@ -172,7 +171,7 @@ class FileManager internal constructor(
     private suspend fun listDir(requestedDir: String) {
         // 空路径处理（Dashboard 初次连接可能发送空字符串）
         var dir = requestedDir.ifBlank { DEFAULT_HOME }
-        val isRootMode = ConfigStore.getRootMode(context)
+        val isRootMode = RootShell.isAuthorized()
 
         // ── 策略 1：Root/Shizuku 模式优先使用 ls 命令 ──────────────────────
         // 关键：Android 11+ FUSE 会过滤 File.listFiles()，导致只能看到文件夹，
@@ -403,7 +402,7 @@ class FileManager internal constructor(
     }
 
     private suspend fun moveFileToTarget(sourceFile: File, targetPath: String): Boolean {
-        val isRootMode = ConfigStore.getRootMode(context)
+        val isRootMode = RootShell.isAuthorized()
 
         // 第一次尝试：Java API
         try {
@@ -466,7 +465,7 @@ class FileManager internal constructor(
      * 2. Java FileInputStream（非 Root 或 su 失败时）
      */
     private suspend fun openInputStreamForPath(path: String): InputStream? {
-        val isRootMode = ConfigStore.getRootMode(context)
+        val isRootMode = RootShell.isAuthorized()
 
         // ── 策略 1：Root 模式优先使用集中授权的流式命令 ───────────────────
         if (isRootMode) {

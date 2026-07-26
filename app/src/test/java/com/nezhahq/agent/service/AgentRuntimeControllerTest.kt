@@ -159,6 +159,50 @@ class AgentRuntimeControllerTest {
         assertTrue(controller.isRunning)
     }
 
+    /**
+     * Collectors query the privileged shell as soon as the runtime starts, so authorization has to
+     * be applied before it exists — and it must follow the snapshot being started, not the previous
+     * one, or a reload that turns root mode off would leave it granted.
+     */
+    @Test
+    fun privilegedAccessIsAppliedForEachSnapshotBeforeItsRuntimeStarts() = runBlocking {
+        val events = mutableListOf<String>()
+        val controller = AgentRuntimeController(
+            factory = AgentRuntimeFactory { snapshot ->
+                RecordingRuntime(onStart = { events += "start-rootMode=${snapshot.rootMode}" })
+            },
+            applyPrivilegedAccess = { enabled -> events += "authorize=$enabled" }
+        )
+
+        controller.reload(config("first").copy(rootMode = true))
+        controller.reload(config("second").copy(rootMode = false))
+
+        assertEquals(
+            listOf(
+                "authorize=true",
+                "start-rootMode=true",
+                "authorize=false",
+                "start-rootMode=false"
+            ),
+            events
+        )
+    }
+
+    @Test
+    fun stopReleasesTheProcessShellThatReloadAuthorized() = runBlocking {
+        val events = mutableListOf<String>()
+        val controller = AgentRuntimeController(
+            factory = AgentRuntimeFactory { RecordingRuntime() },
+            applyPrivilegedAccess = { enabled -> events += "authorize=$enabled" },
+            finalCleanup = { events += "release-shell" }
+        )
+        controller.reload(config("running").copy(rootMode = true))
+
+        controller.stop()
+
+        assertEquals(listOf("authorize=true", "release-shell"), events)
+    }
+
     private class RecordingRuntime(
         private val onStart: suspend () -> Unit = {},
         private val onStop: suspend () -> Unit = {}
