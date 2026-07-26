@@ -1,6 +1,8 @@
 package com.nezhahq.agent.executor
 
 import com.nezhahq.agent.core.model.RemoteCapabilities
+import com.nezhahq.agent.core.task.RemoteCapabilityPolicy
+import com.nezhahq.agent.core.task.TaskTypes
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation

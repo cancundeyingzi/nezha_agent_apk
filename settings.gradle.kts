@@ -21,3 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "NezhaAgent"
 include(":app")
+include(":core")

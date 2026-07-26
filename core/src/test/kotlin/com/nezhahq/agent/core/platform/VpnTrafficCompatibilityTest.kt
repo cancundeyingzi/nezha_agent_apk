@@ -1,4 +1,4 @@
-package com.nezhahq.agent.util
+package com.nezhahq.agent.core.platform
 
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

@@ -1,4 +1,4 @@
-package com.nezhahq.agent.executor
+package com.nezhahq.agent.core.task
 
 /**
  * Task type IDs are part of the Dashboard/Agent wire protocol.

@@ -6,7 +6,7 @@ package com.nezhahq.agent.core.security
  * The lock is intentionally owned by one process-wide instance. Callers must not create a
  * coordinator per repository because independently ordered writes can re-enable stale state.
  */
-internal class RootModeMutationCoordinator(
+class RootModeMutationCoordinator(
     private val applyAuthorization: (Boolean) -> Unit
 ) {
     private val lock = Any()

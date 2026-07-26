@@ -3,6 +3,8 @@ package com.nezhahq.agent.executor
 import android.os.Build
 import androidx.annotation.RequiresApi
 import com.nezhahq.agent.core.model.RemoteCapabilities
+import com.nezhahq.agent.core.task.RemoteCapabilityPolicy
+import com.nezhahq.agent.core.task.TaskTypes
 import com.nezhahq.agent.util.Logger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart

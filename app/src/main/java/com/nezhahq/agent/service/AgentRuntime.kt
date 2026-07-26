@@ -13,11 +13,11 @@ import com.nezhahq.agent.collector.SystemInfoCollector
 import com.nezhahq.agent.collector.SystemStateCollector
 import com.nezhahq.agent.core.model.AgentConfig
 import com.nezhahq.agent.core.model.RemoteCapabilities
+import com.nezhahq.agent.core.task.RemoteCapabilityPolicy
+import com.nezhahq.agent.core.task.TaskTypes
 import com.nezhahq.agent.executor.FileManager
 import com.nezhahq.agent.executor.NatManager
-import com.nezhahq.agent.executor.RemoteCapabilityPolicy
 import com.nezhahq.agent.executor.TaskExecutor
-import com.nezhahq.agent.executor.TaskTypes
 import com.nezhahq.agent.executor.TerminalManager
 import com.nezhahq.agent.grpc.GrpcConnection
 import com.nezhahq.agent.grpc.GrpcConnectionState

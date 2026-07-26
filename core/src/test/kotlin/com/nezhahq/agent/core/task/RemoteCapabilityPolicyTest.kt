@@ -1,4 +1,4 @@
-package com.nezhahq.agent.executor
+package com.nezhahq.agent.core.task
 
 import com.nezhahq.agent.core.model.RemoteCapabilities
 import com.nezhahq.agent.core.model.RemoteCapability

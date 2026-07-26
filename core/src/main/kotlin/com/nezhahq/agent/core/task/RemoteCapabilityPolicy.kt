@@ -1,10 +1,10 @@
-package com.nezhahq.agent.executor
+package com.nezhahq.agent.core.task
 
 import com.nezhahq.agent.core.model.RemoteCapabilities
 import com.nezhahq.agent.core.model.RemoteCapability
 
 /** Pure mapping from wire task types to locally granted remote capabilities. */
-internal object RemoteCapabilityPolicy {
+object RemoteCapabilityPolicy {
     fun requiredCapability(taskType: Long): RemoteCapability? = when (taskType) {
         TaskTypes.COMMAND, TaskTypes.TERMINAL -> RemoteCapability.SHELL
         TaskTypes.FILE_MANAGER -> RemoteCapability.FILE_MANAGER

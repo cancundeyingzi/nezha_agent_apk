@@ -15,7 +15,8 @@
 
 # Gradle
 .gradle
-/build/
+# Unanchored so it covers every module's build dir, not just the root one.
+build/
 
 # Local configuration file (sdk path, etc)
 local.properties
