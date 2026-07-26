@@ -205,6 +205,10 @@ fun MainScreen(
             vm = vm,
             shizukuRequestCode = shizukuRequestCode,
             selectedTab = selectedTab,
+            // Read here rather than inside the pages: they compose inside an embedded ComposeView,
+            // which is a separate composition root that window insets do not reach, so reading them
+            // there reported zero and the content drew under the status bar.
+            contentPadding = WindowInsets.safeDrawing.only(WindowInsetsSides.Top).asPaddingValues(),
             modifier = Modifier.fillMaxSize(),
             onViewReady = { view ->
                 if (contentViewHolder.value !== view) {
@@ -240,12 +244,17 @@ private fun MainPagesHost(
     vm: MainViewModel,
     shizukuRequestCode: Int,
     selectedTab: Int,
+    contentPadding: PaddingValues,
     modifier: Modifier = Modifier,
     onViewReady: (View) -> Unit
 ) {
     val parentComposition = rememberCompositionContext()
     val selectedTabState = remember { mutableIntStateOf(selectedTab) }
     selectedTabState.intValue = selectedTab
+    // Held as state so a change — rotation, a cutout coming into play — reaches the embedded
+    // composition, which is created once and would otherwise keep the first value forever.
+    val contentPaddingState = remember { mutableStateOf(contentPadding) }
+    contentPaddingState.value = contentPadding
 
     AndroidView(
         modifier = modifier,
@@ -257,7 +266,8 @@ private fun MainPagesHost(
                     MainPagesContent(
                         vm = vm,
                         shizukuRequestCode = shizukuRequestCode,
-                        selectedTab = selectedTabState.intValue
+                        selectedTab = selectedTabState.intValue,
+                        contentPadding = contentPaddingState.value
                     )
                 }
                 onViewReady(this)
@@ -273,7 +283,8 @@ private fun MainPagesHost(
 private fun MainPagesContent(
     vm: MainViewModel,
     shizukuRequestCode: Int,
-    selectedTab: Int
+    selectedTab: Int,
+    contentPadding: PaddingValues
 ) {
     Box(
         modifier = Modifier
@@ -315,10 +326,11 @@ private fun MainPagesContent(
                 .blur(120.dp)
         ) {
         }
+        // The background above stays full-bleed; only the content is inset.
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .windowInsetsPadding(WindowInsets.statusBars)
+                .padding(contentPadding)
         ) {
             Box(
                 modifier = Modifier

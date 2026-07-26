@@ -99,15 +99,16 @@
 
 ---
 
-## P3：Android 15 升级
+## P3：Android 15/16 升级
 
-`targetSdk` 34 → 35。
+`targetSdk` 34 → 35。本项目不上架 Google Play，因此 `specialUse` 前台服务类型
+无需提交 Play Console 用途声明。
 
-- [ ] Android 15 设备上，内容**未被状态栏/导航栏遮挡**（edge-to-edge 强制生效）
+- [ ] 内容**未被状态栏遮挡**（曾在 Android 16 上复现：标题跑到状态栏时间下面）
+- [ ] 有挖孔/刘海的设备上，横屏时内容未被摄像头区域裁切
+- [ ] 中文文字行距、卡片高度正常
+      （`elegantTextHeight` 在 targetSdk 35 起默认开启，对 CJK 字体影响比拉丁字体明显）
 - [ ] 前台服务通知正常显示，长时间运行不被系统终止
-
-> 发布到 Google Play 时，`specialUse` 前台服务类型需要在 Play Console 提交用途声明。
-> 这是发布环节的事，不是代码问题。
 
 ---
 
