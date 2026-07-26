@@ -63,7 +63,6 @@ class SharedPreferencesConfigRepository(context: Context) : ConfigRepository {
 
     override fun saveRootMode(enabled: Boolean): Result<Unit> = runCatching {
         requirePersisted(ConfigStore.setRootMode(context, enabled), "root mode")
-        RootShell.configureAuthorization(enabled)
     }
 
     override fun saveRemoteCapability(

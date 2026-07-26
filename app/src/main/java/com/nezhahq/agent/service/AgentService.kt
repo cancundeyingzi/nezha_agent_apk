@@ -399,7 +399,7 @@ class AgentService : Service() {
         )
         if (denialReason != null) {
             Logger.i(
-                "AgentService: 已拒绝未授权的远程 Shell 任务 " +
+                "AgentService: 已拒绝未授权的远程能力任务 " +
                     "(TaskID=${task.id}, Type=${task.type})"
             )
             reportTaskFailure(task, denialReason, resultChannel)

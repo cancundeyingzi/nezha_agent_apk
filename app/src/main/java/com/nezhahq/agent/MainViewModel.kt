@@ -406,7 +406,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             },
             onSuccess = {
                 uuid = uuidToSave
-                RootShell.configureAuthorization(rootModeToSave)
                 // Android 13+ 通知权限时序控制 only begins after durable persistence.
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                     !notificationPermGranted
@@ -620,7 +619,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
             refreshConfigurationFromStorage()
-            RootShell.configureAuthorization(enabled = false)
             storageStatus = ConfigStore.initialize(ctx)
             if (!isConfigStorageAvailable) {
                 storageErrorMessage = "配置存储重置后读取失败，请稍后重试"

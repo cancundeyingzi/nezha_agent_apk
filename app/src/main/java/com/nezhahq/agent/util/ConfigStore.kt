@@ -7,6 +7,7 @@ import android.os.Build
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.nezhahq.agent.core.model.SimulatedDeviceConfig
+import com.nezhahq.agent.core.security.RootModeMutationCoordinator
 import java.io.File
 
 /**
@@ -24,6 +25,9 @@ object ConfigStore {
     private const val PLAINTEXT_MIGRATION_COMPLETE = "__plaintext_config_v1"
 
     private val runtimeLock = Any()
+    private val rootModeMutations = RootModeMutationCoordinator(
+        applyAuthorization = RootShell::configureAuthorization
+    )
 
     @Volatile
     private var runtime: Runtime? = null
@@ -33,7 +37,19 @@ object ConfigStore {
 
     /** Clears live configuration and recreates a verified-empty plaintext store. */
     fun resetConfigurationStorage(context: Context): Boolean =
-        runtimeFor(context).coordinator.reset()
+        rootModeMutations.persistAndApply(enabled = false) {
+            runtimeFor(context).coordinator.reset()
+        }
+
+    /**
+     * Applies the stored root mode under the same ordering boundary used by root-mode writes.
+     */
+    fun synchronizeRootAuthorization(
+        context: Context,
+        storageStatus: StorageStatus = initialize(context)
+    ): Boolean = rootModeMutations.loadAndApply {
+        storageStatus != StorageStatus.UNAVAILABLE && getRootMode(context)
+    }
 
     fun saveConfig(
         context: Context,
@@ -44,14 +60,16 @@ object ConfigStore {
         uuid: String = "",
         rootMode: Boolean = false,
         enableKeepAliveAudio: Boolean = false
-    ): Boolean = commit(context) { editor ->
-        editor.putString("server", server)
-        editor.putInt("port", port)
-        editor.putString("secret", secret)
-        editor.putBoolean("use_tls", useTLS)
-        editor.putString("uuid", uuid)
-        editor.putBoolean("root_mode", rootMode)
-        editor.putBoolean("enable_keep_alive_audio", enableKeepAliveAudio)
+    ): Boolean = rootModeMutations.persistAndApply(rootMode) {
+        commit(context) { editor ->
+            editor.putString("server", server)
+            editor.putInt("port", port)
+            editor.putString("secret", secret)
+            editor.putBoolean("use_tls", useTLS)
+            editor.putString("uuid", uuid)
+            editor.putBoolean("root_mode", rootMode)
+            editor.putBoolean("enable_keep_alive_audio", enableKeepAliveAudio)
+        }
     }
 
     fun saveConnectionConfig(
@@ -215,9 +233,12 @@ object ConfigStore {
         it.putBoolean("enable_remote_nat", enable)
     }
 
-    fun setRootMode(context: Context, enable: Boolean): Boolean = commit(context) {
-        it.putBoolean("root_mode", enable)
-    }
+    fun setRootMode(context: Context, enable: Boolean): Boolean =
+        rootModeMutations.persistAndApply(enable) {
+            commit(context) {
+                it.putBoolean("root_mode", enable)
+            }
+        }
 
     fun saveToolSettings(
         context: Context,
