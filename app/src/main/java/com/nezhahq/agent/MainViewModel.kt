@@ -505,7 +505,6 @@ class MainViewModel(
      * 检查是否需要显示首次开机自启动授权弹窗
      */
     private fun checkAndShowAutoStartPrompt() {
-        val ctx = getApplication<Application>()
         if (!isConfigStorageAvailable) return
         val hasShownAutoStartPrompt = repository.loadAutoStartState().promptShown
         storageStatus = repository.storageStatus()

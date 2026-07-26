@@ -6,12 +6,12 @@ plugins {
 
 android {
     namespace = "com.nezhahq.agent"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.nezhahq.agent"
         minSdk = 23
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 380
         versionName = "A0.9.12"
 
