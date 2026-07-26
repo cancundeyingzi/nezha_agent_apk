@@ -378,12 +378,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             // 启动前台服务
-            val intent = Intent(ctx, AgentService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(intent)
-            } else {
-                ctx.startService(intent)
-            }
+            AgentService.startOrReload(ctx)
             Toast.makeText(ctx, "后台探针服务已启动", Toast.LENGTH_SHORT).show()
             
             // 启动成功后，检查是否需要显示自启动授权弹窗

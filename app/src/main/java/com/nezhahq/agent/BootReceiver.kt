@@ -3,7 +3,6 @@ package com.nezhahq.agent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import androidx.core.content.ContextCompat
 import com.nezhahq.agent.service.AgentService
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
@@ -53,8 +52,6 @@ class BootReceiver : BroadcastReceiver() {
         }
 
         Logger.i("BootReceiver: 收到 $action，正在自动恢复探针后台服务...")
-        val serviceIntent = Intent(context, AgentService::class.java)
-        // ContextCompat.startForegroundService 会在 Android O+ 自动选用正确的启动方式
-        ContextCompat.startForegroundService(context, serviceIntent)
+        AgentService.startOrReload(context)
     }
 }

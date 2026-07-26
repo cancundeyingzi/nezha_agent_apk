@@ -1,7 +1,14 @@
 package com.nezhahq.agent.grpc
 
+import com.nezhahq.agent.core.model.AgentConfig
+import io.grpc.CallOptions
+import io.grpc.ClientCall
+import io.grpc.ManagedChannel
+import io.grpc.MethodDescriptor
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -19,14 +26,99 @@ class GrpcManagerTest {
     }
 
     @Test
-    fun shutdownCanPreserveReconnectState() {
-        GrpcManager.updateState(GrpcConnectionState.RECONNECTING)
+    fun reconnectClosesOldChannelBeforePublishingNewStub() {
+        val events = mutableListOf<String>()
+        var channelId = 0
+        val connection = ManagedGrpcConnection(
+            config = config(useTls = true),
+            channelFactory = GrpcManagedChannelFactory { _, _ ->
+                val id = ++channelId
+                events += "create-$id"
+                FakeManagedChannel { events += "close-$id" }
+            }
+        )
 
-        GrpcManager.shutdown(preserveConnectionState = true)
+        connection.connect()
+        connection.connect()
 
-        assertEquals(GrpcConnectionState.RECONNECTING, GrpcManager.connectionState.value)
+        assertEquals(listOf("create-1", "close-1", "create-2"), events)
+        assertTrue(connection.stub != null)
+    }
 
-        GrpcManager.shutdown()
+    @Test
+    fun closeIsIdempotentAndClearsStubAndUiState() {
+        var channelCloses = 0
+        val connection = ManagedGrpcConnection(
+            config = config(useTls = false),
+            channelFactory = GrpcManagedChannelFactory { _, _ ->
+                FakeManagedChannel { channelCloses++ }
+            }
+        )
+        connection.connect()
+        GrpcManager.updateState(GrpcConnectionState.PLAINTEXT_CONNECTED)
+
+        connection.close()
+        connection.close()
+
+        assertEquals(1, channelCloses)
+        assertNull(connection.stub)
         assertEquals(GrpcConnectionState.IDLE, GrpcManager.connectionState.value)
+        assertEquals(GrpcTransportMode.PLAINTEXT, connection.transportMode)
+    }
+
+    @Test
+    fun tlsFactoryFailureNeverRetriesAsPlaintext() {
+        val attemptedModes = mutableListOf<GrpcTransportMode>()
+        val connection = ManagedGrpcConnection(
+            config = config(useTls = true),
+            channelFactory = GrpcManagedChannelFactory { _, mode ->
+                attemptedModes += mode
+                error("TLS setup failed")
+            }
+        )
+
+        assertTrue(runCatching { connection.connect() }.isFailure)
+        assertEquals(listOf(GrpcTransportMode.TLS), attemptedModes)
+        assertNull(connection.stub)
+    }
+
+    private fun config(useTls: Boolean) = AgentConfig(
+        server = "example.com",
+        port = 443,
+        secret = "secret",
+        uuid = "uuid",
+        useTls = useTls,
+        rootMode = false
+    )
+
+    private class FakeManagedChannel(
+        private val onClose: () -> Unit
+    ) : ManagedChannel() {
+        private var shutdown = false
+
+        override fun shutdown(): ManagedChannel = shutdownNow()
+
+        override fun isShutdown(): Boolean = shutdown
+
+        override fun isTerminated(): Boolean = shutdown
+
+        override fun shutdownNow(): ManagedChannel {
+            if (!shutdown) {
+                shutdown = true
+                onClose()
+            }
+            return this
+        }
+
+        override fun awaitTermination(timeout: Long, unit: TimeUnit): Boolean = shutdown
+
+        override fun <RequestT : Any?, ResponseT : Any?> newCall(
+            methodDescriptor: MethodDescriptor<RequestT, ResponseT>,
+            callOptions: CallOptions
+        ): ClientCall<RequestT, ResponseT> {
+            throw UnsupportedOperationException()
+        }
+
+        override fun authority(): String = "fake"
     }
 }
