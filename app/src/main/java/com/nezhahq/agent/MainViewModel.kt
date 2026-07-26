@@ -422,7 +422,6 @@ class MainViewModel(
     fun startSimulator() {
         if (simulatorRunning) return
 
-        val ctx = getApplication<Application>()
         if (!requireConfigStorage("启动模拟器")) return
         val trimmedServer = simulatorServer.trim()
         val trimmedSecret = simulatorSecret.trim()
@@ -516,6 +515,7 @@ class MainViewModel(
         simulatorJob?.cancel()
         simulatorJob = null
         simulatorRunning = false
+        simulatorActiveThreadCount = 0
         simulatorLastStatus =
             "模拟器已停止，本次会话成功 $simulatorSuccessCount 台，失败 $simulatorFailureCount 台"
         notify("娱乐模拟设备已关闭")
@@ -784,7 +784,6 @@ class MainViewModel(
      * 3. 检查并申请权限
      */
     private fun tryRequestShizukuPermission(requestCode: Int) {
-        val ctx = getApplication<Application>()
         try {
             if (!Shizuku.pingBinder()) {
                 shizukuStatusText = "⚠️ Shizuku 未运行（可使用 Root 则忽略此提示）"

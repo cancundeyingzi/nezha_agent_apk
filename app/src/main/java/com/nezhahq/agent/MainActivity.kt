@@ -1,41 +1,21 @@
 package com.nezhahq.agent
 
-import android.Manifest
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
-import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
 import android.view.View
 import android.widget.Toast
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Home
@@ -43,7 +23,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Size
 
 import androidx.compose.ui.draw.*
 
@@ -53,13 +32,8 @@ import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.Density
-import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -81,17 +55,8 @@ import com.nezhahq.agent.ui.NekoGlassTabSelectedText
 import com.nezhahq.agent.ui.NekoGlassTabUnselected
 import com.nezhahq.agent.ui.SmoothCornerShape
 import com.nezhahq.agent.ui.ToolsScreenContent
-import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.nezhahq.agent.grpc.GrpcConnectionState
-import com.nezhahq.agent.core.model.SimulatedDeviceConfig
-import com.nezhahq.agent.core.config.StorageStatus
-import kotlin.math.PI
-import kotlin.math.abs
-import kotlin.math.cos
-import kotlin.math.pow
-import kotlin.math.sin
 import rikka.shizuku.Shizuku
 
 // Activity 入口（保持不变 — 仅修改主题色）
@@ -176,55 +141,19 @@ class MainActivity : ComponentActivity() {
                     )
                 )
             ) {
-                // 最外层容器 — 浅色背景 + 装饰性渐变光斑
+                // The decorative gradient blobs live in MainPagesContent, which draws its own
+                // opaque background over this whole area; painting them here too would render two
+                // blurred layers that nothing can ever see.
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .background(LgBackground)
                 ) {
-                    // 装饰光斑 — 左上角青色
-                    Box(
-                        modifier = Modifier
-                            .size(280.dp)
-                            .offset(x = (-40).dp, y = 120.dp)
-                            .background(
-                                brush = Brush.radialGradient(
-                                    colors = listOf(
-                                        LgCyan400.copy(alpha = 0.12f),
-                                        Color.Transparent
-                                    ),
-                                    radius = 400f
-                                ),
-                                shape = CircleShape
-                            )
-                            .blur(100.dp)
-                    )
-                    // 装饰光斑 — 右下角蓝色
-                    Box(
-                        modifier = Modifier
-                            .size(340.dp)
-                            .align(Alignment.BottomEnd)
-                            .offset(x = 40.dp, y = (-80).dp)
-                            .background(
-                                brush = Brush.radialGradient(
-                                    colors = listOf(
-                                        Color(0xFF93C5FD).copy(alpha = 0.12f),
-                                        Color.Transparent
-                                    ),
-                                    radius = 500f
-                                ),
-                                shape = CircleShape
-                            )
-                            .blur(120.dp)
-                    )
-
-                    val vm = viewModel
-
                     // 一次性事件在此消费；ViewModel 不再直接触碰 Android 的 Toast。
-                    UiEventHost(vm)
+                    UiEventHost(viewModel)
 
                     MainScreen(
-                        vm = vm,
+                        vm = viewModel,
                         shizukuRequestCode = SHIZUKU_REQUEST_CODE
                     )
                 }
@@ -456,14 +385,7 @@ private fun NekogramBottomBar(
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     AndroidView(
                         modifier = Modifier.matchParentSize(),
-                        factory = { context ->
-                            try {
-                                val view = NekogramLiquidGlassBarView(context)
-                                view
-                            } catch (e: Exception) {
-                                throw e
-                            }
-                        },
+                        factory = ::NekogramLiquidGlassBarView,
                         update = { view ->
                             view.setSourceView(sourceView)
                         }

@@ -109,7 +109,7 @@ class AppListQuery(private val context: Context) {
                 val appInfo = packageInfo.applicationInfo ?: return@mapNotNull null
                 if (!isUserApplicationFlags(appInfo.flags)) return@mapNotNull null
 
-                val packageName = packageInfo.packageName ?: return@mapNotNull null
+                val packageName = packageInfo.packageName
                 val label = appInfo.loadLabel(pm).toString().trim()
                     .takeIf { it.isNotEmpty() } ?: packageName
                 val storage = loadStorageStats(packageName, appInfo)

@@ -1,80 +1,29 @@
 package com.nezhahq.agent.ui
 
-import android.Manifest
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.net.VpnService
-import android.os.Build
-import android.os.Bundle
-import android.provider.Settings
-import android.view.View
-import android.widget.Toast
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.setContent
-import androidx.activity.viewModels
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Build
-import androidx.compose.material.icons.filled.Home
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.draw.*
 import androidx.compose.ui.graphics.*
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.zIndex
-import com.nezhahq.agent.ui.UiEvent
-import androidx.core.content.ContextCompat
-import androidx.core.view.WindowCompat
-import androidx.lifecycle.viewmodel.compose.viewModel
-import com.nezhahq.agent.grpc.GrpcConnectionState
-import com.nezhahq.agent.core.model.SimulatedDeviceConfig
-import com.nezhahq.agent.core.config.StorageStatus
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.pow
 import kotlin.math.sin
-import rikka.shizuku.Shizuku
-import com.nezhahq.agent.MainViewModel
 
 // Liquid Glass 设计系统：配色、形状、阴影与基础控件。
 
@@ -136,7 +85,7 @@ internal fun outerSmoothShape(innerRadius: Dp, inset: Dp): SmoothCornerShape {
 
 internal data class SmoothCornerShape(
     private val radius: Dp,
-    private val exponent: Double = 2.35
+    private val exponent: Double = SMOOTH_CORNER_EXPONENT
 ) : Shape {
     override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
         val radiusPx = with(density) { radius.toPx() }
@@ -146,43 +95,26 @@ internal data class SmoothCornerShape(
         val path = Path().apply {
             moveTo(radiusPx, 0f)
             lineTo(size.width - radiusPx, 0f)
-            smoothCorner(size.width - radiusPx, radiusPx, radiusPx, -90.0, 0.0, exponent)
+            corner(size.width - radiusPx, radiusPx, radiusPx, -90.0, 0.0)
             lineTo(size.width, size.height - radiusPx)
-            smoothCorner(size.width - radiusPx, size.height - radiusPx, radiusPx, 0.0, 90.0, exponent)
+            corner(size.width - radiusPx, size.height - radiusPx, radiusPx, 0.0, 90.0)
             lineTo(radiusPx, size.height)
-            smoothCorner(radiusPx, size.height - radiusPx, radiusPx, 90.0, 180.0, exponent)
+            corner(radiusPx, size.height - radiusPx, radiusPx, 90.0, 180.0)
             lineTo(0f, radiusPx)
-            smoothCorner(radiusPx, radiusPx, radiusPx, 180.0, 270.0, exponent)
+            corner(radiusPx, radiusPx, radiusPx, 180.0, 270.0)
             close()
         }
 
         return Outline.Generic(path)
     }
-}
 
-internal fun Path.smoothCorner(
-    centerX: Float,
-    centerY: Float,
-    radius: Float,
-    startDegrees: Double,
-    endDegrees: Double,
-    exponent: Double
-) {
-    val steps = 32
-    val power = 2.0 / exponent
-
-    for (i in 1..steps) {
-        val angle = (startDegrees + (endDegrees - startDegrees) * i / steps) * PI / 180.0
-        val cosine = cos(angle)
-        val sine = sin(angle)
-        val x = centerX + radius * cosine.signedPow(power)
-        val y = centerY + radius * sine.signedPow(power)
-        lineTo(x.toFloat(), y.toFloat())
-    }
-}
-
-internal fun Double.signedPow(power: Double): Double {
-    return if (this < 0.0) -abs(this).pow(power) else abs(this).pow(power)
+    private fun Path.corner(
+        centerX: Float,
+        centerY: Float,
+        radius: Float,
+        startDegrees: Double,
+        endDegrees: Double
+    ) = traceSmoothCorner(centerX, centerY, radius, startDegrees, endDegrees, exponent, ::lineTo)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

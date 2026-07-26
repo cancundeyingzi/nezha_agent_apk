@@ -92,6 +92,7 @@ class AgentService : Service() {
             },
             awaitPreviousShutdown = SHUTDOWN_GATE::awaitIdle
         )
+        createNotificationChannel()
         startAgentForeground("正在读取连接配置...")
     }
 
@@ -153,21 +154,23 @@ class AgentService : Service() {
         }
     }
 
-    private fun createNotification(statusText: String): Notification {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                "Nezha Agent Status",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
-        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+    /** Idempotent, but called once from [onCreate] rather than on every status change. */
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val channel = NotificationChannel(
+            NOTIFICATION_CHANNEL_ID,
+            "Nezha Agent Status",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
+    }
+
+    private fun createNotification(statusText: String): Notification =
+        NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("Nezha Agent Running")
             .setContentText(statusText)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
-    }
 
     private fun updateNotification(statusText: String) {
         try {

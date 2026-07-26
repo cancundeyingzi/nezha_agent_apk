@@ -256,9 +256,14 @@ class SystemStateCollector(
                         }
                     }
 
-                    // NetworkStatsManager 在旧版 API 中依赖 ConnectivityManager 的 TYPE 常量
+                    // querySummaryForDevice takes the legacy ConnectivityManager TYPE_* constants;
+                    // the NetworkCapabilities transports that replaced them are not accepted by
+                    // this overload, so the deprecated values are the only ones that work here.
+                    @Suppress("DEPRECATION")
                     queryStats(android.net.ConnectivityManager.TYPE_WIFI)
+                    @Suppress("DEPRECATION")
                     queryStats(android.net.ConnectivityManager.TYPE_MOBILE)
+                    @Suppress("DEPRECATION")
                     queryStats(android.net.ConnectivityManager.TYPE_ETHERNET)
 
                     if (hasData) {
