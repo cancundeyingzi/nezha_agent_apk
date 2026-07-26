@@ -122,8 +122,8 @@ internal class AudioKeepAlive(
         var output: AudioOutput? = null
         try {
             output = outputFactory.create()
-            if (!kotlin.coroutines.coroutineContext.isActive) return
             synchronized(stateLock) { ownedOutput = OwnedOutput(output) }
+            if (!kotlin.coroutines.coroutineContext.isActive) return
             output.start()
             writeAudio(output)
         } catch (e: Exception) {

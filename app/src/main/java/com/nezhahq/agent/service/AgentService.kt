@@ -720,10 +720,7 @@ class AgentService : Service() {
         Logger.i("Service is being destroyed globally by system or user intent.")
         super.onDestroy()
         val keepAliveClosed = runBlocking {
-            withTimeoutOrNull(KEEP_ALIVE_CLOSE_TIMEOUT_MILLIS) {
-                keepAliveController?.close()
-                true
-            } ?: false
+            keepAliveController?.closeWithin(KEEP_ALIVE_CLOSE_TIMEOUT_MILLIS) ?: true
         }
         if (!keepAliveClosed) {
             Logger.e("AgentService: 保活资源清理超时，继续其余服务清理")

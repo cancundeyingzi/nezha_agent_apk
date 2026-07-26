@@ -2,6 +2,7 @@ package com.nezhahq.agent.service.keepalive
 
 import com.nezhahq.agent.core.model.KeepAliveSettings
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CancellationException
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -87,6 +88,85 @@ class KeepAliveControllerTest {
         assertEquals(1, overlay.closeCount)
         assertEquals(1, vpn.closeCount)
         assertEquals(1, wakeLock.closeCount)
+    }
+
+    @Test
+    fun normalReconfigurePropagatesCancellation() = runBlocking {
+        val controller = KeepAliveController(
+            CancellationResource(cancelSetEnabled = true),
+            RecordingResource(),
+            RecordingResource(),
+            RecordingResource()
+        )
+
+        var cancellation: CancellationException? = null
+        try {
+            controller.reconfigure(KeepAliveSettings(audio = true))
+        } catch (e: CancellationException) {
+            cancellation = e
+        }
+
+        assertTrue(cancellation != null)
+    }
+
+    @Test
+    fun normalClosePropagatesCancellation() = runBlocking {
+        val controller = KeepAliveController(
+            CancellationResource(cancelClose = true),
+            RecordingResource(),
+            RecordingResource(),
+            RecordingResource()
+        )
+
+        var cancellation: CancellationException? = null
+        try {
+            controller.close()
+        } catch (e: CancellationException) {
+            cancellation = e
+        }
+
+        assertTrue(cancellation != null)
+    }
+
+    @Test
+    fun boundedCloseReturnsWhileIndependentCleanupContinues() = runBlocking {
+        val cleanupExecutor = Executors.newSingleThreadExecutor()
+        val cleanupDispatcher = cleanupExecutor.asCoroutineDispatcher()
+        val cleanupScope = CoroutineScope(SupervisorJob() + cleanupDispatcher)
+        val blocker = BlockingCloseResource()
+        val overlay = RecordingResource()
+        val vpn = RecordingResource()
+        val wakeLock = LatchingCloseResource()
+        val waiter = KeepAliveCloseWaiter { _, _ ->
+            assertTrue(blocker.started.await(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            false
+        }
+        val controller = KeepAliveController(
+            blocker,
+            overlay,
+            wakeLock,
+            vpn,
+            cleanupScope,
+            waiter
+        )
+
+        try {
+            assertFalse(controller.closeWithin(750L))
+            assertEquals(0, overlay.closeCount)
+            assertEquals(0, vpn.closeCount)
+            assertEquals(0, wakeLock.closeCount)
+
+            blocker.unblock()
+
+            assertTrue(wakeLock.closed.await(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertEquals(1, overlay.closeCount)
+            assertEquals(1, vpn.closeCount)
+            assertEquals(1, wakeLock.closeCount)
+        } finally {
+            blocker.unblock()
+            cleanupScope.cancel()
+            cleanupDispatcher.close()
+        }
     }
 
     @Test
@@ -266,6 +346,63 @@ class KeepAliveControllerTest {
     }
 
     @Test
+    fun audioFactoryCancellationRemainsOwnedUntilReleaseCompletes() = runBlocking {
+        val writerExecutor = Executors.newFixedThreadPool(2)
+        val writerDispatcher = writerExecutor.asCoroutineDispatcher()
+        val cleanupExecutor = Executors.newFixedThreadPool(2)
+        val cleanupDispatcher = cleanupExecutor.asCoroutineDispatcher()
+        val writerScope = CoroutineScope(SupervisorJob() + writerDispatcher)
+        val cleanupScope = CoroutineScope(SupervisorJob() + cleanupDispatcher)
+        val first = FactoryBlockedAudioOutput()
+        val replacement = BlockingAudioOutput(AtomicInteger(), AtomicInteger())
+        val factoryEntered = CountDownLatch(1)
+        val factoryGate = CountDownLatch(1)
+        val factoryCount = AtomicInteger()
+        val audio = AudioKeepAlive(
+            scope = writerScope,
+            dispatcher = writerDispatcher,
+            outputFactory = AudioOutputFactory {
+                if (factoryCount.getAndIncrement() == 0) {
+                    factoryEntered.countDown()
+                    factoryGate.await()
+                    first
+                } else {
+                    replacement
+                }
+            },
+            cleanupScope = cleanupScope,
+            cleanupWaiter = AudioCleanupWaiter { }
+        )
+
+        try {
+            audio.setEnabled(true)
+            assertTrue(factoryEntered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+
+            audio.setEnabled(false)
+            audio.setEnabled(true)
+            factoryGate.countDown()
+            assertTrue(first.releaseAttempted.await(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+
+            writerExecutor.submit {}.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            assertEquals(1, factoryCount.get())
+
+            first.allowRelease()
+
+            assertTrue(replacement.started.await(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertEquals(2, factoryCount.get())
+        } finally {
+            factoryGate.countDown()
+            first.allowRelease()
+            audio.close()
+            replacement.released.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            writerScope.cancel()
+            cleanupScope.cancel()
+            writerDispatcher.close()
+            cleanupDispatcher.close()
+        }
+    }
+
+    @Test
     fun overlayAddFailureClearsStateButRemovalFailureRetainsOwnershipForRetry() = runBlocking {
         val addFailingHost = FakeOverlayHost(failAdd = true)
         val addFailingOverlay = OverlayKeepAlive(addFailingHost)
@@ -380,6 +517,47 @@ class KeepAliveControllerTest {
         override suspend fun close() {
             closeCount++
             if (failClose) throw IllegalStateException("close failed")
+        }
+    }
+
+    private class CancellationResource(
+        private val cancelSetEnabled: Boolean = false,
+        private val cancelClose: Boolean = false
+    ) : KeepAliveResource {
+        override suspend fun setEnabled(enabled: Boolean) {
+            if (cancelSetEnabled) throw CancellationException("setEnabled cancelled")
+        }
+
+        override suspend fun close() {
+            if (cancelClose) throw CancellationException("close cancelled")
+        }
+    }
+
+    private class BlockingCloseResource : KeepAliveResource {
+        val started = CountDownLatch(1)
+        private val gate = CountDownLatch(1)
+
+        override suspend fun setEnabled(enabled: Boolean) = Unit
+
+        override suspend fun close() {
+            started.countDown()
+            gate.await()
+        }
+
+        fun unblock() {
+            gate.countDown()
+        }
+    }
+
+    private class LatchingCloseResource : KeepAliveResource {
+        var closeCount = 0
+        val closed = CountDownLatch(1)
+
+        override suspend fun setEnabled(enabled: Boolean) = Unit
+
+        override suspend fun close() {
+            closeCount++
+            closed.countDown()
         }
     }
 
@@ -512,6 +690,27 @@ class KeepAliveControllerTest {
             interruptGate.countDown()
             releaseGate.countDown()
             writeGate.countDown()
+        }
+    }
+
+    private class FactoryBlockedAudioOutput : AudioOutput {
+        override val bufferSizeSamples = 8
+        val releaseAttempted = CountDownLatch(1)
+        private val releaseGate = CountDownLatch(1)
+
+        override fun start() = error("cancelled output must not start")
+
+        override fun write(samples: ShortArray): Int = samples.size
+
+        override fun interrupt() = Unit
+
+        override fun release() {
+            releaseAttempted.countDown()
+            releaseGate.await()
+        }
+
+        fun allowRelease() {
+            releaseGate.countDown()
         }
     }
 

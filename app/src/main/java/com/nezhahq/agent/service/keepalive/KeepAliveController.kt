@@ -3,20 +3,33 @@ package com.nezhahq.agent.service.keepalive
 import android.content.Context
 import com.nezhahq.agent.core.model.KeepAliveSettings
 import com.nezhahq.agent.util.Logger
+import java.util.concurrent.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 internal interface KeepAliveResource {
     suspend fun setEnabled(enabled: Boolean)
     suspend fun close()
 }
 
+internal fun interface KeepAliveCloseWaiter {
+    suspend fun await(job: Job, timeoutMillis: Long): Boolean
+}
+
 internal class KeepAliveController(
     private val audio: KeepAliveResource,
     private val overlay: KeepAliveResource,
     private val wakeLock: KeepAliveResource,
-    private val vpn: KeepAliveResource
+    private val vpn: KeepAliveResource,
+    private val cleanupScope: CoroutineScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    private val closeWaiter: KeepAliveCloseWaiter = TimeoutKeepAliveCloseWaiter()
 ) {
     private val lifecycleMutex = Mutex()
 
@@ -33,6 +46,11 @@ internal class KeepAliveController(
         attempt("overlay close") { closeOverlay() }
         attempt("VPN close") { closeVpn() }
         attempt("wake lock close") { closeWakeLock() }
+    }
+
+    suspend fun closeWithin(timeoutMillis: Long): Boolean {
+        val closeJob = cleanupScope.launch { close() }
+        return closeWaiter.await(closeJob, timeoutMillis)
     }
 
     private suspend fun configureAudio(enabled: Boolean) = audio.setEnabled(enabled)
@@ -52,8 +70,13 @@ internal class KeepAliveController(
     private suspend fun closeVpn() = vpn.close()
 
     private suspend fun attempt(operation: String, action: suspend () -> Unit) {
-        runCatching { action() }
-            .onFailure { Logger.e("KeepAliveController: $operation failed", it) }
+        try {
+            action()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.e("KeepAliveController: $operation failed", e)
+        }
     }
 
     companion object {
@@ -70,4 +93,12 @@ internal class KeepAliveController(
             )
         }
     }
+}
+
+private class TimeoutKeepAliveCloseWaiter : KeepAliveCloseWaiter {
+    override suspend fun await(job: Job, timeoutMillis: Long): Boolean =
+        withTimeoutOrNull(timeoutMillis) {
+            job.join()
+            !job.isCancelled
+        } ?: false
 }
