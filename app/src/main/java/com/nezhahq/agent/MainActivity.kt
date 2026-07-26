@@ -18,6 +18,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -63,6 +64,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
+import com.nezhahq.agent.ui.UiEvent
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -387,18 +389,21 @@ class MainActivity : ComponentActivity() {
     private val SHIZUKU_REQUEST_CODE = 19527
 
     /**
-     * Compose 侧注册的 ViewModel 引用回调。
-     * 当 Shizuku 权限结果回来时，转发给 ViewModel。
+     * Held at activity level so the Shizuku listener can deliver straight to it.
+     *
+     * The result used to be routed through a callback that composition installed, which left a gap
+     * between activity recreation and the first composition: a grant arriving in that window was
+     * dropped, and the user saw an authorization that appeared to do nothing.
      */
-    @Volatile
-    private var viewModelCallback: ((Boolean) -> Unit)? = null
+    private val viewModel: MainViewModel by viewModels { MainViewModel.Factory }
 
     /** Shizuku 权限回调：将结果转发给 ViewModel。 */
     private val shizukuPermResultListener =
         Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
             if (requestCode == SHIZUKU_REQUEST_CODE) {
-                val granted = grantResult == PackageManager.PERMISSION_GRANTED
-                viewModelCallback?.invoke(granted)
+                viewModel.onShizukuPermissionResult(
+                    grantResult == PackageManager.PERMISSION_GRANTED
+                )
             }
         }
 
@@ -488,15 +493,10 @@ class MainActivity : ComponentActivity() {
                             .blur(120.dp)
                     )
 
-                    // 获取 ViewModel（绑定到 Activity 的 ViewModelStore，旋转安全）
-                    val vm: MainViewModel = viewModel(factory = MainViewModel.Factory)
+                    val vm = viewModel
 
-                    // 注册 ViewModel 的 Shizuku 回调桥接
-                    LaunchedEffect(Unit) {
-                        viewModelCallback = { granted ->
-                            vm.onShizukuPermissionResult(granted)
-                        }
-                    }
+                    // 一次性事件在此消费；ViewModel 不再直接触碰 Android 的 Toast。
+                    UiEventHost(vm)
 
                     MainScreen(
                         vm = vm,
@@ -510,7 +510,26 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         Shizuku.removeRequestPermissionResultListener(shizukuPermResultListener)
-        viewModelCallback = null
+    }
+}
+
+/**
+ * Shows the view model's one-off messages.
+ *
+ * Collection is tied to the composition, so a message emitted while the UI is gone waits in the
+ * channel rather than being shown to nobody.
+ */
+@Composable
+private fun UiEventHost(vm: MainViewModel) {
+    val context = LocalContext.current
+    LaunchedEffect(vm) {
+        vm.events.collect { event ->
+            val (text, duration) = when (event) {
+                is UiEvent.Message -> event.text to Toast.LENGTH_SHORT
+                is UiEvent.LongMessage -> event.text to Toast.LENGTH_LONG
+            }
+            Toast.makeText(context, text, duration).show()
+        }
     }
 }
 
@@ -977,8 +996,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 GlassButtonPrimary(
                     onClick = { vm.startSimulator() },
                     modifier = Modifier.weight(1f),
-                    enabled = !vm.simulatorRunning && vm.isConfigStorageAvailable &&
-                        !vm.isConfigWriteInProgress
+                    enabled = !vm.simulatorRunning && vm.canEditConfig
                 ) { Text("开启", fontWeight = FontWeight.Bold) }
                 GlassButtonSecondary(
                     onClick = { vm.stopSimulator() },
@@ -1004,7 +1022,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 PermissionStatusRow(
                     item = item,
                     actionEnabled = item.key != "auto_start" ||
-                        (vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress),
+                        vm.canEditConfig,
                     onAction = {
                         // 根据权限类型执行不同的授权动作
                         when (item.key) {
@@ -1091,7 +1109,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 onCheckedChange = vm::setKeepAliveAudio,
                 title = "允许后台播放微弱音频",
                 description = "发送极其微弱的次声波骗过部分系统的静音检测，防止杀后台（需重启服务生效）",
-                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
+                enabled = vm.canEditConfig
             )
 
             // 悬浮窗
@@ -1100,7 +1118,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 onCheckedChange = vm::setFloatWindow,
                 title = "开启像素级透明悬浮窗",
                 description = "创建一个1x1不可见的悬浮窗来拉高进程优先级（需授予悬浮窗权限并重启服务生效）",
-                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
+                enabled = vm.canEditConfig
             )
 
             // 开机自启动
@@ -1111,7 +1129,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 },
                 title = "开机自启动",
                 description = "设备重启后自动恢复探针后台服务，建议开启以防失联",
-                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
+                enabled = vm.canEditConfig
             )
         }
 
@@ -1134,7 +1152,7 @@ fun ToolsScreenContent(vm: MainViewModel) {
                 Row(verticalAlignment = Alignment.Top) {
                     EtherSwitch(
                         checked = vm.enableVpnTraffic,
-                        enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress,
+                        enabled = vm.canEditConfig,
                         onCheckedChange = { newValue ->
                             if (newValue) {
                                 val prepareIntent = VpnService.prepare(vpnContext)
@@ -1486,7 +1504,7 @@ fun ConfigScreenContent(
                         )
                     },
                     modifier = Modifier.weight(1f),
-                    enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
+                    enabled = vm.canEditConfig
                 ) {
                     Text("启动探针", fontWeight = FontWeight.Bold)
                 }
@@ -1592,7 +1610,7 @@ fun ConfigScreenContent(
                 },
                 title = "允许面板远程执行命令",
                 description = "允许 TaskType 4 命令和新建交互终端 Shell；关闭后新请求立即生效",
-                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
+                enabled = vm.canEditConfig
             )
             if (vm.enableRemoteCommand) {
                 Text(
@@ -1613,7 +1631,7 @@ fun ConfigScreenContent(
                 },
                 title = "允许面板远程管理文件",
                 description = "允许 TaskType 11 浏览、下载和上传设备文件；关闭后新请求立即生效",
-                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
+                enabled = vm.canEditConfig
             )
             if (vm.enableRemoteFileManager) {
                 Text(
@@ -1634,7 +1652,7 @@ fun ConfigScreenContent(
                 },
                 title = "允许面板内网穿透",
                 description = "允许 TaskType 9 通过本机转发 TCP 流量；关闭后新请求立即生效",
-                enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
+                enabled = vm.canEditConfig
             )
             if (vm.enableRemoteNat) {
                 Text(

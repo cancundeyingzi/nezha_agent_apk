@@ -9,7 +9,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
-import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -34,12 +33,16 @@ import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.service.AgentService
 import com.nezhahq.agent.simulator.GrpcSimulatedDeviceReporter
 import com.nezhahq.agent.simulator.SimulatedDeviceLoop
+import com.nezhahq.agent.ui.UiEvent
 import com.nezhahq.agent.util.RootShell
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -188,6 +191,32 @@ class MainViewModel(
         private set
 
     // ══════════════════════════════════════════════════════════════════════════
+    // 一次性 UI 事件
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private val _events = Channel<UiEvent>(Channel.BUFFERED)
+
+    /** Transient messages for the presenter to show; see [UiEvent]. */
+    val events: Flow<UiEvent> = _events.receiveAsFlow()
+
+    /**
+     * Whether configuration may be edited right now.
+     *
+     * Collapses the storage-usable and no-write-in-flight pair that the screens previously
+     * recombined at every control, where forgetting one half silently enabled a dead toggle.
+     */
+    val canEditConfig: Boolean
+        get() = isConfigStorageAvailable && !isConfigWriteInProgress
+
+    private fun notify(text: String) {
+        _events.trySend(UiEvent.Message(text))
+    }
+
+    private fun notifyLong(text: String) {
+        _events.trySend(UiEvent.LongMessage(text))
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // 业务方法
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -211,7 +240,7 @@ class MainViewModel(
             .orEmpty()
 
         if (input.isBlank()) {
-            Toast.makeText(context, "剪贴板中没有可解析的安装脚本", Toast.LENGTH_SHORT).show()
+            notify("剪贴板中没有可解析的安装脚本")
             return
         }
 
@@ -261,7 +290,7 @@ class MainViewModel(
             parseBooleanLike(envTlsMatch.groupValues[1])?.let { useTls = it }
         }
 
-        Toast.makeText(context, "配置已解析完成", Toast.LENGTH_SHORT).show()
+        notify("配置已解析完成")
     }
 
     fun setKeepAliveAudio(enabled: Boolean) {
@@ -314,7 +343,7 @@ class MainViewModel(
 
         // Same rules the service validates with, so a saved configuration can always be started.
         AgentConfig.validationError(server = server, portText = port, secret = secret)?.let {
-            Toast.makeText(ctx, it, Toast.LENGTH_SHORT).show()
+            notify(it)
             return
         }
 
@@ -343,11 +372,7 @@ class MainViewModel(
                     try {
                         batteryIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
                         ctx.startActivity(batteryIntent)
-                        Toast.makeText(
-                            ctx,
-                            "请在弹出的系统对话框中选择 '允许' 以保证后台保活",
-                            Toast.LENGTH_LONG
-                        ).show()
+                        notifyLong("请在弹出的系统对话框中选择 '允许' 以保证后台保活")
                     } catch (e: Exception) {
                         try {
                             val fallback = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
@@ -360,7 +385,7 @@ class MainViewModel(
 
             // 启动前台服务
             AgentService.startOrReload(ctx)
-            Toast.makeText(ctx, "后台探针服务已启动", Toast.LENGTH_SHORT).show()
+            notify("后台探针服务已启动")
             
             // 启动成功后，检查是否需要显示自启动授权弹窗
             checkAndShowAutoStartPrompt()
@@ -391,7 +416,7 @@ class MainViewModel(
         val ctx = getApplication<Application>()
         val intent = Intent(ctx, AgentService::class.java)
         ctx.stopService(intent)
-        Toast.makeText(ctx, "后台探针服务已停止", Toast.LENGTH_SHORT).show()
+        notify("后台探针服务已停止")
     }
 
     fun startSimulator() {
@@ -408,7 +433,7 @@ class MainViewModel(
             threadCountText = simulatorThreadCount
         )
         if (validationError != null) {
-            Toast.makeText(ctx, validationError, Toast.LENGTH_SHORT).show()
+            notify(validationError)
             return
         }
 
@@ -478,14 +503,14 @@ class MainViewModel(
                         }
                     }
                 }
-                Toast.makeText(ctx, "娱乐模拟设备已开启", Toast.LENGTH_SHORT).show()
+                notify("娱乐模拟设备已开启")
             }
         )
     }
 
     fun stopSimulator() {
         if (!simulatorRunning && simulatorJob == null) {
-            Toast.makeText(getApplication(), "娱乐模拟设备未开启", Toast.LENGTH_SHORT).show()
+            notify("娱乐模拟设备未开启")
             return
         }
         simulatorJob?.cancel()
@@ -493,7 +518,7 @@ class MainViewModel(
         simulatorRunning = false
         simulatorLastStatus =
             "模拟器已停止，本次会话成功 $simulatorSuccessCount 台，失败 $simulatorFailureCount 台"
-        Toast.makeText(getApplication(), "娱乐模拟设备已关闭", Toast.LENGTH_SHORT).show()
+        notify("娱乐模拟设备已关闭")
     }
 
     fun onUseTlsChanged(enabled: Boolean) {
@@ -509,7 +534,7 @@ class MainViewModel(
         val hasShownAutoStartPrompt = repository.loadAutoStartState().promptShown
         storageStatus = repository.storageStatus()
         if (!isConfigStorageAvailable) {
-            storageErrorMessage = CONFIG_STORAGE_UNAVAILABLE_MESSAGE
+            reportStorageProblem(CONFIG_STORAGE_UNAVAILABLE_MESSAGE)
             showAutoStartPrompt = false
             return
         }
@@ -615,19 +640,17 @@ class MainViewModel(
             isResettingConfigStorage = false
             storageStatus = repository.storageStatus()
             if (!resetSucceeded || !isConfigStorageAvailable) {
-                storageErrorMessage = "配置存储重置失败，请稍后重试"
-                Toast.makeText(ctx, storageErrorMessage, Toast.LENGTH_LONG).show()
+                reportStorageProblem("配置存储重置失败，请稍后重试")
                 return@launch
             }
             refreshConfigurationFromStorage()
             storageStatus = repository.storageStatus()
             if (!isConfigStorageAvailable) {
-                storageErrorMessage = "配置存储重置后读取失败，请稍后重试"
-                Toast.makeText(ctx, storageErrorMessage, Toast.LENGTH_LONG).show()
+                reportStorageProblem("配置存储重置后读取失败，请稍后重试")
                 return@launch
             }
             storageErrorMessage = null
-            Toast.makeText(ctx, "配置已重置，请重新填写连接信息", Toast.LENGTH_LONG).show()
+            notifyLong("配置已重置，请重新填写连接信息")
         }
     }
 
@@ -654,11 +677,11 @@ class MainViewModel(
     fun onShizukuPermissionResult(granted: Boolean) {
         if (granted) {
             shizukuStatusText = "✅ Shizuku 已授权"
-            Toast.makeText(getApplication(), "Shizuku 权限已授予，ADB Shell 模式可用", Toast.LENGTH_SHORT).show()
+            notify("Shizuku 权限已授予，ADB Shell 模式可用")
         } else {
             shizukuStatusText = "❌ Shizuku 授权被拒绝"
             rootMode = false
-            Toast.makeText(getApplication(), "Shizuku 权限被拒绝，已关闭高权限模式", Toast.LENGTH_SHORT).show()
+            notify("Shizuku 权限被拒绝，已关闭高权限模式")
         }
     }
 
@@ -765,17 +788,13 @@ class MainViewModel(
         try {
             if (!Shizuku.pingBinder()) {
                 shizukuStatusText = "⚠️ Shizuku 未运行（可使用 Root 则忽略此提示）"
-                Toast.makeText(
-                    ctx,
-                    "Shizuku 未运行。如设备已 Root 可忽略此提示；\n否则请先安装并启动 Shizuku 应用。",
-                    Toast.LENGTH_LONG
-                ).show()
+                notifyLong("Shizuku 未运行。如设备已 Root 可忽略此提示；\n否则请先安装并启动 Shizuku 应用。")
                 return
             }
 
             if (Shizuku.isPreV11()) {
                 shizukuStatusText = "⚠️ Shizuku 版本过低，不受支持"
-                Toast.makeText(ctx, "当前 Shizuku 版本过低，请升级到 v11 以上", Toast.LENGTH_LONG).show()
+                notifyLong("当前 Shizuku 版本过低，请升级到 v11 以上")
                 return
             }
 
@@ -785,11 +804,7 @@ class MainViewModel(
                 }
                 Shizuku.shouldShowRequestPermissionRationale() -> {
                     shizukuStatusText = "❌ Shizuku 授权被永久拒绝，请在 Shizuku 应用中手动授权"
-                    Toast.makeText(
-                        ctx,
-                        "Shizuku 权限已被永久拒绝，请打开 Shizuku 应用，在「授权管理」中手动为本应用授权。",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    notifyLong("Shizuku 权限已被永久拒绝，请打开 Shizuku 应用，在「授权管理」中手动为本应用授权。")
                 }
                 else -> {
                     shizukuStatusText = "⏳ 等待 Shizuku 授权..."
@@ -798,11 +813,7 @@ class MainViewModel(
             }
         } catch (e: Exception) {
             shizukuStatusText = "⚠️ Shizuku 检测异常"
-            Toast.makeText(
-                ctx,
-                "Shizuku 检测失败：${e.message}\n如设备已 Root 可忽略此提示。",
-                Toast.LENGTH_LONG
-            ).show()
+            notifyLong("Shizuku 检测失败：${e.message}\n如设备已 Root 可忽略此提示。")
         }
     }
 
@@ -822,12 +833,7 @@ class MainViewModel(
     private fun requireConfigStorage(action: String): Boolean {
         storageStatus = repository.storageStatus()
         if (isConfigStorageAvailable) return true
-        storageErrorMessage = CONFIG_STORAGE_UNAVAILABLE_MESSAGE
-        Toast.makeText(
-            getApplication(),
-            "$action 已拒绝：$CONFIG_STORAGE_UNAVAILABLE_MESSAGE",
-            Toast.LENGTH_LONG
-        ).show()
+        reportStorageProblem("$action 已拒绝：$CONFIG_STORAGE_UNAVAILABLE_MESSAGE")
         return false
     }
 
@@ -840,7 +846,7 @@ class MainViewModel(
     ) {
         if (isConfigWriteInProgress) {
             onFailure()
-            Toast.makeText(getApplication(), "配置正在保存，请稍候", Toast.LENGTH_SHORT).show()
+            notify("配置正在保存，请稍候")
             return
         }
         if (!requireConfigStorage(action)) {
@@ -902,17 +908,23 @@ class MainViewModel(
     }
 
     private fun showToolSettingSaved() {
-        Toast.makeText(
-            getApplication(),
-            "配置已保存，请在主页停止并重新启动探针以生效",
-            Toast.LENGTH_LONG
-        ).show()
+        notifyLong("配置已保存，请在主页停止并重新启动探针以生效")
     }
 
     private fun reportStorageWriteFailure(message: String) {
         storageStatus = repository.storageStatus()
-        storageErrorMessage = "$message；配置存储不可用，请重置配置存储"
-        Toast.makeText(getApplication(), storageErrorMessage, Toast.LENGTH_LONG).show()
+        reportStorageProblem("$message；配置存储不可用，请重置配置存储")
+    }
+
+    /**
+     * The only way [storageErrorMessage] becomes non-null.
+     *
+     * Setting the field and telling the user were separate steps before, so the banner could show a
+     * problem the user was never notified about, or outlive the condition that caused it.
+     */
+    private fun reportStorageProblem(message: String) {
+        storageErrorMessage = message
+        notifyLong(message)
     }
 
     private fun refreshConfigurationFromStorage() {
