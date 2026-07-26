@@ -6,9 +6,11 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -27,6 +29,7 @@ import java.nio.ByteOrder
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class FileManagerProtocolTest {
 
@@ -86,6 +89,47 @@ class FileManagerProtocolTest {
 
         assertTrue(firstStream.closed)
         assertEquals(listOf("first"), source.openedPaths)
+    }
+
+    @Test
+    fun `stalled outgoing stream bounds download read ahead`() = runBlocking {
+        val firstRead = CompletableDeferred<Unit>()
+        val readCount = AtomicInteger()
+        val source = object : DownloadFileSource {
+            override suspend fun size(path: String): Long = (BUFFER_SIZE * 10L)
+
+            override suspend fun open(path: String): InputStream =
+                CountingInputStream(
+                    remainingBytes = BUFFER_SIZE * 10,
+                    readCount = readCount,
+                    firstRead = firstRead
+                )
+        }
+        val manager = FileManager(
+            context = ContextWrapper(null),
+            streamId = "bounded-output",
+            openIoStream = {
+                flow {
+                    emit(downloadRequest("large"))
+                    awaitCancellation()
+                }
+            },
+            downloadSourceOverride = source
+        )
+        val session = launch { manager.run() }
+
+        try {
+            withTimeout(TEST_TIMEOUT_MS) { firstRead.await() }
+            delay(100)
+            assertEquals(
+                "download continued reading while its bounded output channel was full",
+                1,
+                readCount.get()
+            )
+        } finally {
+            session.cancel()
+            withTimeout(TEST_TIMEOUT_MS) { session.join() }
+        }
     }
 
     private fun successfulSession(
@@ -212,6 +256,25 @@ class FileManagerProtocolTest {
         override fun close() {
             closed = true
             closeSignal.countDown()
+        }
+    }
+
+    private class CountingInputStream(
+        remainingBytes: Int,
+        private val readCount: AtomicInteger,
+        private val firstRead: CompletableDeferred<Unit>
+    ) : InputStream() {
+        private var remaining = remainingBytes
+
+        override fun read(): Int = throw UnsupportedOperationException()
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            if (remaining == 0) return -1
+            val bytesRead = minOf(length, remaining)
+            remaining -= bytesRead
+            readCount.incrementAndGet()
+            firstRead.complete(Unit)
+            return bytesRead
         }
     }
 

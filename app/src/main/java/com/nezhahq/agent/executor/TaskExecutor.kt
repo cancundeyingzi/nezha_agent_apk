@@ -296,7 +296,7 @@ private const val PROCESS_READ_BUFFER_BYTES = 8 * 1024
  *
  * ## 安全说明
  * - HTTPGet 使用信任所有证书的 OkHttpClient，用于监控自签名 HTTPS 站点
- * - Command 任务默认禁用，需用户在设置中手动启用
+ * - Command 与交互终端共用远程 Shell 授权，默认禁用
  * - Command 执行设有 2 小时硬超时，防止死循环脚本阻塞协程
  */
 object TaskExecutor {
@@ -361,13 +361,23 @@ object TaskExecutor {
      * 执行面板下发的任务并返回结果。
      *
      * @param task              面板下发的任务描述（含类型、ID、数据）
-     * @param isCommandEnabled  是否允许执行远程命令（用户设置项）
+     * @param isRemoteShellEnabled 是否允许执行远程命令与交互终端 Shell
      * @return TaskResult       包含延时、成功状态和数据的执行结果
      */
-    suspend fun executeTask(task: Task, isCommandEnabled: Boolean): TaskResult = withContext(Dispatchers.IO) {
+    suspend fun executeTask(
+        task: Task,
+        isRemoteShellEnabled: Boolean
+    ): TaskResult = withContext(Dispatchers.IO) {
         val resultBuilder = TaskResult.newBuilder()
             .setId(task.id)
             .setType(task.type)
+
+        TaskAuthorizationPolicy.denialReason(task.type, isRemoteShellEnabled)?.let { reason ->
+            return@withContext resultBuilder
+                .setSuccessful(false)
+                .setData(reason)
+                .build()
+        }
 
         try {
             when (task.type) {
@@ -440,10 +450,6 @@ object TaskExecutor {
 
                 // ── TaskType 4：远程命令执行（带超时保护）─────────────────────
                 TaskTypes.COMMAND -> {
-                    if (!isCommandEnabled) {
-                        resultBuilder.setData("Command execution disabled on Android Agent.\n").setSuccessful(false)
-                        return@withContext resultBuilder.build()
-                    }
                     executeCommand(task.data, resultBuilder)
                 }
 

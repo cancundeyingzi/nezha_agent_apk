@@ -1618,20 +1618,19 @@ fun ConfigScreenContent(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // ── [安全修复] 远程命令执行独立开关 ──────────────────────────
-            // 将命令执行权限从 rootMode 中解耦，需用户显式开启。
+            // 远程 Shell 权限与 rootMode 解耦，需用户显式开启。
             EtherToggleRow(
                 checked = vm.enableRemoteCommand,
                 onCheckedChange = { newValue ->
                     vm.toggleRemoteCommand(newValue)
                 },
                 title = "允许面板远程执行命令",
-                description = "允许面板通过 TaskType 4 在本设备上执行 sh -c 命令（需重启服务生效）",
+                description = "允许 TaskType 4 命令和新建交互终端 Shell；关闭后新请求立即生效",
                 enabled = vm.isConfigStorageAvailable && !vm.isConfigWriteInProgress
             )
             if (vm.enableRemoteCommand) {
                 Text(
-                    "⚠️ 安全警告：开启此选项后，面板可在本设备上执行任意 Shell 命令。" +
+                    "⚠️ 安全警告：开启后，面板可通过任务或交互终端执行任意 Shell 命令。" +
                             "请确保你完全信任面板管理员，否则可能带来数据泄露或设备损坏风险。",
                     style = MaterialTheme.typography.bodySmall,
                     color = LgError,

@@ -7,6 +7,7 @@ import kotlinx.coroutines.launch
 
 class SimulatedDeviceLoop(
     private val reporter: SimulatedDeviceReporter,
+    private val deviceFactory: () -> SimulatedDevice = { RandomDeviceFactory.create() },
     private val intervalMs: Long = 1_000L,
     private val nowMs: () -> Long = System::currentTimeMillis,
     private val delayNext: suspend (Long) -> Unit = { delay(it) }
@@ -43,10 +44,15 @@ class SimulatedDeviceLoop(
         onSuccess: suspend () -> Unit,
         onFailure: suspend (Throwable) -> Unit
     ) {
+        var pendingDevice: SimulatedDevice? = null
         while (shouldContinue()) {
+            val device = pendingDevice ?: deviceFactory().also {
+                pendingDevice = it
+            }
             val startedAt = nowMs()
             try {
-                reporter.reportOne(config)
+                reporter.reportOne(config, device)
+                pendingDevice = null
                 onSuccess()
             } catch (e: CancellationException) {
                 throw e

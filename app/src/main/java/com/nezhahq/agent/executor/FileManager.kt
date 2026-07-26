@@ -1,7 +1,6 @@
 package com.nezhahq.agent.executor
 
 import android.content.Context
-import android.content.pm.PackageManager
 import com.nezhahq.agent.util.ConfigStore
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
@@ -12,7 +11,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import proto.Nezha
 import proto.NezhaServiceGrpcKt.NezhaServiceCoroutineStub
-import rikka.shizuku.Shizuku
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -52,6 +50,7 @@ class FileManager internal constructor(
         val COMPLETE_IDENTIFIER = byteArrayOf(0x4E, 0x5A, 0x55, 0x50)
 
         const val BUFFER_SIZE = 1024 * 1024
+        const val OUTPUT_BUFFER_CAPACITY = 2
         const val DEFAULT_HOME = "/sdcard/"
         const val UPLOAD_HEADER_OFFSET = 1
         const val UPLOAD_SIZE_BYTES = 8
@@ -59,14 +58,14 @@ class FileManager internal constructor(
         const val UPLOAD_MIN_REQUEST_BYTES = UPLOAD_PATH_OFFSET
     }
 
-    private val outputChannel = Channel<Nezha.IOStreamData>(Channel.BUFFERED)
+    private val outputChannel = Channel<Nezha.IOStreamData>(OUTPUT_BUFFER_CAPACITY)
     private val closed = AtomicBoolean(false)
 
     @Volatile private var uploadSession: UploadSession? = null
 
     suspend fun run() {
         try {
-            coroutineScope {
+            resourceSessionScope(::close) session@{
                 val header = STREAM_MAGIC + streamId.toByteArray(Charsets.UTF_8)
                 val headerMsg = Nezha.IOStreamData.newBuilder()
                     .setData(ByteString.copyFrom(header))
@@ -111,37 +110,50 @@ class FileManager internal constructor(
                             )
                             Logger.i("FileUpload: 收到上传请求: $targetPath (size=$fileSize) (StreamID=$streamId)")
 
-                            // 总是使用缓存文件进行传输，解决 Root 路径直接 IO 写失败问题
-                            val cacheFile = File(context.cacheDir, "nezha_upload_${System.currentTimeMillis()}.tmp")
                             val session = try {
-                                withContext(Dispatchers.IO) {
-                                    UploadSession.create(targetPath, fileSize, cacheFile)
-                                }
+                                beginUpload(targetPath, fileSize)
                             } catch (e: IllegalArgumentException) {
                                 Logger.e("FileUpload: 上传请求被拒绝: ${e.message}")
                                 sendError(e.message ?: "上传请求无效")
                                 return@collect
+                            } catch (e: CancellationException) {
+                                throw e
                             } catch (e: Exception) {
                                 Logger.e("FileUpload: 无法创建临时缓存文件: $targetPath (StreamID=$streamId)", e)
                                 sendError("无法创建临时缓存文件: ${e.message}")
                                 return@collect
                             }
 
-                            uploadSession = session
                             if (session.isComplete) {
                                 completeUpload(session)
                             }
                         }
                     }
                 }
-                this@coroutineScope.cancel()
+                this@session.cancel()
+            }
+        } catch (e: CancellationException) {
+            if (!currentCoroutineContext().isActive) throw e
+        } catch (e: Exception) {
+            Logger.i("FileManager: 文件管理器会话结束 (StreamID=$streamId): ${e.message}")
+        }
+    }
+
+    private suspend fun beginUpload(
+        targetPath: String,
+        declaredSize: Long
+    ): UploadSession = withContext(Dispatchers.IO) {
+        val cacheFile = File.createTempFile("nezha_upload_", ".tmp", context.cacheDir)
+        try {
+            UploadSession.create(targetPath, declaredSize, cacheFile).also {
+                uploadSession = it
             }
         } catch (e: Exception) {
-            if (e !is CancellationException) {
-                Logger.i("FileManager: 文件管理器会话结束 (StreamID=$streamId): ${e.message}")
+            try {
+                cacheFile.delete()
+            } catch (_: Exception) {
             }
-        } finally {
-            close()
+            throw e
         }
     }
 
@@ -350,6 +362,8 @@ class FileManager internal constructor(
                     abortUploadSession()
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Logger.e("FileUpload: 写入缓存文件失败: ${session.targetPath} (StreamID=$streamId)", e)
             sendError("写入文件失败: ${e.message}")
@@ -399,6 +413,8 @@ class FileManager internal constructor(
                 sourceFile.copyTo(target, overwrite = true)
             }
             if (target.exists() && target.length() == sourceFile.length()) return true
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {}
 
         // [安全修复] 仅在 rootMode=true 时才尝试 RootShell 提权写入
@@ -439,46 +455,29 @@ class FileManager internal constructor(
         return result.trim().toLongOrNull()
     }
 
-    private class ProcessInputStream(private val process: Process) : InputStream() {
-        private val root = process.inputStream
-        override fun read(): Int = root.read()
-        override fun read(b: ByteArray): Int = root.read(b)
-        override fun read(b: ByteArray, off: Int, len: Int): Int = root.read(b, off, len)
-        override fun available(): Int = root.available()
-        override fun close() {
-            super.close()
-            try { root.close() } catch (_: Exception) {}
-            try { process.destroy() } catch (_: Exception) {}
-        }
-    }
-
     /**
      * 打开文件的 InputStream。
      *
      * ## 策略优先级（与 listDir 一致的 Root-first 策略）
-     * Root/Shizuku 模式下优先使用 `su -c cat` 或 Shizuku 读取，
-     * 防止 FUSE 层因 Scoped Storage 拦截文件读取。
+     * Root/Shizuku 模式下优先通过 [RootShell] 打开流式 `cat` 命令，
+     * 防止 FUSE 层因 Scoped Storage 拦截文件读取。RootShell 会再次强制校验权限。
      *
-     * 1. Root 模式：优先 `su -c cat`（绕过 FUSE）
+     * 1. Root 模式：优先使用集中授权的高权限输入流
      * 2. Java FileInputStream（非 Root 或 su 失败时）
-     * 3. Shizuku（Java IO 也失败时的最后手段）
      */
     private suspend fun openInputStreamForPath(path: String): InputStream? {
         val isRootMode = ConfigStore.getRootMode(context)
 
-        // ── 策略 1：Root 模式优先使用 su -c cat ──────────────────────────
+        // ── 策略 1：Root 模式优先使用集中授权的流式命令 ───────────────────
         if (isRootMode) {
-            try {
-                val p = withContext(Dispatchers.IO) {
-                    Runtime.getRuntime().exec(arrayOf("su", "-c", "cat ${shellEscape(path)}"))
-                }
-                // 不再使用 delay+exitValue 的脆弱检测，直接返回 ProcessInputStream
-                // 如果文件不存在或权限不足，read() 时自然会返回 EOF 或抛异常
-                Logger.i("FileManager: 使用 Root (su) 读取文件: $path")
-                return ProcessInputStream(p)
-            } catch (e: Exception) {
-                Logger.i("FileManager: Root (su) 读取文件失败，回退到 Java IO: $path (${e.message})")
+            val privilegedInput = withContext(Dispatchers.IO) {
+                RootShell.openCommandInputStream("cat ${shellEscape(path)}")
             }
+            if (privilegedInput != null) {
+                Logger.i("FileManager: 使用集中授权的 Root/Shizuku Shell 读取文件: $path")
+                return privilegedInput
+            }
+            Logger.i("FileManager: 高权限读取不可用，回退到 Java IO: $path")
         }
 
         // ── 策略 2：Java FileInputStream ────────────────────────────────
@@ -488,37 +487,6 @@ class FileManager internal constructor(
                 return FileInputStream(file)
             }
         } catch (_: Exception) {}
-
-        // ── [安全修复] 非 Root 模式下不再尝试 su 提权读取 ─────────────────
-        // 原实现在 rootMode=false 时仍会尝试 su -c cat 读取文件，
-        // 导致用户关闭高权限模式后文件管理器仍可能获得 Root 权限。
-        // 现在仅在 Java IO 失败时返回 null，不做提权回退。
-
-        // ── 策略 3：Shizuku（仅 Root 模式下） ──────────────────────────────
-        // [安全修复] 仅在 rootMode=true 时才尝试 Shizuku 提权读取
-        if (isRootMode) {
-            try {
-                if (isShizukuAvailable()) {
-                    @Suppress("DEPRECATION")
-                    val method = Shizuku::class.java.getDeclaredMethod(
-                        "newProcess",
-                        Array<String>::class.java,
-                        Array<String>::class.java,
-                        String::class.java
-                    )
-                    method.isAccessible = true
-                    val p = method.invoke(
-                        null,
-                        arrayOf("sh", "-c", "cat ${shellEscape(path)}"),
-                        null, null
-                    ) as Process
-                    Logger.i("FileManager: 使用 Shizuku 读取文件: $path")
-                    return ProcessInputStream(p)
-                }
-            } catch (e: Exception) {
-                Logger.e("FileManager: Shizuku 读取文件失败: $path", e)
-            }
-        }
 
         return null
     }
@@ -559,6 +527,8 @@ class FileManager internal constructor(
                         .build()
                 )
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {}
     }
 
@@ -570,6 +540,8 @@ class FileManager internal constructor(
                     .setData(ByteString.copyFrom(data))
                     .build()
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {}
     }
 
@@ -590,15 +562,6 @@ class FileManager internal constructor(
         return "'" + input.replace("'", "'\\''") + "'"
     }
 
-    private fun isShizukuAvailable(): Boolean {
-        return try {
-            Shizuku.pingBinder()
-                    && !Shizuku.isPreV11()
-                    && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-        } catch (_: Exception) {
-            false
-        }
-    }
 }
 
 internal interface DownloadFileSource {

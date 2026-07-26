@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Environment
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
+import com.nezhahq.agent.util.ShellSession
 import com.google.protobuf.ByteString
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -11,7 +12,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import proto.Nezha
 import proto.NezhaServiceGrpcKt.NezhaServiceCoroutineStub
-import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.atomic.AtomicBoolean
@@ -36,26 +36,30 @@ import org.json.JSONObject
 class TerminalManager(
     private val context: Context,
     private val stub: NezhaServiceCoroutineStub,
-    private val streamId: String,
-    /** 是否启用 Root/Shizuku 高权限模式（由用户在设置中控制） */
-    private val rootMode: Boolean = false
+    private val streamId: String
 ) {
     private companion object {
         const val PROMPT = "nezha:/ $ "
         const val AGENT_CMD_PREFIX = "@agent "
         const val AGENT_CMD_EXACT = "@agent"
+        const val MAX_COMMAND_LENGTH = 8 * 1024
+        const val SHELL_INPUT_BUFFER_CAPACITY = 8
+        const val OUTPUT_BUFFER_CAPACITY = 16
         /** IOStream StreamID 魔术头（协议规定） */
         val STREAM_MAGIC = byteArrayOf(0xFF.toByte(), 0x05, 0xFF.toByte(), 0x05)
     }
 
     private enum class InputState { NORMAL, ESC, CSI }
 
-    private var process: Process? = null
-    private var shellInput: OutputStream? = null
-    private val outputChannel = Channel<Nezha.IOStreamData>(Channel.BUFFERED)
+    @Volatile private var process: Process? = null
+    @Volatile private var privilegedProcess: RootShell.ManagedProcess? = null
+    @Volatile private var shellInput: OutputStream? = null
+    private val shellInputChannel = Channel<ByteArray>(SHELL_INPUT_BUFFER_CAPACITY)
+    private val outputChannel = Channel<Nezha.IOStreamData>(OUTPUT_BUFFER_CAPACITY)
     private val commandHandler = AgentCommandHandler(context)
     private val closed = AtomicBoolean(false)
     private val lineBuffer = StringBuilder()
+    private var lineOverflowed = false
     private var inputState = InputState.NORMAL
     private val awaitingPrompt = AtomicBoolean(false)
 
@@ -67,34 +71,41 @@ class TerminalManager(
      */
     suspend fun run() {
         try {
-            coroutineScope {
-                // 1. 选择 Shell 类型并启动子进程
-                //    优先使用 su（Root），其次 Shizuku，最后普通 sh
+            resourceSessionScope(::close) session@{
+                // 1. 由 RootShell 集中授权高权限进程；不可用时回退到普通 sh
                 //    显式切入 IO 调度器，避免 Thread.sleep / ProcessBuilder.start 阻塞非 IO 线程
-                val (shellProcess, shellType) = withContext(Dispatchers.IO) {
-                    startShellProcess()
+                val shellType = withContext(Dispatchers.IO) {
+                    startAndAttachShell()
                 }
-                process = shellProcess
-                shellInput = process!!.outputStream
+                val shellProcess = checkNotNull(process) { "Shell process was not attached." }
                 Logger.i("TerminalManager: Shell 子进程已启动 (type=$shellType, StreamID=$streamId)")
 
                 // 2. 启动 stdout 读取协程
                 launch(Dispatchers.IO) {
                     try {
-                        readLoop(process!!.inputStream)
+                        readLoop(shellProcess.inputStream)
                     } finally {
-                        this@coroutineScope.cancel()
+                        this@session.cancel()
                     }
                 }
 
-                // 3. 发送 StreamID 魔术头（协议握手）
+                // 3. 单写者顺序写入 Shell stdin；有界队列避免输入无限积压。
+                launch(Dispatchers.IO) {
+                    try {
+                        writeShellLoop()
+                    } finally {
+                        this@session.cancel()
+                    }
+                }
+
+                // 4. 发送 StreamID 魔术头（协议握手）
                 val header = STREAM_MAGIC + streamId.toByteArray(Charsets.UTF_8)
                 val headerMsg = Nezha.IOStreamData.newBuilder()
                     .setData(ByteString.copyFrom(header))
                     .build()
                 outputChannel.send(headerMsg)
 
-                // 4. 发送欢迎横幅（显示当前 Shell 权限类型）
+                // 5. 发送欢迎横幅（显示当前 Shell 权限类型）
                 val typeLabel = when (shellType) {
                     "su"      -> "Root"
                     "shizuku" -> "Shizuku (ADB)"
@@ -105,10 +116,10 @@ class TerminalManager(
                 sendOutput("==========================================\r\n\r\n")
                 sendOutput(PROMPT)
 
-                // 5. 启动心跳协程
+                // 6. 启动心跳协程
                 launch { keepAliveLoop() }
 
-                // 6. 建立 IOStream 双向流并处理输入
+                // 7. 建立 IOStream 双向流并处理输入
                 stub.iOStream(outputFlow()).collect { ioData ->
                     val bytes = ioData.data.toByteArray()
                     if (bytes.isEmpty()) return@collect // 心跳空包，忽略
@@ -127,15 +138,13 @@ class TerminalManager(
                         }
                     }
                 }
-                
-                this@coroutineScope.cancel()
+
+                this@session.cancel()
             }
+        } catch (e: CancellationException) {
+            if (!currentCoroutineContext().isActive) throw e
         } catch (e: Exception) {
-            if (e !is CancellationException) {
-                Logger.i("TerminalManager: 终端会话结束 (StreamID=$streamId): ${e.message}")
-            }
-        } finally {
-            close()
+            Logger.i("TerminalManager: 终端会话结束 (StreamID=$streamId): ${e.message}")
         }
     }
 
@@ -148,10 +157,17 @@ class TerminalManager(
     fun close() {
         if (closed.getAndSet(true)) return
         Logger.i("TerminalManager: 正在关闭终端会话 (StreamID=$streamId)")
-        try { shellInput?.close() } catch (_: Exception) {}
-        try { process?.destroy() } catch (_: Exception) {}
+        val managed = privilegedProcess
+        if (managed != null) {
+            managed.close()
+        } else {
+            process?.let(ShellSession::destroyProcess)
+        }
+        shellInputChannel.close()
         outputChannel.close()
-        process = null; shellInput = null
+        process = null
+        privilegedProcess = null
+        shellInput = null
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -172,20 +188,7 @@ class TerminalManager(
                 InputState.NORMAL -> when (b) {
                     0x1B -> inputState = InputState.ESC
                     0x0D -> { // Enter
-                        sendOutput("\r\n")
-                        val cmd = lineBuffer.toString().trim()
-                        lineBuffer.clear()
-                        when {
-                            cmd.startsWith(AGENT_CMD_PREFIX) || cmd == AGENT_CMD_EXACT -> {
-                                handleAgentCommand(cmd)
-                                sendOutput(PROMPT)
-                            }
-                            cmd.isNotEmpty() -> {
-                                awaitingPrompt.set(true)
-                                writeToShell((cmd + "\n").toByteArray())
-                            }
-                            else -> sendOutput(PROMPT)
-                        }
+                        handleEnter()
                     }
                     0x0A -> { /* 忽略 LF（CR+LF 场景） */ }
                     0x7F, 0x08 -> { // Backspace
@@ -196,6 +199,7 @@ class TerminalManager(
                     }
                     0x03 -> { // Ctrl+C
                         lineBuffer.clear()
+                        lineOverflowed = false
                         sendOutput("^C\r\n")
                         if (awaitingPrompt.get()) {
                             writeToShell(byteArrayOf(0x03))
@@ -208,6 +212,7 @@ class TerminalManager(
                             sendOutput("\b \b".repeat(lineBuffer.length))
                             lineBuffer.clear()
                         }
+                        lineOverflowed = false
                     }
                     0x04 -> { // Ctrl+D
                         if (lineBuffer.isEmpty()) {
@@ -216,12 +221,45 @@ class TerminalManager(
                         }
                     }
                     in 0x20..0x7E -> { // 可打印 ASCII
-                        lineBuffer.append(b.toChar())
-                        sendOutput(byteArrayOf(byte))
+                        appendPrintableInput(byte)
                     }
                 }
             }
         }
+    }
+
+    private suspend fun handleEnter() {
+        sendOutput("\r\n")
+        if (lineOverflowed) {
+            lineBuffer.clear()
+            lineOverflowed = false
+            sendOutput("[Command rejected: maximum length is $MAX_COMMAND_LENGTH characters]\r\n")
+            sendOutput(PROMPT)
+            return
+        }
+
+        val command = lineBuffer.toString().trim()
+        lineBuffer.clear()
+        when {
+            command.startsWith(AGENT_CMD_PREFIX) || command == AGENT_CMD_EXACT -> {
+                handleAgentCommand(command)
+                sendOutput(PROMPT)
+            }
+            command.isNotEmpty() -> {
+                awaitingPrompt.set(true)
+                writeToShell((command + "\n").toByteArray())
+            }
+            else -> sendOutput(PROMPT)
+        }
+    }
+
+    private suspend fun appendPrintableInput(byte: Byte) {
+        if (lineBuffer.length >= MAX_COMMAND_LENGTH) {
+            lineOverflowed = true
+            return
+        }
+        lineBuffer.append(byte.toInt().toChar())
+        sendOutput(byteArrayOf(byte))
     }
 
     private suspend fun handleAgentCommand(line: String) {
@@ -234,9 +272,29 @@ class TerminalManager(
         }
     }
 
-    private fun writeToShell(data: ByteArray) {
-        try { shellInput?.let { it.write(data); it.flush() } }
-        catch (e: Exception) { Logger.e("TerminalManager: 写入 Shell stdin 失败", e) }
+    private suspend fun writeToShell(data: ByteArray) {
+        if (closed.get()) return
+        try {
+            shellInputChannel.send(data)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (!closed.get()) Logger.e("TerminalManager: 排队写入 Shell stdin 失败", e)
+        }
+    }
+
+    private suspend fun writeShellLoop() {
+        try {
+            for (data in shellInputChannel) {
+                val input = shellInput ?: break
+                input.write(data)
+                input.flush()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (!closed.get()) Logger.e("TerminalManager: 写入 Shell stdin 失败", e)
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -269,10 +327,18 @@ class TerminalManager(
                     }
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             if (!closed.get()) Logger.e("TerminalManager: 读取 Shell 输出异常", e)
         } finally {
-            if (!closed.get()) { sendOutput("\r\n[Shell session ended]\r\n"); close() }
+            if (!closed.get()) {
+                try {
+                    sendOutput("\r\n[Shell session ended]\r\n")
+                } finally {
+                    close()
+                }
+            }
         }
     }
 
@@ -333,20 +399,21 @@ class TerminalManager(
                         .build()
                 )
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {}
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Shell 进程启动策略（三级回退）
+    // Shell 进程启动策略（集中授权 + 普通回退）
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
      * 启动 Shell 子进程，根据设备提权能力选择最优方式。
      *
-     * ## 三级回退策略
-     * 1. **Root (su)**：通过 `su` 启动 Root Shell，拥有完整系统访问权限
-     * 2. **Shizuku (ADB)**：通过 Shizuku 服务启动 ADB 级别 Shell (UID 2000)
-     * 3. **普通 (sh)**：使用 `/system/bin/sh`，权限受限于应用沙箱
+     * ## 两级回退策略
+     * 1. 请求 [RootShell] 创建经过集中授权的 Root/Shizuku Shell
+     * 2. 高权限模式关闭或不可用时，使用应用沙箱内的普通 `/system/bin/sh`
      *
      * ## 工作目录选择
      * - Root/Shizuku 模式：`/sdcard`（用户有最强的使用直觉）
@@ -356,87 +423,28 @@ class TerminalManager(
      *         ("su" / "shizuku" / "sh")
      */
     private fun startShellProcess(): Pair<Process, String> {
-        // ── 选择工作目录 ──────────────────────────────────────────────
-        // 确定一个有权限访问的默认工作目录
-        val defaultDir = context.filesDir  // 应用沙箱目录，始终有权限
-        val sdcardDir = Environment.getExternalStorageDirectory()  // /sdcard
-
-        // ── [安全修复] 仅在用户开启 rootMode 时才尝试提权 Shell ──────
-        // 修复：原实现无视 rootMode 开关，始终优先尝试 su/Shizuku，
-        // 导致用户关闭高权限模式后远程终端仍能获得 Root/ADB 权限。
-        if (rootMode) {
-            // ── 策略 1：尝试 su（Root Shell）────────────────────────────
-            try {
-                val pb = ProcessBuilder("su")
-                pb.redirectErrorStream(true)
-                pb.directory(sdcardDir)  // Root 权限下 /sdcard 更方便用户操作
-                val p = pb.start()
-                // 短暂等待让 su 有时间初始化或退出
-                Thread.sleep(200)
-                try {
-                    p.exitValue()
-                    // 能拿到 exitValue 说明 su 已退出（权限被拒绝或不存在）
-                    Logger.i("TerminalManager: su 进程秒退，尝试 Shizuku...")
-                } catch (e: IllegalThreadStateException) {
-                    // 抛出异常说明进程仍在运行 → su 启动成功！
-                    Logger.i("TerminalManager: Root Shell (su) 启动成功")
-                    return Pair(p, "su")
-                }
-            } catch (e: Exception) {
-                Logger.i("TerminalManager: su 不可用 (${e.message})，尝试 Shizuku...")
-            }
-
-            // ── 策略 2：尝试 Shizuku (ADB Shell) ──────────────────────
-            try {
-                if (isShizukuAvailableForTerminal()) {
-                    @Suppress("DEPRECATION")
-                    val method = rikka.shizuku.Shizuku::class.java.getDeclaredMethod(
-                        "newProcess",
-                        Array<String>::class.java,
-                        Array<String>::class.java,
-                        String::class.java
-                    )
-                    method.isAccessible = true
-                    // Shizuku.newProcess 第三个参数是工作目录路径
-                    val p = method.invoke(
-                        null,
-                        arrayOf("sh"),
-                        null,
-                        sdcardDir.absolutePath
-                    ) as Process
-                    Logger.i("TerminalManager: Shizuku Shell 启动成功")
-                    return Pair(p, "shizuku")
-                }
-            } catch (e: Exception) {
-                Logger.e("TerminalManager: Shizuku Shell 启动失败", e)
-            }
-        } else {
-            Logger.i("TerminalManager: rootMode=false，跳过 su/Shizuku 提权尝试")
+        val privileged = RootShell.startInteractiveShell(
+            Environment.getExternalStorageDirectory()
+        )
+        if (privileged != null) {
+            privilegedProcess = privileged
+            Logger.i("TerminalManager: 高权限 Shell (${privileged.type}) 启动成功")
+            return Pair(privileged.process, privileged.type)
         }
 
-        // ── 普通 sh（rootMode=false 或提权全部失败的回退）──────────────
         Logger.i("TerminalManager: 使用普通 sh（权限受限于应用沙箱）")
         val pb = ProcessBuilder("/system/bin/sh")
         pb.redirectErrorStream(true)
-        pb.directory(defaultDir)  // 普通模式使用应用数据目录，确保有读写权限
+        pb.directory(context.filesDir)
         val p = pb.start()
         return Pair(p, "sh")
     }
 
-    /**
-     * 检测 Shizuku 是否可用并已授权（独立于 RootShell 的检测逻辑）。
-     * 终端进程不复用 RootShell 的持久会话，而是启动独立的 Shell 进程，
-     * 因此需要独立检测 Shizuku 的可用性。
-     */
-    private fun isShizukuAvailableForTerminal(): Boolean {
-        return try {
-            rikka.shizuku.Shizuku.pingBinder()
-                    && !rikka.shizuku.Shizuku.isPreV11()
-                    && rikka.shizuku.Shizuku.checkSelfPermission() ==
-                       android.content.pm.PackageManager.PERMISSION_GRANTED
-        } catch (e: Exception) {
-            false
-        }
+    private fun startAndAttachShell(): String {
+        val (startedProcess, shellType) = startShellProcess()
+        process = startedProcess
+        shellInput = startedProcess.outputStream
+        return shellType
     }
 
     private suspend fun sendOutput(text: String) = sendOutput(text.toByteArray(Charsets.UTF_8))
@@ -449,6 +457,8 @@ class TerminalManager(
                     .setData(ByteString.copyFrom(bytes))
                     .build()
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {}
     }
 }

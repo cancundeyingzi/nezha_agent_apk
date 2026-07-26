@@ -9,14 +9,11 @@ import proto.NezhaServiceGrpcKt.NezhaServiceCoroutineStub
 import java.util.concurrent.TimeUnit
 
 fun interface SimulatedDeviceReporter {
-    suspend fun reportOne(config: SimulatedDeviceConfig)
+    suspend fun reportOne(config: SimulatedDeviceConfig, device: SimulatedDevice)
 }
 
-class GrpcSimulatedDeviceReporter(
-    private val deviceFactory: () -> SimulatedDevice = { RandomDeviceFactory.create() }
-) : SimulatedDeviceReporter {
-    override suspend fun reportOne(config: SimulatedDeviceConfig) {
-        val device = deviceFactory()
+class GrpcSimulatedDeviceReporter : SimulatedDeviceReporter {
+    override suspend fun reportOne(config: SimulatedDeviceConfig, device: SimulatedDevice) {
         val transportMode = if (config.useTls) GrpcTransportMode.TLS else GrpcTransportMode.PLAINTEXT
         val channel = GrpcChannelFactory.create(
             server = config.server,

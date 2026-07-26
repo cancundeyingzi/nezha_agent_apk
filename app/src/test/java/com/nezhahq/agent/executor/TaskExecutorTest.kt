@@ -32,7 +32,7 @@ class TaskExecutorTest {
     fun keepaliveReturnsSuccessfulEmptyResult() = runBlocking {
         val task = Task.newBuilder().setId(7L).setType(TaskTypes.KEEPALIVE).build()
 
-        val result = TaskExecutor.executeTask(task, isCommandEnabled = false)
+        val result = TaskExecutor.executeTask(task, isRemoteShellEnabled = false)
 
         assertEquals(7L, result.id)
         assertEquals(TaskTypes.KEEPALIVE, result.type)
@@ -44,11 +44,53 @@ class TaskExecutorTest {
     fun unsupportedMcpTypesReturnExplicitFailure() = runBlocking {
         val task = Task.newBuilder().setId(16L).setType(TaskTypes.FS_LIST).build()
 
-        val result = TaskExecutor.executeTask(task, isCommandEnabled = false)
+        val result = TaskExecutor.executeTask(task, isRemoteShellEnabled = false)
 
         assertEquals(TaskTypes.FS_LIST, result.type)
         assertFalse(result.successful)
         assertEquals(TaskTypes.unsupportedMessage(TaskTypes.FS_LIST), result.data)
+    }
+
+    @Test
+    fun remoteShellPolicyCoversCommandsAndInteractiveTerminalsOnly() {
+        assertTrue(
+            TaskAuthorizationPolicy.denialReason(
+                TaskTypes.COMMAND,
+                remoteShellEnabled = false
+            ) != null
+        )
+        assertTrue(
+            TaskAuthorizationPolicy.denialReason(
+                TaskTypes.TERMINAL,
+                remoteShellEnabled = false
+            ) != null
+        )
+        assertEquals(
+            null,
+            TaskAuthorizationPolicy.denialReason(
+                TaskTypes.NAT,
+                remoteShellEnabled = false
+            )
+        )
+        assertEquals(
+            null,
+            TaskAuthorizationPolicy.denialReason(
+                TaskTypes.FILE_MANAGER,
+                remoteShellEnabled = false
+            )
+        )
+    }
+
+    @Test
+    fun disabledRemoteShellRejectsInteractiveTerminal() = runBlocking {
+        val task = Task.newBuilder().setId(8L).setType(TaskTypes.TERMINAL).build()
+
+        val result = TaskExecutor.executeTask(task, isRemoteShellEnabled = false)
+
+        assertEquals(8L, result.id)
+        assertEquals(TaskTypes.TERMINAL, result.type)
+        assertFalse(result.successful)
+        assertEquals("Remote shell execution is disabled on Android Agent.", result.data)
     }
 
     @Test

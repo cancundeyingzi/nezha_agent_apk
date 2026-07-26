@@ -131,7 +131,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val isVpnTrafficCompatibilityAvailable: Boolean
         get() = VpnTrafficCompatibility.isSupported(Build.VERSION.SDK_INT)
-    /** [安全修复] 远程命令执行独立开关（与 Root/Shizuku 模式解耦） */
+    /** 远程 Shell 开关：同时控制 TaskType 4 命令与新建交互终端。 */
     var enableRemoteCommand by mutableStateOf(ConfigStore.getEnableRemoteCommand(application))
         private set
 
@@ -584,10 +584,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * 切换远程命令执行开关。
+     * 切换远程 Shell 执行开关。
      *
-     * [安全修复] 此开关与 Root/Shizuku 模式完全独立，
-     * 防止用户启用 Root 提权功能时静默授予面板远程命令执行权限。
+     * 此开关与 Root/Shizuku 模式完全独立，同时控制静默命令和交互终端；
+     * Root 模式只决定已授权 Shell 能否提权。
      */
     fun toggleRemoteCommand(enabled: Boolean) {
         persistOnIo(

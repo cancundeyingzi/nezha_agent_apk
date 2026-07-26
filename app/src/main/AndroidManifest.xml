@@ -64,6 +64,7 @@
         tools:ignore="ScopedStorage" />
 
     <application
+        android:name=".NezhaAgentApplication"
         android:allowBackup="false"
         android:label="@string/app_name"
         android:supportsRtl="true"

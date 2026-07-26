@@ -19,6 +19,7 @@ import com.nezhahq.agent.collector.SystemInfoCollector
 import com.nezhahq.agent.collector.SystemStateCollector
 import com.nezhahq.agent.executor.FileManager
 import com.nezhahq.agent.executor.NatManager
+import com.nezhahq.agent.executor.TaskAuthorizationPolicy
 import com.nezhahq.agent.executor.TaskTypes
 import com.nezhahq.agent.executor.TaskExecutor
 import com.nezhahq.agent.executor.TerminalManager
@@ -70,6 +71,14 @@ class AgentService : Service() {
     private companion object {
         private const val SHORT_TASK_WORKER_COUNT = 8
         private const val SHORT_TASK_QUEUE_CAPACITY = 64
+        private const val TASK_INPUT_BUFFER_CAPACITY = 16
+        private const val TASK_RESULT_BUFFER_CAPACITY = 8
+        private const val MAX_STREAM_SESSIONS = 36
+        private const val MAX_TERMINAL_SESSIONS = 2
+        private const val MAX_NAT_SESSIONS = 32
+        private const val MAX_FILE_MANAGER_SESSIONS = 2
+        private const val MAX_STREAM_ID_BYTES = 256
+        private const val MAX_NAT_HOST_BYTES = 1024
         private val TLS_FAILURE_MARKERS = listOf(
             "ssl",
             "tls",
@@ -324,10 +333,9 @@ class AgentService : Service() {
     }
 
     private suspend fun handleTaskStream(stub: NezhaServiceCoroutineStub) = coroutineScope {
-        val resultChannel = Channel<TaskResult>(SHORT_TASK_QUEUE_CAPACITY)
-        // 短任务使用固定 worker + 有界队列。
-        // 队列满时直接拒绝新短任务，避免阻塞 gRPC 入站流并拖住后续 8/9/11 会话任务。
+        val resultChannel = Channel<TaskResult>(TASK_RESULT_BUFFER_CAPACITY)
         val shortTaskQueue = Channel<Task>(SHORT_TASK_QUEUE_CAPACITY)
+        val streamSessions = createStreamSessionRegistry()
 
         val workerJobs = List(SHORT_TASK_WORKER_COUNT) {
             launch {
@@ -338,7 +346,9 @@ class AgentService : Service() {
         }
 
         try {
-            val taskChannel = stub.requestTask(resultChannel.receiveAsFlow()).produceIn(this)
+            val taskChannel = stub.requestTask(resultChannel.receiveAsFlow())
+                .buffer(TASK_INPUT_BUFFER_CAPACITY)
+                .produceIn(this)
             try {
                 while (isActive) {
                     val task = DashboardSessionWatchdog.receiveWithin(
@@ -346,7 +356,13 @@ class AgentService : Service() {
                         DashboardSessionWatchdog.TASK_IDLE_TIMEOUT_MS,
                         "RequestTask stream"
                     )
-                    routeIncomingTask(stub, task, shortTaskQueue, resultChannel)
+                    routeIncomingTask(
+                        stub,
+                        task,
+                        shortTaskQueue,
+                        resultChannel,
+                        streamSessions
+                    )
                 }
             } finally {
                 taskChannel.cancel()
@@ -358,113 +374,213 @@ class AgentService : Service() {
         }
     }
 
-    private fun CoroutineScope.routeIncomingTask(
+    private fun createStreamSessionRegistry(): StreamSessionRegistry =
+        StreamSessionRegistry(
+            maxTotal = MAX_STREAM_SESSIONS,
+            maxByTaskType = mapOf(
+                TaskTypes.TERMINAL to MAX_TERMINAL_SESSIONS,
+                TaskTypes.NAT to MAX_NAT_SESSIONS,
+                TaskTypes.FILE_MANAGER to MAX_FILE_MANAGER_SESSIONS
+            )
+        )
+
+    private suspend fun CoroutineScope.routeIncomingTask(
         stub: NezhaServiceCoroutineStub,
         task: Task,
         shortTaskQueue: SendChannel<Task>,
-        resultChannel: SendChannel<TaskResult>
+        resultChannel: SendChannel<TaskResult>,
+        streamSessions: StreamSessionRegistry
     ) {
-        if (task.type in TaskTypes.STREAM_TASKS) {
-            launchStreamTask(stub, task)
-        } else {
-            enqueueShortTask(task, shortTaskQueue, resultChannel)
-        }
-    }
-
-    private fun CoroutineScope.launchStreamTask(
-        stub: NezhaServiceCoroutineStub,
-        task: Task
-    ) {
-        val isRootMode = ConfigStore.getRootMode(this@AgentService)
-        when (task.type) {
-            TaskTypes.TERMINAL -> launch {
-                try {
-                    val json = org.json.JSONObject(task.data)
-                    val streamId = json.getString("StreamID")
-                    // 注意：终端会话（TaskType 8）始终允许建立连接。
-                    // enableRemoteCommand 开关仅控制 TaskType 4 的静默 sh -c 命令执行，
-                    // 终端是交互式的，安全级别由 rootMode 独立控制（是否能 su/Shizuku 提权）。
-                    Logger.i("收到终端任务 (TaskID=${task.id}, StreamID=$streamId)")
-                    val terminal = TerminalManager(
-                        this@AgentService, stub, streamId, isRootMode
-                    )
-                    terminal.run()
-                } catch (e: Exception) {
-                    if (e !is CancellationException) {
-                        Logger.e("终端任务执行失败", e)
-                    }
-                }
-            }
-            TaskTypes.NAT -> launch {
-                try {
-                    val json = org.json.JSONObject(task.data)
-                    val streamId = json.getString("StreamID")
-                    val natHost = json.getString("Host")
-                    Logger.i("收到 NAT 内网穿透任务 (TaskID=${task.id}, StreamID=$streamId, Host=$natHost)")
-                    val natManager = NatManager(stub, streamId, natHost)
-                    natManager.run()
-                } catch (e: Exception) {
-                    if (e !is CancellationException) {
-                        Logger.e("NAT 内网穿透任务执行失败", e)
-                    }
-                }
-            }
-            TaskTypes.FILE_MANAGER -> launch {
-                try {
-                    val json = org.json.JSONObject(task.data)
-                    val streamId = json.getString("StreamID")
-                    Logger.i("收到文件管理器任务 (TaskID=${task.id}, StreamID=$streamId)")
-                    val fileManager = FileManager(this@AgentService, stub, streamId)
-                    fileManager.run()
-                } catch (e: Exception) {
-                    if (e !is CancellationException) {
-                        Logger.e("文件管理器任务执行失败", e)
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * 将短任务入队到 Worker 队列。
-     *
-     * ## 背压策略
-     * - shortTaskQueue 满 → 构造失败结果并尝试非阻塞发送至 resultChannel
-     * - resultChannel 也满 → 在独立协程中挂起 send()，
-     *   既不阻塞 collect 闭包（保证 8/9/11 流式任务不被拖住），
-     *   又保证面板最终收到该任务的完成状态
-     */
-    private fun CoroutineScope.enqueueShortTask(
-        task: Task,
-        shortTaskQueue: SendChannel<Task>,
-        resultChannel: SendChannel<TaskResult>
-    ) {
-        if (shortTaskQueue.trySend(task).isSuccess) {
+        val remoteShellEnabled = ConfigStore.getEnableRemoteCommand(this@AgentService)
+        val denialReason = TaskAuthorizationPolicy.denialReason(
+            taskType = task.type,
+            remoteShellEnabled = remoteShellEnabled
+        )
+        if (denialReason != null) {
+            Logger.i(
+                "AgentService: 已拒绝未授权的远程 Shell 任务 " +
+                    "(TaskID=${task.id}, Type=${task.type})"
+            )
+            reportTaskFailure(task, denialReason, resultChannel)
             return
         }
 
-        Logger.e("AgentService: 短任务队列已满，拒绝任务 TaskID=${task.id}, Type=${task.type}")
-        val droppedResult = TaskResult.newBuilder()
-            .setId(task.id)
-            .setType(task.type)
-            .setSuccessful(false)
-            .setData("Task dropped: local short-task queue is full.")
-            .build()
-        if (!resultChannel.trySend(droppedResult).isSuccess) {
-            // resultChannel 也满：在独立协程中挂起发送，不阻塞 collect 闭包
-            Logger.e("AgentService: 结果通道暂满，异步等待上报被拒任务 TaskID=${task.id}")
-            launch {
-                resultChannel.send(droppedResult)
+        if (task.type in TaskTypes.STREAM_TASKS) {
+            launchStreamTask(stub, task, resultChannel, streamSessions)
+        } else {
+            val admission = enqueueShortTaskWithBackpressure(
+                task,
+                shortTaskQueue,
+                resultChannel
+            )
+            if (admission == ShortTaskAdmission.REJECTED_QUEUE_FULL) {
+                Logger.e(
+                    "AgentService: 短任务队列已满，已拒绝并背压上报 " +
+                        "TaskID=${task.id}, Type=${task.type}"
+                )
             }
         }
+    }
+
+    private suspend fun CoroutineScope.launchStreamTask(
+        stub: NezhaServiceCoroutineStub,
+        task: Task,
+        resultChannel: SendChannel<TaskResult>,
+        streamSessions: StreamSessionRegistry
+    ) {
+        val request = try {
+            parseStreamTask(task)
+        } catch (e: Exception) {
+            val message = "Invalid stream task: ${e.message ?: "unknown error"}"
+            Logger.e(
+                "AgentService: 流式任务参数无效 TaskID=${task.id}, Type=${task.type}",
+                e
+            )
+            reportTaskFailure(task, message, resultChannel)
+            return
+        }
+
+        val lease = when (
+            val admission = streamSessions.tryAcquire(task.type, request.streamId)
+        ) {
+            is StreamSessionAdmission.Accepted -> admission.lease
+            is StreamSessionAdmission.Rejected -> {
+                Logger.e(
+                    "AgentService: 已拒绝流式任务 TaskID=${task.id}, " +
+                        "Type=${task.type}: ${admission.reason}"
+                )
+                reportTaskFailure(task, admission.reason, resultChannel)
+                return
+            }
+        }
+
+        val sessionJob = when (request) {
+            is StreamTaskRequest.Terminal -> launchTerminalSession(stub, request)
+            is StreamTaskRequest.Nat -> launchNatSession(stub, request)
+            is StreamTaskRequest.FileManager -> launchFileManagerSession(stub, request)
+        }
+        sessionJob.invokeOnCompletion {
+            lease.close()
+        }
+    }
+
+    private fun parseStreamTask(task: Task): StreamTaskRequest {
+        val json = org.json.JSONObject(task.data)
+        val streamId = json.getString("StreamID")
+        require(streamId.isNotBlank()) { "StreamID must not be blank." }
+        require(streamId.toByteArray(Charsets.UTF_8).size <= MAX_STREAM_ID_BYTES) {
+            "StreamID exceeds the $MAX_STREAM_ID_BYTES-byte limit."
+        }
+
+        return when (task.type) {
+            TaskTypes.TERMINAL -> StreamTaskRequest.Terminal(task, streamId)
+            TaskTypes.NAT -> {
+                val host = json.getString("Host")
+                require(host.isNotBlank()) { "NAT Host must not be blank." }
+                require(host.toByteArray(Charsets.UTF_8).size <= MAX_NAT_HOST_BYTES) {
+                    "NAT Host exceeds the $MAX_NAT_HOST_BYTES-byte limit."
+                }
+                StreamTaskRequest.Nat(task, streamId, host)
+            }
+            TaskTypes.FILE_MANAGER -> StreamTaskRequest.FileManager(task, streamId)
+            else -> error("Task type ${task.type} is not a stream task.")
+        }
+    }
+
+    private fun CoroutineScope.launchTerminalSession(
+        stub: NezhaServiceCoroutineStub,
+        request: StreamTaskRequest.Terminal
+    ): Job = launch {
+        runStreamTask("终端", request.task) {
+            Logger.i(
+                "收到终端任务 (TaskID=${request.task.id}, StreamID=${request.streamId})"
+            )
+            TerminalManager(this@AgentService, stub, request.streamId).run()
+        }
+    }
+
+    private fun CoroutineScope.launchNatSession(
+        stub: NezhaServiceCoroutineStub,
+        request: StreamTaskRequest.Nat
+    ): Job = launch {
+        runStreamTask("NAT 内网穿透", request.task) {
+            Logger.i(
+                "收到 NAT 内网穿透任务 " +
+                    "(TaskID=${request.task.id}, StreamID=${request.streamId}, Host=${request.host})"
+            )
+            NatManager(stub, request.streamId, request.host).run()
+        }
+    }
+
+    private fun CoroutineScope.launchFileManagerSession(
+        stub: NezhaServiceCoroutineStub,
+        request: StreamTaskRequest.FileManager
+    ): Job = launch {
+        runStreamTask("文件管理器", request.task) {
+            Logger.i(
+                "收到文件管理器任务 " +
+                    "(TaskID=${request.task.id}, StreamID=${request.streamId})"
+            )
+            FileManager(this@AgentService, stub, request.streamId).run()
+        }
+    }
+
+    private suspend fun runStreamTask(
+        taskName: String,
+        task: Task,
+        block: suspend () -> Unit
+    ) {
+        try {
+            block()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.e(
+                "$taskName 任务执行失败 (TaskID=${task.id}, Type=${task.type})",
+                e
+            )
+        }
+    }
+
+    private suspend fun reportTaskFailure(
+        task: Task,
+        message: String,
+        resultChannel: SendChannel<TaskResult>
+    ) {
+        resultChannel.send(buildFailedTaskResult(task, message))
+    }
+
+    private sealed interface StreamTaskRequest {
+        val task: Task
+        val streamId: String
+
+        data class Terminal(
+            override val task: Task,
+            override val streamId: String
+        ) : StreamTaskRequest
+
+        data class Nat(
+            override val task: Task,
+            override val streamId: String,
+            val host: String
+        ) : StreamTaskRequest
+
+        data class FileManager(
+            override val task: Task,
+            override val streamId: String
+        ) : StreamTaskRequest
     }
 
     private suspend fun executeShortTask(
         task: Task,
         resultChannel: SendChannel<TaskResult>
     ) {
-        val isCommandEnabled = ConfigStore.getEnableRemoteCommand(this@AgentService)
-        val result = TaskExecutor.executeTask(task, isCommandEnabled = isCommandEnabled)
+        // Recheck immediately before execution so disabling the setting also rejects queued commands.
+        val remoteShellEnabled = ConfigStore.getEnableRemoteCommand(this@AgentService)
+        val result = TaskExecutor.executeTask(
+            task,
+            isRemoteShellEnabled = remoteShellEnabled
+        )
         resultChannel.send(result)
     }
 

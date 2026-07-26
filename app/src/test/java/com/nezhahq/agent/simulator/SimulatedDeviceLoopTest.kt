@@ -15,7 +15,7 @@ class SimulatedDeviceLoopTest {
         var calls = 0
         var successes = 0
         var failures = 0
-        val reporter = SimulatedDeviceReporter {
+        val reporter = SimulatedDeviceReporter { _, _ ->
             calls += 1
             if (calls == 2) error("state receipt missing")
         }
@@ -42,7 +42,7 @@ class SimulatedDeviceLoopTest {
         var calls = 0
         var now = 0L
         val delays = mutableListOf<Long>()
-        val reporter = SimulatedDeviceReporter {
+        val reporter = SimulatedDeviceReporter { _, _ ->
             calls += 1
             now += 1_500L
         }
@@ -70,7 +70,7 @@ class SimulatedDeviceLoopTest {
         val active = AtomicInteger(0)
         val maxActive = AtomicInteger(0)
         val releaseReports = CompletableDeferred<Unit>()
-        val reporter = SimulatedDeviceReporter {
+        val reporter = SimulatedDeviceReporter { _, _ ->
             val currentActive = active.incrementAndGet()
             maxActive.updateAndGet { old -> maxOf(old, currentActive) }
             if (entered.incrementAndGet() == 2) {
@@ -102,7 +102,7 @@ class SimulatedDeviceLoopTest {
         val successes = AtomicInteger(0)
         val failures = AtomicInteger(0)
         val keepRunning = AtomicBoolean(true)
-        val reporter = SimulatedDeviceReporter {
+        val reporter = SimulatedDeviceReporter { _, _ ->
             if (calls.incrementAndGet() == 1) {
                 error("state receipt missing")
             }
@@ -128,6 +128,46 @@ class SimulatedDeviceLoopTest {
         assertEquals(1, failures.get())
         assertTrue(successes.get() >= 1)
         assertTrue(calls.get() >= 2)
+    }
+
+    @Test
+    fun failedDeviceKeepsItsUuidUntilTheFullReportSucceeds() = runBlocking {
+        val devices = listOf(
+            RandomDeviceFactory.create(),
+            RandomDeviceFactory.create()
+        )
+        var generatedDevices = 0
+        var calls = 0
+        val reportedUuids = mutableListOf<String>()
+        val reporter = SimulatedDeviceReporter { _, device ->
+            calls += 1
+            reportedUuids += device.uuid
+            if (calls <= 2) error("report incomplete")
+        }
+        val loop = SimulatedDeviceLoop(
+            reporter = reporter,
+            deviceFactory = { devices[generatedDevices++] },
+            nowMs = { 0L },
+            delayNext = {}
+        )
+
+        loop.run(
+            config = validConfig(),
+            shouldContinue = { calls < 4 },
+            onSuccess = {},
+            onFailure = {}
+        )
+
+        assertEquals(
+            listOf(
+                devices[0].uuid,
+                devices[0].uuid,
+                devices[0].uuid,
+                devices[1].uuid
+            ),
+            reportedUuids
+        )
+        assertEquals(2, generatedDevices)
     }
 
     @Test

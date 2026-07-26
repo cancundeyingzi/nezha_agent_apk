@@ -1,17 +1,30 @@
 package com.nezhahq.agent.util
 
+import android.content.Context
 import android.content.pm.PackageManager
+import java.io.File
+import java.io.InputStream
 import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicBoolean
 import rikka.shizuku.Shizuku
 
 /**
- * Thread-safe persistent privileged shell. Commands are serialized through one su/Shizuku
- * process and bounded by a per-command timeout; any framing or IO failure resets the session.
+ * Process-wide privileged-shell boundary.
+ *
+ * Every su/Shizuku entry point checks the persisted root-mode setting here. Callers may still
+ * choose whether a privileged strategy is useful, but they cannot bypass the authorization
+ * decision by invoking a lower-level process API.
  */
 object RootShell {
     private const val RETRY_COOLDOWN_MS = 30_000L
     private const val MARKER_RANDOM_BYTES = 24
     private val markerRandom = SecureRandom()
+
+    @Volatile
+    private var applicationContext: Context? = null
+
+    private val managedProcessLock = Any()
+    private val managedProcesses = mutableSetOf<ManagedProcess>()
 
     private val persistentShell = PersistentShell(
         sessionFactory = ::startSession,
@@ -26,36 +39,132 @@ object RootShell {
         }
     )
 
+    private val accessGate = PrivilegedAccessGate(
+        isAllowed = {
+            applicationContext?.let { ConfigStore.getRootMode(it) } == true
+        },
+        onRevoked = ::closePrivilegedResources
+    )
+
+    /** Binds the application context used by the central root-mode policy. */
+    fun initialize(context: Context) {
+        applicationContext = context.applicationContext
+    }
+
     /** Executes [command], returning at most 4 MiB of merged stdout/stderr. */
     fun execute(command: String, timeoutMs: Long = DEFAULT_SHELL_TIMEOUT_MS): String {
+        if (!accessGate.authorize()) return ""
         return persistentShell.execute(command, timeoutMs)
     }
 
     /** Executes [command] and returns its first non-blank output line. */
     fun executeFirstLine(command: String, timeoutMs: Long = DEFAULT_SHELL_TIMEOUT_MS): String? {
-        return persistentShell.executeFirstLine(command, timeoutMs)
+        return execute(command, timeoutMs).lineSequence().firstOrNull { it.isNotBlank() }
+    }
+
+    /**
+     * Starts one independently managed interactive privileged shell.
+     *
+     * The returned process is tracked so [shutdown] or a later authorization denial can revoke it.
+     */
+    internal fun startInteractiveShell(workingDirectory: File): ManagedProcess? {
+        return startManagedShell(workingDirectory)
+    }
+
+    /**
+     * Opens stdout for one privileged command without buffering the complete result in memory.
+     * Closing the stream also destroys and unregisters its backing process.
+     */
+    internal fun openCommandInputStream(command: String): InputStream? {
+        val managed = startManagedShell(workingDirectory = null) ?: return null
+        return try {
+            managed.process.outputStream.apply {
+                write("exec $command\n".toByteArray(Charsets.UTF_8))
+                flush()
+            }
+            ManagedProcessInputStream(managed)
+        } catch (exception: Exception) {
+            managed.close()
+            Logger.e("RootShell: 启动流式高权限命令失败", exception)
+            null
+        }
     }
 
     /** Closes the process and reader executor. A later call to [execute] can start them again. */
     fun shutdown() {
-        persistentShell.shutdown()
+        accessGate.revoke()
     }
 
-    fun isAlive(): Boolean = persistentShell.isAlive()
+    fun isAlive(): Boolean = accessGate.authorize() && persistentShell.isAlive()
 
-    fun getSessionType(): String? = persistentShell.sessionType()
+    fun getSessionType(): String? {
+        if (!accessGate.authorize()) return null
+        return persistentShell.sessionType()
+    }
 
     /** Tries su first, then an authorized Shizuku shell. */
     private fun startSession(): ShellSession? {
+        if (!accessGate.authorize()) return null
+        val launched = startShellProcess(workingDirectory = null) ?: return null
+        if (!accessGate.authorize()) {
+            ShellSession.destroyProcess(launched.process)
+            return null
+        }
+        return try {
+            ShellSession.openRedirected(launched.process, launched.type)
+        } catch (exception: Exception) {
+            ShellSession.destroyProcess(launched.process)
+            throw exception
+        }
+    }
+
+    private fun startManagedShell(workingDirectory: File?): ManagedProcess? {
+        if (!accessGate.authorize()) return null
+        val launched = startShellProcess(workingDirectory) ?: return null
+        if (!accessGate.authorize()) {
+            ShellSession.destroyProcess(launched.process)
+            return null
+        }
+
+        return try {
+            // Shizuku does not expose ProcessBuilder.redirectErrorStream; configure the shell once.
+            launched.process.outputStream.apply {
+                write("exec 2>&1\n".toByteArray(Charsets.US_ASCII))
+                flush()
+            }
+            val managed = ManagedProcess(launched.process, launched.type)
+            synchronized(managedProcessLock) {
+                managedProcesses += managed
+            }
+            if (!accessGate.authorize()) {
+                managed.close()
+                null
+            } else {
+                managed
+            }
+        } catch (exception: Exception) {
+            ShellSession.destroyProcess(launched.process)
+            Logger.e("RootShell: 初始化独立高权限 Shell 失败", exception)
+            null
+        }
+    }
+
+    private fun startShellProcess(workingDirectory: File?): LaunchedShell? {
+        if (!accessGate.authorize()) return null
         var temporarySuProcess: Process? = null
         try {
-            temporarySuProcess = Runtime.getRuntime().exec("su")
+            temporarySuProcess = ProcessBuilder("su")
+                .redirectErrorStream(true)
+                .apply {
+                    if (workingDirectory != null) directory(workingDirectory)
+                }
+                .start()
             Thread.sleep(200)
             if (isProcessAlive(temporarySuProcess)) {
-                val session = ShellSession.openRedirected(temporarySuProcess, "su")
+                val launched = LaunchedShell(temporarySuProcess, "su")
                 temporarySuProcess = null
-                Logger.i("RootShell: 持久化 su 会话已建立（Root 模式）。")
-                return session
+                Logger.i("RootShell: su Shell 已建立（Root 模式）。")
+                return launched
             }
             Logger.i("RootShell: su 进程已退出（可能权限被拒绝），尝试 Shizuku 回退...")
         } catch (exception: InterruptedException) {
@@ -82,21 +191,31 @@ object RootShell {
                 String::class.java
             )
             method.isAccessible = true
-            val process = method.invoke(null, arrayOf("sh"), null, null) as Process
-            return try {
-                ShellSession.openRedirected(process, "shizuku").also {
-                    Logger.i(
-                        "RootShell: 持久化 Shizuku Shell 会话已建立" +
-                            "（ADB 模式，UID=${Shizuku.getUid()}）。"
-                    )
-                }
-            } catch (exception: Exception) {
-                ShellSession.destroyProcess(process)
-                throw exception
-            }
+            val process = method.invoke(
+                null,
+                arrayOf("sh"),
+                null,
+                workingDirectory?.absolutePath
+            ) as Process
+            Logger.i("RootShell: Shizuku Shell 已建立（ADB 模式，UID=${Shizuku.getUid()}）。")
+            return LaunchedShell(process, "shizuku")
         } catch (exception: Exception) {
             Logger.e("RootShell: Shizuku Shell 启动失败，高权限 Shell 功能不可用", exception)
             return null
+        }
+    }
+
+    private fun closePrivilegedResources() {
+        persistentShell.shutdown()
+        val processes = synchronized(managedProcessLock) {
+            managedProcesses.toList().also { managedProcesses.clear() }
+        }
+        processes.forEach(ManagedProcess::forceClose)
+    }
+
+    private fun unregister(managedProcess: ManagedProcess) {
+        synchronized(managedProcessLock) {
+            managedProcesses -= managedProcess
         }
     }
 
@@ -133,5 +252,73 @@ object RootShell {
             hex[index * 2 + 1] = alphabet[value and 0x0f]
         }
         return String(hex)
+    }
+
+    private data class LaunchedShell(
+        val process: Process,
+        val type: String
+    )
+
+    internal class ManagedProcess internal constructor(
+        val process: Process,
+        val type: String
+    ) : AutoCloseable {
+        private val closed = AtomicBoolean()
+
+        override fun close() {
+            if (!closed.compareAndSet(false, true)) return
+            unregister(this)
+            ShellSession.destroyProcess(process)
+        }
+
+        internal fun forceClose() {
+            if (!closed.compareAndSet(false, true)) return
+            ShellSession.destroyProcess(process)
+        }
+    }
+
+    private class ManagedProcessInputStream(
+        private val managedProcess: ManagedProcess
+    ) : InputStream() {
+        private val delegate = managedProcess.process.inputStream
+
+        override fun read(): Int = delegate.read()
+
+        override fun read(buffer: ByteArray): Int = delegate.read(buffer)
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+            delegate.read(buffer, offset, length)
+
+        override fun available(): Int = delegate.available()
+
+        override fun close() {
+            managedProcess.close()
+        }
+    }
+}
+
+/**
+ * Tracks authorization transitions so already-issued privileged resources are revoked once when
+ * access changes from allowed to denied.
+ */
+internal class PrivilegedAccessGate(
+    private val isAllowed: () -> Boolean,
+    private val onRevoked: () -> Unit
+) {
+    private val previouslyAllowed = AtomicBoolean()
+
+    fun authorize(): Boolean {
+        val allowed = isAllowed()
+        if (allowed) {
+            previouslyAllowed.set(true)
+        } else if (previouslyAllowed.getAndSet(false)) {
+            onRevoked()
+        }
+        return allowed
+    }
+
+    fun revoke() {
+        previouslyAllowed.set(false)
+        onRevoked()
     }
 }
