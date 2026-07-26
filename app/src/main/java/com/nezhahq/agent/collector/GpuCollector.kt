@@ -7,9 +7,13 @@ import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.os.Build
+import android.os.SystemClock
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
 import java.io.File
+
+private const val DUMPSYS_THROTTLE_MS = 5_000L
+private const val PRIVILEGED_UNAVAILABLE_RETRY_MS = 30_000L
 
 /**
  * GPU 数据采集器（独立模块，单一职责）。
@@ -50,19 +54,26 @@ internal data class GpuProbeResult(
 /**
  * Keeps normal and privileged strategy decisions independent for one collector instance.
  */
-internal class GpuModeStrategyCache {
+internal class GpuModeStrategyCache(
+    private val monotonicTimeMs: () -> Long = { System.nanoTime() / 1_000_000L },
+    private val privilegedUnavailableRetryMs: Long = PRIVILEGED_UNAVAILABLE_RETRY_MS
+) {
     private var normalStrategy: GpuCollectionStrategy? = null
     private var privilegedStrategy: GpuCollectionStrategy? = null
+    private var privilegedUnavailableAtMs: Long? = null
 
     fun collect(
         isPrivileged: Boolean,
         readCached: (GpuCollectionStrategy) -> List<Double>,
         probe: () -> GpuProbeResult
     ): List<Double> = synchronized(this) {
-        strategyFor(isPrivileged)?.let(readCached) ?: probe().let { result ->
-            setStrategy(isPrivileged, result.strategy)
-            result.usages
+        val strategy = strategyFor(isPrivileged)
+        if (strategy == null || shouldRetryUnavailable(isPrivileged, strategy)) {
+            return@synchronized probe().also { result ->
+                cacheProbeResult(isPrivileged, result.strategy)
+            }.usages
         }
+        readCached(strategy)
     }
 
     fun current(isPrivileged: Boolean): GpuCollectionStrategy? = synchronized(this) {
@@ -71,11 +82,13 @@ internal class GpuModeStrategyCache {
 
     fun clear(isPrivileged: Boolean) = synchronized(this) {
         setStrategy(isPrivileged, null)
+        if (isPrivileged) privilegedUnavailableAtMs = null
     }
 
     fun clearAll() = synchronized(this) {
         normalStrategy = null
         privilegedStrategy = null
+        privilegedUnavailableAtMs = null
     }
 
     private fun strategyFor(isPrivileged: Boolean): GpuCollectionStrategy? {
@@ -92,16 +105,74 @@ internal class GpuModeStrategyCache {
             normalStrategy = strategy
         }
     }
+
+    private fun cacheProbeResult(
+        isPrivileged: Boolean,
+        strategy: GpuCollectionStrategy
+    ) {
+        setStrategy(isPrivileged, strategy)
+        if (isPrivileged) {
+            privilegedUnavailableAtMs = if (strategy == GpuCollectionStrategy.UNAVAILABLE) {
+                monotonicTimeMs()
+            } else {
+                null
+            }
+        }
+    }
+
+    private fun shouldRetryUnavailable(
+        isPrivileged: Boolean,
+        strategy: GpuCollectionStrategy
+    ): Boolean {
+        if (!isPrivileged || strategy != GpuCollectionStrategy.UNAVAILABLE) return false
+        val unavailableAt = privilegedUnavailableAtMs ?: return true
+        val elapsed = monotonicTimeMs() - unavailableAt
+        return elapsed < 0L || elapsed >= privilegedUnavailableRetryMs
+    }
 }
 
-class GpuCollector {
+/**
+ * Caches and throttles dumpsys samples, including the sample that selected dumpsys initially.
+ */
+internal class GpuDumpsysThrottle(
+    private val monotonicTimeMs: () -> Long,
+    private val throttleMs: Long = DUMPSYS_THROTTLE_MS
+) {
+    private var lastSampleAtMs: Long? = null
+    private var lastResult: Double? = null
+
+    fun recordInitial(result: Double) = synchronized(this) {
+        lastSampleAtMs = monotonicTimeMs()
+        lastResult = result
+    }
+
+    fun read(reader: () -> Double?): Double? = synchronized(this) {
+        val now = monotonicTimeMs()
+        val sampledAt = lastSampleAtMs
+        if (sampledAt != null && now >= sampledAt && now - sampledAt < throttleMs) {
+            return@synchronized lastResult
+        }
+
+        reader().also { result ->
+            lastSampleAtMs = now
+            lastResult = result
+        }
+    }
+
+    fun reset() = synchronized(this) {
+        lastSampleAtMs = null
+        lastResult = null
+    }
+}
+
+class GpuCollector internal constructor(
+    monotonicTimeMs: () -> Long = { SystemClock.elapsedRealtime() },
+    privilegedUnavailableRetryMs: Long = PRIVILEGED_UNAVAILABLE_RETRY_MS
+) {
 
     // ══════════════════════════════════════════════════════════════════════════
     // 常量
     // ══════════════════════════════════════════════════════════════════════════
-
-    /** P2 dumpsys 节流间隔（毫秒）：dumpsys 单次耗时 50~200ms，不宜高频调用 */
-    private val dumpsysThrottleMs = 5000L
 
     /**
      * 已知 GPU 厂商路径数据库。
@@ -188,19 +259,21 @@ class GpuCollector {
     /** 缓存的 GPU 厂商名称（GL_VENDOR），如 "Qualcomm"，用于路径优先匹配 */
     @Volatile private var cachedGpuVendor: String? = null
 
-    private class ModeState {
+    private class ModeState(monotonicTimeMs: () -> Long) {
         @Volatile var sysfsPath: String? = null
         @Volatile var parser: ((String) -> Double?)? = null
         @Volatile var directReadFailed = false
         @Volatile var probeCompleted = false
         @Volatile var unavailableWarned = false
-        @Volatile var lastDumpsysTimeMs = 0L
-        @Volatile var lastDumpsysResult: Double? = null
+        val dumpsysThrottle = GpuDumpsysThrottle(monotonicTimeMs)
     }
 
-    private val normalState = ModeState()
-    private val privilegedState = ModeState()
-    private val strategyCache = GpuModeStrategyCache()
+    private val normalState = ModeState(monotonicTimeMs)
+    private val privilegedState = ModeState(monotonicTimeMs)
+    private val strategyCache = GpuModeStrategyCache(
+        monotonicTimeMs = monotonicTimeMs,
+        privilegedUnavailableRetryMs = privilegedUnavailableRetryMs
+    )
 
     // ══════════════════════════════════════════════════════════════════════════
     // 公开 API：GPU 型号名称
@@ -277,15 +350,14 @@ class GpuCollector {
         strategyCache.current(isRootMode)
     ) {
         GpuCollectionStrategy.DIRECT, GpuCollectionStrategy.SHELL_FS -> 2000L
-        GpuCollectionStrategy.DUMPSYS -> dumpsysThrottleMs
+        GpuCollectionStrategy.DUMPSYS -> DUMPSYS_THROTTLE_MS
         GpuCollectionStrategy.UNAVAILABLE, null -> Long.MAX_VALUE
     }
 
     /**
      * 清理所有缓存，强制下次调用时重新探测。
      *
-     * 应在 AgentService.onDestroy() 中调用，确保服务重启时
-     * 重新适配（例如用户在运行期间切换了 Root 模式）。
+     * 仅影响当前实例，可用于要求立即重新探测的显式恢复流程。
      */
     fun resetCache() {
         // 型号名称不清理（硬件不变），仅清理路径和策略缓存
@@ -301,8 +373,7 @@ class GpuCollector {
         state.directReadFailed = false
         state.probeCompleted = false
         state.unavailableWarned = false
-        state.lastDumpsysTimeMs = 0L
-        state.lastDumpsysResult = null
+        state.dumpsysThrottle.reset()
     }
 
     private fun stateFor(isPrivileged: Boolean): ModeState {
@@ -425,6 +496,11 @@ class GpuCollector {
      * @return 本次探测的 GPU 使用率列表
      */
     private fun probeAndRead(isRootMode: Boolean, state: ModeState): GpuProbeResult {
+        // A privileged negative-cache retry must repeat dynamic discovery as well as known paths.
+        if (isRootMode && state.probeCompleted) {
+            state.probeCompleted = false
+        }
+
         // ── P0: Direct sysfs 直读（极速通道）──────────────────────────────
         // 仅在 Android 9 以下（SELinux untrusted_app 限制较松）时尝试
         if (!state.directReadFailed && Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
@@ -466,6 +542,7 @@ class GpuCollector {
         // ── P2: dumpsys gpu 兜底 ─────────────────────────────────────────
         val p2Result = readDumpsysInternal()
         if (p2Result != null) {
+            state.dumpsysThrottle.recordInitial(p2Result)
             Logger.i("GpuCollector: P2 dumpsys 解析成功")
             return GpuProbeResult(GpuCollectionStrategy.DUMPSYS, listOf(p2Result))
         }
@@ -698,15 +775,7 @@ class GpuCollector {
      * 避免高频 dumpsys 调用（单次耗时 50~200ms）。
      */
     private fun readDumpsys(state: ModeState): List<Double> {
-        val now = System.currentTimeMillis()
-        if (now - state.lastDumpsysTimeMs < dumpsysThrottleMs) {
-            // 节流期内，返回上次缓存的值
-            return state.lastDumpsysResult?.let { listOf(it) } ?: emptyList()
-        }
-
-        val result = readDumpsysInternal()
-        state.lastDumpsysTimeMs = now
-        state.lastDumpsysResult = result
+        val result = state.dumpsysThrottle.read(::readDumpsysInternal)
         return result?.let { listOf(it) } ?: emptyList()
     }
 
