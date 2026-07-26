@@ -9,15 +9,14 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.nezhahq.agent.collector.GeoIpCollector
 import com.nezhahq.agent.collector.GpuCollector
 import com.nezhahq.agent.collector.SystemInfoCollector
 import com.nezhahq.agent.collector.SystemStateCollector
+import com.nezhahq.agent.core.model.KeepAliveSettings
 import com.nezhahq.agent.core.model.RemoteCapabilities
 import com.nezhahq.agent.executor.FileManager
 import com.nezhahq.agent.executor.NatManager
@@ -28,9 +27,8 @@ import com.nezhahq.agent.executor.TerminalManager
 import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.grpc.GrpcManager
 import com.nezhahq.agent.grpc.GrpcTransportMode
+import com.nezhahq.agent.service.keepalive.KeepAliveController
 import com.nezhahq.agent.util.ConfigStore
-import com.nezhahq.agent.util.FloatWindowManager
-import com.nezhahq.agent.util.KeepAliveAudioPlayer
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
 import com.nezhahq.agent.util.StorageStatus
@@ -58,14 +56,12 @@ class AgentService : Service() {
         Logger.e("AgentService: 协程未捕获异常（已兜底，不闪退）", throwable)
     }
     private val scope = CoroutineScope(Dispatchers.IO + job + exceptionHandler)
-    
-    private var wakeLock: PowerManager.WakeLock? = null
+
+    private var keepAliveController: KeepAliveController? = null
     private val gpuCollector = GpuCollector()
     private val stateCollector by lazy {
         SystemStateCollector(this, gpuCollector, Dispatchers.IO)
     }
-    private val audioPlayer = KeepAliveAudioPlayer()
-
     // ── [修复问题5] 保存 NetworkCallback 引用，以便在 onDestroy 中注销 ──────
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var connectivityManager: ConnectivityManager? = null
@@ -102,6 +98,7 @@ class AgentService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        keepAliveController = KeepAliveController.create(this, scope)
         // Enter foreground before configuration IO. This notification-only step does not start
         // agent business work.
         startAgentForeground("正在读取连接配置...")
@@ -136,15 +133,14 @@ class AgentService : Service() {
             return
         }
 
-        if (audioEnabled) {
-            Logger.i("AgentService: 启用无声音频保活机制")
-            audioPlayer.start()
+        val keepAliveSettings = KeepAliveSettings(
+            audio = audioEnabled,
+            overlay = floatWindowEnabled,
+            vpn = vpnEnabled
+        )
+        scope.launch(Dispatchers.Main.immediate) {
+            keepAliveController?.reconfigure(keepAliveSettings)
         }
-        if (floatWindowEnabled) {
-            Logger.i("AgentService: 启用悬浮窗保活机制")
-            FloatWindowManager.show(this)
-        }
-        acquireWakeLock()
 
         // ── 清理上次可能因 App Crash 遗留的临时上传文件 ───────────────────
         // FileManager 上传时使用 cacheDir/nezha_upload_{time}.tmp 作为中转，
@@ -164,28 +160,6 @@ class AgentService : Service() {
         setupNetworkListener()
         startWorkLoop()
 
-        // ── VPN 流量兼容服务 ──────────────────────────────────────────────────
-        Logger.i("AgentService: VPN 流量兼容配置 = $vpnEnabled")
-        if (vpnEnabled) {
-            // 占位 VPN 兼容行为仅保留在 Android 12 以下。
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                Logger.i("AgentService: VPN 流量兼容模式仅适用于 Android 12 以下，跳过启动")
-            } else {
-                try {
-                    val prepareIntent = VpnService.prepare(this)
-                    if (prepareIntent == null) {
-                        // VPN 已被用户授权，直接启动兼容服务
-                        val vpnIntent = Intent(this, TrafficVpnService::class.java)
-                        startService(vpnIntent)
-                        Logger.i("AgentService: VPN 流量兼容服务已启动")
-                    } else {
-                        Logger.i("AgentService: VPN 流量兼容已启用但权限未授权（需在工具页重新开启开关以触发授权），跳过启动")
-                    }
-                } catch (e: Exception) {
-                    Logger.e("AgentService: VPN 流量兼容服务启动异常", e)
-                }
-            }
-        }
     }
 
     private fun startAgentForeground(statusText: String) {
@@ -700,14 +674,6 @@ class AgentService : Service() {
         }
     }
 
-    // ── [修复问题4] WakeLock 无超时，由 onDestroy 显式释放 ──────────────────
-    // 原实现使用 24 小时超时，长期运行的 agent 会在 24 小时后失去保活条件
-    private fun acquireWakeLock() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "NezhaAgent::BgWakeLock")
-        wakeLock?.acquire() // 无超时，由 onDestroy 释放
-    }
-
     /**
      * 创建前台服务通知。
      *
@@ -752,10 +718,11 @@ class AgentService : Service() {
     override fun onDestroy() {
         Logger.i("Service is being destroyed globally by system or user intent.")
         super.onDestroy()
-        audioPlayer.stop()
-        FloatWindowManager.hide(this)
+        runBlocking {
+            keepAliveController?.close()
+        }
+        keepAliveController = null
         job.cancel()
-        wakeLock?.let { if (it.isHeld) it.release() }
 
         // [修复问题5] 注销 NetworkCallback，防止泄漏和重复回调
         networkCallback?.let { callback ->
@@ -772,9 +739,5 @@ class AgentService : Service() {
         // 关闭持久化 Root Shell 会话，释放后台 su 进程资源，防止进程泄漏
         RootShell.shutdown()
         Logger.i("RootShell persistent session closed.")
-        // 停止 VPN 流量兼容服务（若正在运行）
-        try {
-            stopService(Intent(this, TrafficVpnService::class.java))
-        } catch (_: Exception) {}
     }
 }
