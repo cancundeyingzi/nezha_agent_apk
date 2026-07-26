@@ -15,7 +15,6 @@ android {
         versionCode = 380
         versionName = "A0.9.12"
 
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
         }
@@ -100,12 +99,10 @@ dependencies {
     compileOnly("org.apache.tomcat:annotations-api:6.0.53") // For javax.annotation.Generated
 
     testImplementation("junit:junit:4.13.2")
-    androidTestImplementation("androidx.test.ext:junit:1.1.5")
-    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
-    androidTestImplementation(platform("androidx.compose:compose-bom:2024.02.00"))
-    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    // No androidTest dependencies: there is no app/src/androidTest source set. Espresso and
+    // compose-ui-test were declared but never used, which made the project look like it had
+    // instrumented coverage. Add them back alongside the first test that needs them.
     debugImplementation("androidx.compose.ui:ui-tooling")
-    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
 
 protobuf {

@@ -1,0 +1,29 @@
+<!--
+    Launcher icon for API 23-25, which predate adaptive icons. API 26+ resolves
+    mipmap-anydpi-v26/ic_launcher.xml instead, which layers the same artwork so both look alike.
+
+    A vector rather than the usual density-bucketed PNGs: the shape is a handful of arcs, and
+    shipping one file keeps the two variants from drifting apart.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+
+    <path
+        android:fillColor="#FF006575"
+        android:pathData="M0,0h48v48h-48z" />
+
+    <group android:translateX="12" android:translateY="12">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M12,17.5m-2,0a2,2 0 1,0 4,0a2,2 0 1,0 -4,0" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M8.11,13.6a1,1 0 0,1 -0.71,-1.71a6.5,6.5 0 0,1 9.2,0a1,1 0 1,1 -1.42,1.42a4.5,4.5 0 0,0 -6.36,0a1,1 0 0,1 -0.71,0.29z" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M4.93,10.43a1,1 0 0,1 -0.71,-1.71a11,11 0 0,1 15.56,0a1,1 0 1,1 -1.42,1.42a9,9 0 0,0 -12.72,0a1,1 0 0,1 -0.71,0.29z" />
+    </group>
+</vector>

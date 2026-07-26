@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches LgPrimary in EtherDesignSystem, so the launcher icon and the app agree. -->
+    <color name="ic_launcher_background">#FF006575</color>
+</resources>

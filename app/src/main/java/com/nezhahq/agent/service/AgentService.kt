@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.nezhahq.agent.R
 import com.nezhahq.agent.appContainer
 import com.nezhahq.agent.grpc.ManagedGrpcConnection
 import com.nezhahq.agent.util.Logger
@@ -169,7 +170,7 @@ class AgentService : Service() {
         NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("Nezha Agent Running")
             .setContentText(statusText)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(R.drawable.ic_notification)
             .build()
 
     private fun updateNotification(statusText: String) {
