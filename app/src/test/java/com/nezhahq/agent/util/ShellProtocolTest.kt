@@ -183,7 +183,15 @@ class ShellProtocolTest {
         }
     }
 
-    @Test
+    /**
+     * Shutdown must not wait out an in-flight command's timeout.
+     *
+     * The blocked command is given 120 seconds, so a shutdown that waited for it would hang here.
+     * The method timeout turns that into a deterministic failure. It replaces a wall-clock
+     * assertion that shutdown returned within a second, which measured the machine rather than the
+     * code and reddened on any GC pause.
+     */
+    @Test(timeout = 30_000)
     fun shutdownInterruptsLongCommandAndAllowsLaterRebuild() {
         val blockedMarker = marker("shutdown_blocked")
         val rebuiltMarker = marker("shutdown_rebuilt")
@@ -213,11 +221,8 @@ class ShellProtocolTest {
             }
             assertTrue(blockedInput.awaitReadStarted())
 
-            val startedNs = System.nanoTime()
             shell.shutdown()
-            val shutdownMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)
 
-            assertTrue("shutdown took ${shutdownMs}ms", shutdownMs < 1_000)
             assertEquals("", command.get(1, TimeUnit.SECONDS))
             assertTrue(blockedProcess.destroyed)
             assertEquals(1, blockedProcess.destroyCalls.get())
@@ -264,7 +269,15 @@ class ShellProtocolTest {
             racingInput.release()
 
             shutdown.get(1, TimeUnit.SECONDS)
-            assertTrue(first.get(1, TimeUnit.SECONDS) in setOf("", "finished"))
+            // Whichever side of the race wins is legitimate: "finished" if the read completed
+            // first, "" if the shutdown did. Accepting both is the point — what must not happen is
+            // the call hanging, throwing, or returning something else. The assertion that carries
+            // this test is the next one.
+            val racingResult = first.get(1, TimeUnit.SECONDS)
+            assertTrue(
+                "racing command returned <$racingResult>",
+                racingResult in setOf("", "finished")
+            )
             assertEquals("next", shell.execute("next-command", timeoutMs = 1_000))
             assertFalse(nextProcess.destroyed)
         } finally {

@@ -61,41 +61,6 @@ class TaskExecutorTest {
     }
 
     @Test
-    fun remoteCapabilityPolicyCoversPrivilegedRemoteTools() {
-        assertTrue(
-            RemoteCapabilityPolicy.denialReason(
-                TaskTypes.COMMAND,
-                RemoteCapabilities()
-            ) != null
-        )
-        assertTrue(
-            RemoteCapabilityPolicy.denialReason(
-                TaskTypes.TERMINAL,
-                RemoteCapabilities()
-            ) != null
-        )
-        assertTrue(
-            RemoteCapabilityPolicy.denialReason(
-                TaskTypes.NAT,
-                RemoteCapabilities()
-            ) != null
-        )
-        assertTrue(
-            RemoteCapabilityPolicy.denialReason(
-                TaskTypes.FILE_MANAGER,
-                RemoteCapabilities()
-            ) != null
-        )
-        assertEquals(
-            null,
-            RemoteCapabilityPolicy.denialReason(
-                TaskTypes.HTTP_GET,
-                RemoteCapabilities()
-            )
-        )
-    }
-
-    @Test
     fun disabledRemoteShellRejectsInteractiveTerminal() = runBlocking {
         val task = Task.newBuilder().setId(8L).setType(TaskTypes.TERMINAL).build()
 

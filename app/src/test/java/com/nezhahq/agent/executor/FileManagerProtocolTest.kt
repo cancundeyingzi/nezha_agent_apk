@@ -125,7 +125,12 @@ class FileManagerProtocolTest {
 
         try {
             withTimeout(TEST_TIMEOUT_MS) { firstRead.await() }
-            delay(100)
+            // Nothing collects the outgoing flow, so a correct download blocks on send after one
+            // buffer and never reads again. Proving a read does not happen needs a window to
+            // observe across; this one only has to be long enough that an unbounded reader would
+            // have run away with a 10-buffer source. A fully deterministic version would need
+            // FileManager to take an injectable dispatcher, which it does not.
+            delay(READ_AHEAD_SETTLE_MS)
             assertEquals(
                 "download continued reading while its bounded output channel was full",
                 1,
@@ -286,6 +291,9 @@ class FileManagerProtocolTest {
     private companion object {
         const val BUFFER_SIZE = 1024 * 1024
         const val TEST_TIMEOUT_MS = 5_000L
+
+        /** How long a runaway reader is given to reveal itself; see the read-ahead test. */
+        const val READ_AHEAD_SETTLE_MS = 250L
         val FILE_DATA_MAGIC = byteArrayOf(0x4E, 0x5A, 0x54, 0x44)
     }
 }

@@ -1,12 +1,18 @@
-package com.nezhahq.agent.util
+package com.nezhahq.agent.core.security
 
-import com.nezhahq.agent.core.security.PrivilegedAccessController
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class RootShellPolicyTest {
+/**
+ * Covers [PrivilegedAccessController] only.
+ *
+ * This lived in `:app` under the name RootShellPolicyTest, in RootShell's own package, which made
+ * it read as coverage of RootShell. RootShell has none: it is a process-wide object that builds a
+ * real shell on touch, so nothing exercises its authorization checks or its su/Shizuku fallback.
+ */
+class PrivilegedAccessControllerTest {
     @Test
     fun disableRevokesResourcesOncePerEnabledTransition() {
         var revocations = 0

@@ -2,6 +2,7 @@ package com.nezhahq.agent.core.model
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 /**
@@ -45,10 +46,29 @@ class AgentConfigValidationTest {
         assertNull(AgentConfig.validationError(server = "host", portText = " 5555 ", secret = "s"))
     }
 
-    /** The blank one is filled in for the user, so it must not be reported as an error. */
+    /**
+     * Passing validation is not the same as being buildable.
+     *
+     * [AgentConfig.validationError] takes no UUID at all, because a blank one is filled in for the
+     * user rather than reported back. The constructor still rejects a blank UUID, so a caller that
+     * forwards a validated form straight through without generating one gets an exception instead
+     * of a message it can show. Asserting only that validation passes — which the previous version
+     * of this test did, with a call identical to [aCompleteConnectionPasses] — cannot catch that.
+     */
     @Test
-    fun aBlankUuidIsNotTreatedAsAValidationFailure() {
+    fun aFormThatPassesValidationStillNeedsAUuidBeforeItCanBuildAConfig() {
         assertNull(AgentConfig.validationError(server = "host", portText = "5555", secret = "s"))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            AgentConfig(
+                server = "host",
+                port = 5555,
+                secret = "s",
+                uuid = "",
+                useTls = true,
+                rootMode = false
+            )
+        }
     }
 
     @Test

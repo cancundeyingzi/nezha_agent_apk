@@ -33,16 +33,17 @@ import com.nezhahq.agent.grpc.GrpcConnectionState
 import com.nezhahq.agent.service.AgentService
 import com.nezhahq.agent.simulator.GrpcSimulatedDeviceReporter
 import com.nezhahq.agent.simulator.SimulatedDeviceLoop
+import com.nezhahq.agent.ui.ClipboardConfigParser
+import com.nezhahq.agent.ui.ParsedUuid
 import com.nezhahq.agent.ui.UiEvent
+import com.nezhahq.agent.ui.UiEvents
 import com.nezhahq.agent.util.RootShell
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -194,10 +195,10 @@ class MainViewModel(
     // 一次性 UI 事件
     // ══════════════════════════════════════════════════════════════════════════
 
-    private val _events = Channel<UiEvent>(Channel.BUFFERED)
+    private val uiEvents = UiEvents()
 
     /** Transient messages for the presenter to show; see [UiEvent]. */
-    val events: Flow<UiEvent> = _events.receiveAsFlow()
+    val events: Flow<UiEvent> = uiEvents.flow
 
     /**
      * Whether configuration may be edited right now.
@@ -208,13 +209,9 @@ class MainViewModel(
     val canEditConfig: Boolean
         get() = isConfigStorageAvailable && !isConfigWriteInProgress
 
-    private fun notify(text: String) {
-        _events.trySend(UiEvent.Message(text))
-    }
+    private fun notify(text: String) = uiEvents.send(text)
 
-    private fun notifyLong(text: String) {
-        _events.trySend(UiEvent.LongMessage(text))
-    }
+    private fun notifyLong(text: String) = uiEvents.sendLong(text)
 
     // ══════════════════════════════════════════════════════════════════════════
     // 业务方法
@@ -244,53 +241,28 @@ class MainViewModel(
             return
         }
 
-        // Legacy flag based params
-        val sMatch = Regex("-s\\s+([^:\\s]+):(\\d+)").find(input)
-        if (sMatch != null) {
-            server = sMatch.groupValues[1]
-            port = sMatch.groupValues[2]
-        } else {
-            val sMatch2 = Regex("-s\\s+([^\\s:]+)").find(input)
-            if (sMatch2 != null) server = sMatch2.groupValues[1]
-        }
-
-        val pMatch = Regex("-p\\s+([^\\s]+)").find(input)
-        if (pMatch != null) secret = pMatch.groupValues[1]
-
-        if (Regex("(^|\\s)--tls(\\s|$)").containsMatchIn(input)) {
-            useTls = true
-        }
-        if (Regex("(^|\\s)--(no-tls|disable-tls)(\\s|$)").containsMatchIn(input)) {
-            useTls = false
-        }
-
-        // New Dashboard Script logic (Environment variable based mapping)
-        val envServerMatch = Regex("NZ_SERVER=([^:\\s]+):(\\d+)").find(input)
-        if (envServerMatch != null) {
-            server = envServerMatch.groupValues[1]
-            port = envServerMatch.groupValues[2]
-        }
-        val envSecretMatch = Regex("NZ_CLIENT_SECRET=([^\\s]+)").find(input)
-        if (envSecretMatch != null) secret = envSecretMatch.groupValues[1]
-
-        val envUuidMatch = Regex("NZ_UUID=([^\\s]+)").find(input)
-        if (envUuidMatch != null) {
-            val parsedUuid = envUuidMatch.groupValues[1].replace(Regex("^['\"]|['\"]$"), "")
-            if (parsedUuid.isNotBlank() && parsedUuid != "\\") {
-                uuid = parsedUuid
-            } else {
-                uuid = java.util.UUID.randomUUID().toString()
-            }
-        } else if (uuid.isBlank() || uuid == "''" || uuid == "\"\"") {
-            uuid = java.util.UUID.randomUUID().toString()
-        }
-
-        val envTlsMatch = Regex("NZ_TLS=([^\\s]+)").find(input)
-        if (envTlsMatch != null) {
-            parseBooleanLike(envTlsMatch.groupValues[1])?.let { useTls = it }
-        }
+        val parsed = ClipboardConfigParser.parse(input)
+        parsed.server?.let { server = it }
+        parsed.port?.let { port = it }
+        parsed.secret?.let { secret = it }
+        parsed.useTls?.let { useTls = it }
+        uuid = resolveUuid(parsed.uuid)
 
         notify("配置已解析完成")
+    }
+
+    /**
+     * Settles on the UUID to use after a paste.
+     *
+     * A script that named one wins. A script that declared an empty one is asking for a fresh UUID.
+     * A script that said nothing leaves the configured UUID alone — unless there is nothing usable
+     * there either, in which case one is generated so the user never has to supply it by hand.
+     */
+    private fun resolveUuid(parsed: ParsedUuid): String = when (parsed) {
+        is ParsedUuid.Found -> parsed.value
+        ParsedUuid.Placeholder -> newUuid()
+        ParsedUuid.Absent ->
+            if (uuid.isBlank() || uuid == "''" || uuid == "\"\"") newUuid() else uuid
     }
 
     fun setKeepAliveAudio(enabled: Boolean) {
@@ -348,8 +320,7 @@ class MainViewModel(
         }
 
         val cleanedUuid = uuid.trim().replace(Regex("^['\"]|['\"]$"), "")
-        val uuidToSave = cleanedUuid.takeUnless { it.isBlank() || it == "\\" }
-            ?: java.util.UUID.randomUUID().toString()
+        val uuidToSave = cleanedUuid.takeUnless { it.isBlank() || it == "\\" } ?: newUuid()
         val draftToSave = ConnectionDraft(
             server = server,
             port = port.trim().toInt(),
@@ -816,19 +787,6 @@ class MainViewModel(
         }
     }
 
-    private fun parseBooleanLike(rawValue: String): Boolean? {
-        val normalized = rawValue
-            .trim()
-            .trim('\'', '"')
-            .trimEnd(';')
-            .lowercase()
-        return when (normalized) {
-            "true", "1", "yes", "on" -> true
-            "false", "0", "no", "off" -> false
-            else -> null
-        }
-    }
-
     private fun requireConfigStorage(action: String): Boolean {
         storageStatus = repository.storageStatus()
         if (isConfigStorageAvailable) return true
@@ -980,6 +938,8 @@ class MainViewModel(
 
 private const val CONFIG_STORAGE_UNAVAILABLE_MESSAGE =
     "配置存储不可用，连接信息不会写入；请重置配置存储"
+
+private fun newUuid(): String = java.util.UUID.randomUUID().toString()
 
 private fun Throwable.toSimulatorMessage(): String {
     val message = generateSequence(this) { it.cause }
