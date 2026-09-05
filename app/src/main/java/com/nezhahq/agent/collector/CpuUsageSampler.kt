@@ -3,26 +3,35 @@ package com.nezhahq.agent.collector
 /** Stateful `/proc/stat` sampler. A valid baseline is required before usage is reported. */
 internal class CpuUsageSampler {
     private var baseline: CpuCounters? = null
+    private var lastUsage = 0.0
+    private var consecutiveInvalidSamples = 0
 
     fun sample(line: String?): Double {
         val current = parse(line)
         if (current == null) {
-            baseline = null
-            return 0.0
+            if (consecutiveInvalidSamples++ >= MAX_TOLERATED_INVALID_SAMPLES) {
+                baseline = null
+                lastUsage = 0.0
+                consecutiveInvalidSamples = 0
+            }
+            return lastUsage
         }
 
+        consecutiveInvalidSamples = 0
         val previous = baseline
         baseline = current
         if (previous == null || current.values.indices.any { current.values[it] < previous.values[it] }) {
-            return 0.0
+            lastUsage = 0.0
+            return lastUsage
         }
 
         val totalDelta = current.total - previous.total
         val idleDelta = current.idle - previous.idle
-        if (totalDelta <= 0L || idleDelta < 0L || idleDelta > totalDelta) return 0.0
+        if (totalDelta <= 0L || idleDelta < 0L || idleDelta > totalDelta) return lastUsage
 
-        return ((totalDelta - idleDelta).toDouble() * 100.0 / totalDelta.toDouble())
+        lastUsage = ((totalDelta - idleDelta).toDouble() * 100.0 / totalDelta.toDouble())
             .coerceIn(0.0, 100.0)
+        return lastUsage
     }
 
     private fun parse(line: String?): CpuCounters? {
@@ -43,10 +52,7 @@ internal class CpuUsageSampler {
         return CpuCounters(values, total, idle)
     }
 
-    private fun addWithoutOverflow(left: Long, right: Long): Long? =
-        if (right > Long.MAX_VALUE - left) null else left + right
-
-    private data class CpuCounters(
+    private class CpuCounters(
         val values: LongArray,
         val total: Long,
         val idle: Long
@@ -58,5 +64,6 @@ internal class CpuUsageSampler {
         const val COUNTER_COUNT = 8
         const val IDLE_INDEX = 3
         const val IOWAIT_INDEX = 4
+        const val MAX_TOLERATED_INVALID_SAMPLES = 2
     }
 }

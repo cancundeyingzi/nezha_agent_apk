@@ -7,20 +7,6 @@ internal data class TrafficSnapshot(
     val txBytes: Long
 )
 
-/** Keeps both counters in one source domain when a primary snapshot is incomplete. */
-internal fun selectTrafficSnapshot(
-    primary: TrafficSnapshot,
-    fallback: () -> TrafficSnapshot?
-): TrafficSnapshot {
-    if (primary.rxBytes > 0L && primary.txBytes > 0L) return primary
-
-    val candidate = fallback() ?: return primary
-    val suppliesMissingDirection =
-        (primary.rxBytes <= 0L && candidate.rxBytes > 0L) ||
-            (primary.txBytes <= 0L && candidate.txBytes > 0L)
-    return if (suppliesMissingDirection) candidate else primary
-}
-
 /** Reads and aggregates physical network counters exposed by `/proc/net/dev`. */
 internal object ProcNetDevReader {
     private val fieldSeparator = Regex("\\s+")
@@ -60,9 +46,8 @@ internal object ProcNetDevReader {
         return TrafficSnapshot(rxBytes, txBytes)
     }
 
-    private fun shouldIgnore(interfaceName: String): Boolean =
-        interfaceName == "lo" || interfaceName.startsWith("tun")
-
-    private fun addWithoutOverflow(left: Long, right: Long): Long? =
-        if (right > Long.MAX_VALUE - left) null else left + right
+    private fun shouldIgnore(interfaceName: String): Boolean = isIgnoredTrafficInterface(interfaceName)
 }
+
+internal fun isIgnoredTrafficInterface(interfaceName: String): Boolean =
+    interfaceName == "lo" || interfaceName.startsWith("tun")

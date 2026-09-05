@@ -12,8 +12,8 @@ android {
         applicationId = "com.nezhahq.agent"
         minSdk = 23
         targetSdk = 35
-        versionCode = 381
-        versionName = "A0.10.0"
+        versionCode = 385
+        versionName = "A0.10.1"
 
         vectorDrawables {
             useSupportLibrary = true

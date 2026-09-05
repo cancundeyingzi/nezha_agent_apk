@@ -2,10 +2,7 @@ package com.nezhahq.agent.collector
 
 import android.app.ActivityManager
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.net.TrafficStats
-import android.os.BatteryManager
 import android.os.SystemClock
 import com.nezhahq.agent.util.Logger
 import com.nezhahq.agent.util.RootShell
@@ -13,8 +10,8 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import proto.Nezha.State
-import proto.Nezha.State_SensorTemperature
 import java.io.File
+import java.net.NetworkInterface
 
 /**
  * 系统运行时状态采集器（动态数据，每次上报前调用一次）。
@@ -35,17 +32,14 @@ import java.io.File
  *  - 进程数：枚举 /proc 下的数字子目录（每 PID 一个）。
  *
  * ### Root/Shizuku 模式（isRootMode = true）
- *  - CPU：通过 [RootShell]（持久 su 会话）执行 `head -n 1 /proc/stat`，
- *    绕过 SELinux 限制，使用差值法精确计算。
- *  - 连接数：通过 [RootShell] 执行 `ss` 命令，获取全系统连接数。
- *  - 进程数：通过 [RootShell] 执行 `ps -A | wc -l` 获取全量进程数。
+ * CPU、网络、负载、连接和进程数据通过一次带分段标记的 [RootShell] 请求采集，
+ * 避免多个 Binder 往返产生部分成功、部分降级的不一致状态。
  *
  * ## 性能优化
- *  - 所有 Regex 均以伴生对象常量形式预编译（/proc/stat 分割）。
+ *  - 热点解析所需 Regex 均为单例，避免重复编译和 GC。
  *  - /proc/meminfo 解析改用纯字符串操作，避免临时 Regex 对象和 GC。
  *  - /proc/net/ 等连接数统计改为字节缓冲区计换行符，无 String 对象分配。
- *  - Root 模式下的所有 shell 命令通过 [RootShell] 单例持久会话执行，
- *    彻底消除每 2 秒 fork 新 su 进程的性能灾难。
+ *  - Root 模式的动态系统指标合并为一次持久 Shell 请求。
  */
 class SystemStateCollector(
     private val context: Context,
@@ -54,27 +48,30 @@ class SystemStateCollector(
 ) {
 
     // ──────────────────────────────────────────────────────────────────────────
-    // 伴生对象：预编译 Regex 常量（避免每次调用时重新编译 JIT 开销）
+    // 伴生对象：共享常量
     // ──────────────────────────────────────────────────────────────────────────
     companion object {
-        /**
-         * 用于分割 /proc/stat 各字段的空白正则。
-         * 预编译后复用，避免频繁 GC。
-         */
-        private val WHITESPACE_RE = Regex("\\s+")
-
         /** /proc/net/tcp 等文件的字节读取缓冲区大小（8 KiB）。 */
         private const val NET_BUF_SIZE = 8192
+
+        private val DEFAULT_LOAD_AVERAGE = Triple(0.0, 0.0, 0.0)
+        private val PRIVILEGED_TRAFFIC_SOURCES = listOf(
+            TrafficSource.PRIVILEGED_PROC_NET_DEV,
+            TrafficSource.INTERFACE_TRAFFIC_STATS,
+            TrafficSource.NETWORK_STATS,
+            TrafficSource.TOTAL_TRAFFIC_STATS,
+            TrafficSource.DIRECT_PROC_NET_DEV
+        )
+        private val UNPRIVILEGED_TRAFFIC_SOURCES = PRIVILEGED_TRAFFIC_SOURCES.drop(1)
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // 状态变量：网络速度差值计算
-    // ──────────────────────────────────────────────────────────────────────────
-    private var lastRxBytes = -1L
-    private var lastTxBytes = -1L
-    private var lastTimeMs  = SystemClock.elapsedRealtime()
-
     private val cpuUsageSampler = CpuUsageSampler()
+    private val batteryCollector = BatteryCollector(context)
+    private val trafficSourceSelector = TrafficSourceSelector()
+    private val networkSpeedSampler = NetworkSpeedSampler()
+    private val processCountMetric = StableMetric<Long>()
+    private val connectionCountMetric = StableMetric<Pair<Long, Long>>()
+    private val loadAverageMetric = StableMetric<Triple<Double, Double, Double>>()
 
     // ──────────────────────────────────────────────────────────────────────────
     // 日志去重标志：对于已知的不可恢复限制，只打印一次警告
@@ -92,6 +89,10 @@ class SystemStateCollector(
     }
 
     private fun collectState(isRootMode: Boolean): State {
+        // One framed transaction keeps all Shizuku-backed values from the same sampling tick and
+        // avoids repeatedly crossing Binder for six tiny shell commands.
+        val privilegedMetrics = if (isRootMode) readPrivilegedMetrics() else null
+
         // ── 1. RAM ─────────────────────────────────────────────────────────────
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memInfo = ActivityManager.MemoryInfo()
@@ -106,50 +107,22 @@ class SystemStateCollector(
         val diskUsed = diskInfo.usedBytes
 
         // ── 4. 网络速度与流量 ──────────────────────────────────────────────────
-        val (currentRx, currentTx) = readNetworkTrafficBytes(isRootMode)
-        val currentTime = SystemClock.elapsedRealtime()
-        val timeDiff    = currentTime - lastTimeMs
-
-        var rxSpeed = 0L
-        var txSpeed = 0L
-        // Ensure lastBytes is initialized properly (-1L) to avoid first tick huge speed
-        if (timeDiff > 0 && lastRxBytes >= 0 && lastTxBytes >= 0) {
-            rxSpeed = (currentRx - lastRxBytes) * 1000 / timeDiff
-            txSpeed = (currentTx - lastTxBytes) * 1000 / timeDiff
-        }
-        lastRxBytes = currentRx
-        lastTxBytes = currentTx
-        lastTimeMs  = currentTime
+        val networkSample = networkSpeedSampler.sample(
+            readNetworkTraffic(isRootMode, privilegedMetrics?.traffic),
+            SystemClock.elapsedRealtime()
+        )
 
         // ── 5. 温度传感器（电池温度作为系统回退值）───────────────────────────
-        val batteryIntent = context.registerReceiver(
-            null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-        )
-        val tempCelsius = batteryIntent
-            ?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0)
-            ?.toDouble()?.div(10.0) ?: 0.0
-        val sensorTemp = State_SensorTemperature.newBuilder()
-            .setName("Battery")
-            .setTemperature(tempCelsius)
-            .build()
+        val batteryMetrics = batteryCollector.collect(privilegedMetrics?.batteryUevent)
 
         // ── 6. CPU + 进程数 + 连接数 ───────────────────────────────────────────
-        val cpuUsage     = readCpuUsagePercent(isRootMode)
-        var processCount = 0L
-        var tcpConnCount = 0L
-        var udpConnCount = 0L
-
-        try {
-            processCount = readProcessCount(isRootMode)
-            val (tcp, udp) = readConnectionCounts(isRootMode)
-            tcpConnCount = tcp
-            udpConnCount = udp
-        } catch (e: Exception) {
-            Logger.e("StateCollector: 采集进程/连接数时异常", e)
-        }
+        val cpuUsage = readCpuUsagePercent(isRootMode, privilegedMetrics?.cpuLine)
+        val processCount = readProcessCount(isRootMode, privilegedMetrics?.processCount)
+        val (tcpConnCount, udpConnCount) =
+            readConnectionCounts(isRootMode, privilegedMetrics?.connectionCounts)
 
         // ── 7. 系统负载（1 / 5 / 15 分钟平均值）────────────────────────────────
-        val loadAvg = readLoadAverage(isRootMode)
+        val loadAvg = readLoadAverage(isRootMode, privilegedMetrics?.loadAverage)
 
         // ── 8. GPU 使用率（Root/Shizuku 模式可用）────────────────────────────
         val gpuUsages = gpuCollector.getGpuUsages(isRootMode)
@@ -159,10 +132,10 @@ class SystemStateCollector(
             .setMemUsed(memUsed)
             .setSwapUsed(swapUsed)
             .setDiskUsed(diskUsed)
-            .setNetInTransfer(currentRx)
-            .setNetOutTransfer(currentTx)
-            .setNetInSpeed(rxSpeed)
-            .setNetOutSpeed(txSpeed)
+            .setNetInTransfer(networkSample.snapshot.rxBytes)
+            .setNetOutTransfer(networkSample.snapshot.txBytes)
+            .setNetInSpeed(networkSample.rxBytesPerSecond)
+            .setNetOutSpeed(networkSample.txBytesPerSecond)
             .setUptime(SystemClock.elapsedRealtime() / 1000)
             .setLoad1(loadAvg.first)
             .setLoad5(loadAvg.second)
@@ -170,9 +143,18 @@ class SystemStateCollector(
             .setTcpConnCount(tcpConnCount)
             .setUdpConnCount(udpConnCount)
             .setProcessCount(processCount)
-            .addTemperatures(sensorTemp)
+            .addAllTemperatures(batteryMetrics)
             .addAllGpu(gpuUsages)
             .build()
+    }
+
+    private fun readPrivilegedMetrics(): PrivilegedMetricsSnapshot? {
+        return try {
+            PrivilegedMetricsSnapshotParser.parse(RootShell.execute(PRIVILEGED_METRICS_COMMAND))
+        } catch (e: Exception) {
+            Logger.e("StateCollector: Root/Shizuku 指标快照读取失败", e)
+            null
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -184,112 +166,82 @@ class SystemStateCollector(
      * - Root/Shizuku 模式：通过 `cat /proc/net/dev` 解析全网卡流量，规避 Android 11+ 对 TrafficStats 的限制。
      * - 普通模式（Android 12+）：遍历 NetworkInterface 并调用 TrafficStats.getRxBytes(iface.name)。
      * - 普通模式（Android 6+ 降级）：尝试使用 NetworkStatsManager 查询设备总计。
-     * - 普通模式（最低兜底）：使用 TrafficStats.getTotalRxBytes()，若被系统拦截或不支持则回退为 0。
-     * - 所有普通策略均返回 0 时，直接尝试读取 `/proc/net/dev`。
+     * - 普通模式（最低兜底）：使用 TrafficStats 总计，再尝试直读 `/proc/net/dev`。
+     *
+     * 选中的来源会保持稳定；短暂失败不会立刻切换计数域。确需切换时，网速采样器会先
+     * 重新建立基线，因此不会把两个口径的累计值相减。
      */
-    private fun readNetworkTrafficBytes(isRootMode: Boolean): Pair<Long, Long> {
-        var rx = -1L
-        var tx = -1L
-
-        if (isRootMode) {
-            try {
-                ProcNetDevReader.parse(RootShell.execute("cat /proc/net/dev"))?.let { snapshot ->
-                    rx = snapshot.rxBytes
-                    tx = snapshot.txBytes
-                }
-            } catch (e: Exception) {
-                Logger.e("StateCollector: Root 模式读取 /proc/net/dev 失败", e)
+    private fun readNetworkTraffic(
+        isRootMode: Boolean,
+        privilegedTraffic: TrafficSnapshot?
+    ): TrafficReading? {
+        val candidates = if (isRootMode) PRIVILEGED_TRAFFIC_SOURCES else UNPRIVILEGED_TRAFFIC_SOURCES
+        return trafficSourceSelector.read(candidates) { source ->
+            when (source) {
+                TrafficSource.PRIVILEGED_PROC_NET_DEV -> privilegedTraffic
+                TrafficSource.INTERFACE_TRAFFIC_STATS -> readInterfaceTrafficStats()
+                TrafficSource.NETWORK_STATS -> readNetworkStats()
+                TrafficSource.TOTAL_TRAFFIC_STATS -> readTotalTrafficStats()
+                TrafficSource.DIRECT_PROC_NET_DEV -> ProcNetDevReader.read()
             }
         }
+    }
 
-        // 降级策略 1：使用 Android 12 (API 31+) 提供的按网卡获取流量的方法
-        if ((rx < 0L || tx < 0L) && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-            try {
-                val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
-                if (interfaces != null) {
-                    var tempRx = 0L
-                    var tempTx = 0L
-                    var hasData = false
-                    for (iface in interfaces) {
-                        if (!iface.isLoopback) {
-                            val r = TrafficStats.getRxBytes(iface.name)
-                            val t = TrafficStats.getTxBytes(iface.name)
-                            if (r != TrafficStats.UNSUPPORTED.toLong() && r >= 0) {
-                                tempRx += r
-                                hasData = true
-                            }
-                            if (t != TrafficStats.UNSUPPORTED.toLong() && t >= 0) {
-                                tempTx += t
-                                hasData = true
-                            }
-                        }
-                    }
-                    if (hasData) {
-                        rx = tempRx
-                        tx = tempTx
-                    }
+    private fun readInterfaceTrafficStats(): TrafficSnapshot? {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) return null
+        return runCatching {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return@runCatching null
+            var rx = 0L
+            var tx = 0L
+            var hasRx = false
+            var hasTx = false
+            while (interfaces.hasMoreElements()) {
+                val networkInterface = interfaces.nextElement()
+                if (networkInterface.isLoopback || isIgnoredTrafficInterface(networkInterface.name)) continue
+
+                val interfaceRx = TrafficStats.getRxBytes(networkInterface.name)
+                if (interfaceRx >= 0L) {
+                    rx = addWithoutOverflow(rx, interfaceRx) ?: return@runCatching null
+                    hasRx = true
                 }
-            } catch (e: Exception) {
-                Logger.e("StateCollector: API 31+ TrafficStats 按网卡获取失败", e)
-            }
-        }
-
-        // 降级策略 2：使用 Android 6 (API 23+) 的 NetworkStatsManager 获取设备级流量
-        if ((rx < 0L || tx < 0L) && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-            try {
-                val nsm = context.getSystemService(Context.NETWORK_STATS_SERVICE) as? android.app.usage.NetworkStatsManager
-                if (nsm != null) {
-                    var tempRx = 0L
-                    var tempTx = 0L
-                    var hasData = false
-
-                    val queryStats = { transportType: Int ->
-                        try {
-                            val bucket = nsm.querySummaryForDevice(transportType, null, 0, System.currentTimeMillis())
-                            if (bucket != null) {
-                                tempRx += bucket.rxBytes
-                                tempTx += bucket.txBytes
-                                if (bucket.rxBytes > 0 || bucket.txBytes > 0) hasData = true
-                            }
-                        } catch (e: Exception) {
-                            // 忽略缺乏权限 (SecurityException) 或服务不可用等异常
-                        }
-                    }
-
-                    // querySummaryForDevice takes the legacy ConnectivityManager TYPE_* constants;
-                    // the NetworkCapabilities transports that replaced them are not accepted by
-                    // this overload, so the deprecated values are the only ones that work here.
-                    @Suppress("DEPRECATION")
-                    queryStats(android.net.ConnectivityManager.TYPE_WIFI)
-                    @Suppress("DEPRECATION")
-                    queryStats(android.net.ConnectivityManager.TYPE_MOBILE)
-                    @Suppress("DEPRECATION")
-                    queryStats(android.net.ConnectivityManager.TYPE_ETHERNET)
-
-                    if (hasData) {
-                        rx = tempRx
-                        tx = tempTx
-                    }
+                val interfaceTx = TrafficStats.getTxBytes(networkInterface.name)
+                if (interfaceTx >= 0L) {
+                    tx = addWithoutOverflow(tx, interfaceTx) ?: return@runCatching null
+                    hasTx = true
                 }
-            } catch (e: Exception) {
-                Logger.e("StateCollector: NetworkStatsManager 获取失败", e)
             }
-        }
+            if (hasRx && hasTx) TrafficSnapshot(rx, tx) else null
+        }.getOrNull()
+    }
 
-        // 降级策略 3：回退到最基础的 TrafficStats 总计（API 8+）
-        if (rx < 0L || tx < 0L) {
-            val tsRx = TrafficStats.getTotalRxBytes()
-            val tsTx = TrafficStats.getTotalTxBytes()
-            rx = if (tsRx >= 0) tsRx else 0L
-            tx = if (tsTx >= 0) tsTx else 0L
-        }
-
-        // 任一方向缺失时整体切换到同一个 /proc 快照，避免混合不同计数域。
-        val selected = selectTrafficSnapshot(
-            primary = TrafficSnapshot(rxBytes = rx, txBytes = tx),
-            fallback = ProcNetDevReader::read
+    @Suppress("DEPRECATION")
+    private fun readNetworkStats(): TrafficSnapshot? {
+        val manager = context.getSystemService(Context.NETWORK_STATS_SERVICE)
+            as? android.app.usage.NetworkStatsManager ?: return null
+        var rx = 0L
+        var tx = 0L
+        var hasSnapshot = false
+        val networkTypes = intArrayOf(
+            android.net.ConnectivityManager.TYPE_WIFI,
+            android.net.ConnectivityManager.TYPE_MOBILE,
+            android.net.ConnectivityManager.TYPE_ETHERNET
         )
-        return Pair(selected.rxBytes, selected.txBytes)
+        for (networkType in networkTypes) {
+            val bucket = runCatching {
+                manager.querySummaryForDevice(networkType, null, 0L, System.currentTimeMillis())
+            }.getOrNull() ?: continue
+            if (bucket.rxBytes < 0L || bucket.txBytes < 0L) continue
+            rx = addWithoutOverflow(rx, bucket.rxBytes) ?: return null
+            tx = addWithoutOverflow(tx, bucket.txBytes) ?: return null
+            hasSnapshot = true
+        }
+        return if (hasSnapshot) TrafficSnapshot(rx, tx) else null
+    }
+
+    private fun readTotalTrafficStats(): TrafficSnapshot? {
+        val rx = TrafficStats.getTotalRxBytes()
+        val tx = TrafficStats.getTotalTxBytes()
+        return if (rx >= 0L && tx >= 0L) TrafficSnapshot(rx, tx) else null
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -300,8 +252,8 @@ class SystemStateCollector(
      * 读取 CPU 使用率，范围 [0.0, 100.0]。
      *
      * ### Root 模式
-     * 通过 [RootShell] 持久 su 会话执行 `head -n 1 /proc/stat`，绕过 SELinux，
-     * 再通过差值法（本次 - 上次）计算精确使用率。
+     * 从 [RootShell] 合并快照读取 `/proc/stat`，绕过 SELinux，再通过差值法
+     * （本次 - 上次）计算精确使用率。
      *
      * ### 普通模式（Android ≤ 8）
      * 直接读取 `/proc/stat` 并差值法计算。
@@ -316,11 +268,10 @@ class SystemStateCollector(
      * @param isRootMode 是否处于 Root/Shizuku 提权模式
      * @return [0.0, 100.0] 内的 CPU 使用率
      */
-    private fun readCpuUsagePercent(isRootMode: Boolean): Double {
+    private fun readCpuUsagePercent(isRootMode: Boolean, privilegedLine: String?): Double {
         val line = try {
             if (isRootMode) {
-                // Root 模式：使用持久 su 会话读取（不创建新进程！）
-                RootShell.executeFirstLine("head -n 1 /proc/stat")
+                privilegedLine
             } else {
                 File("/proc/stat").bufferedReader().use { it.readLine() }
             }
@@ -340,8 +291,8 @@ class SystemStateCollector(
      * 第一行是**所有核心**的累加，因此差值法的结果天然为 0-100%，
      * 无需额外除以核心数。
      *
-     * @param line /proc/stat 的第一行，null 返回 0.0
-     * @return [0.0, 100.0] 的 CPU 使用率，首次调用返回 0.0（无历史基准）
+     * @param line /proc/stat 的第一行
+     * @return [0.0, 100.0] 的 CPU 使用率；首次调用返回 0.0，短暂缺样沿用上一有效值
      */
     private fun parseProcStatLine(line: String?): Double {
         return cpuUsageSampler.sample(line)
@@ -358,8 +309,8 @@ class SystemStateCollector(
      * 前三个字段分别为 1/5/15 分钟的 CPU 队列平均长度。
      *
      * ### 权限策略
-     * - **Root/Shizuku 模式**：通过 [RootShell] 执行 `cat /proc/loadavg`，
-     *   绕过 Android 9+ 的 SELinux 限制，保证数据可用。
+     * - **Root/Shizuku 模式**：从 [RootShell] 合并快照读取 `/proc/loadavg`，
+     *   绕过 Android 9+ 的 SELinux 限制。
      * - **普通模式**：直接读取 `/proc/loadavg`。
      *   Android 7~8 的内核通常允许读取此文件；
      *   Android 9+ 部分 OEM ROM 可能通过 SELinux 策略拒绝读取，
@@ -368,25 +319,12 @@ class SystemStateCollector(
      * @param isRootMode 是否处于 Root/Shizuku 提权模式
      * @return Triple(load1, load5, load15)，读取失败返回 (0.0, 0.0, 0.0)
      */
-    private fun readLoadAverage(isRootMode: Boolean): Triple<Double, Double, Double> {
-        val defaultLoad = Triple(0.0, 0.0, 0.0)
-
-        // 获取 /proc/loadavg 的原始内容
-        val content: String? = if (isRootMode) {
-            // Root/Shizuku 模式：通过持久 Shell 读取，绕过 SELinux 限制
-            try {
-                RootShell.executeFirstLine("cat /proc/loadavg")
-            } catch (e: Exception) {
-                Logger.e("StateCollector: Root 模式读取 /proc/loadavg 失败，回退到直接读取", e)
-                // Root Shell 异常时回退到直接读取
-                readLoadAvgDirect()
-            }
-        } else {
-            // 普通模式：直接读取文件
-            readLoadAvgDirect()
-        }
-
-        return parseLoadAvgLine(content) ?: defaultLoad
+    private fun readLoadAverage(
+        isRootMode: Boolean,
+        privilegedLoad: Triple<Double, Double, Double>?
+    ): Triple<Double, Double, Double> {
+        val fallback = { parseLoadAverage(readLoadAvgDirect()) ?: DEFAULT_LOAD_AVERAGE }
+        return if (isRootMode) loadAverageMetric.resolve(privilegedLoad, fallback) else fallback()
     }
 
     /**
@@ -408,25 +346,6 @@ class SystemStateCollector(
             }
             null
         }
-    }
-
-    /**
-     * 解析 /proc/loadavg 的一行内容，提取前三个浮点数。
-     *
-     * 行格式：`0.34 0.28 0.22 1/345 12345`
-     * 使用纯字符串操作提取，避免正则分配。
-     *
-     * @param line /proc/loadavg 的第一行，null 返回 null
-     * @return Triple(load1, load5, load15)，格式不匹配返回 null
-     */
-    private fun parseLoadAvgLine(line: String?): Triple<Double, Double, Double>? {
-        if (line.isNullOrBlank()) return null
-        val parts = line.trim().split(WHITESPACE_RE)
-        if (parts.size < 3) return null
-        val load1  = parts[0].toDoubleOrNull() ?: return null
-        val load5  = parts[1].toDoubleOrNull() ?: return null
-        val load15 = parts[2].toDoubleOrNull() ?: return null
-        return Triple(load1, load5, load15)
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -501,25 +420,13 @@ class SystemStateCollector(
     /**
      * 获取当前进程总数。
      *
-     * - **Root 模式**：通过 [RootShell] 执行 `ps -A | wc -l`（全量，含系统进程）。
+     * - **Root 模式**：从 [RootShell] 合并快照获取 `ps -A` 进程数（全量，含系统进程）。
      * - **普通模式**：枚举 `/proc` 下的数字子目录（每 PID 一目录，无需权限）。
      */
-    private fun readProcessCount(isRootMode: Boolean): Long {
+    private fun readProcessCount(isRootMode: Boolean, privilegedCount: Long?): Long {
         return if (isRootMode) {
-            val output = RootShell.executeFirstLine("ps -A 2>/dev/null | wc -l")
-            val total = output?.trim()?.toLongOrNull()
-            // ps -A 输出包含标题行，减 1 得到实际进程数。
-            // 若输出不可解析，或计算后为非正数（如 toybox 不支持 -A 时返回 0），回退到 /proc 枚举法。
-            if (total != null) {
-                val count = (total - 1L).coerceAtLeast(0L)
-                if (count > 0L) {
-                    return count
-                }
-            }
-            readProcessCountFromProc()
-        } else {
-            readProcessCountFromProc()
-        }
+            processCountMetric.resolve(privilegedCount, ::readProcessCountFromProc)
+        } else readProcessCountFromProc()
     }
 
     /**
@@ -528,7 +435,7 @@ class SystemStateCollector(
      */
     private fun readProcessCountFromProc(): Long {
         return try {
-            File("/proc").listFiles { f -> f.isDirectory && f.name.all { it.isDigit() } }
+            File("/proc").listFiles { f -> f.name.all { it.isDigit() } && f.isDirectory }
                 ?.size?.toLong() ?: 0L
         } catch (e: Exception) {
             Logger.e("StateCollector: 枚举 /proc 目录统计进程数失败", e)
@@ -543,40 +450,17 @@ class SystemStateCollector(
     /**
      * 获取 TCP 和 UDP 连接数，返回 Pair(tcpCount, udpCount)。
      *
-     * - **Root 模式**：通过 [RootShell] 执行 `ss` 命令，获取全系统连接数。
+     * - **Root 模式**：从 [RootShell] 合并快照获取 `ss` 全系统连接数。
      * - **普通模式**：字节级扫描 /proc/net/tcp(6) 和 /proc/net/udp(6)，
      *   统计换行符数量（减去标题行），性能远优于按行 readLine() + String 分配。
      */
-    private fun readConnectionCounts(isRootMode: Boolean): Pair<Long, Long> {
+    private fun readConnectionCounts(
+        isRootMode: Boolean,
+        privilegedCounts: Pair<Long, Long>?
+    ): Pair<Long, Long> {
         return if (isRootMode) {
-            readConnectionCountsRoot()
-        } else {
-            readConnectionCountsFromProc()
-        }
-    }
-
-    /**
-     * Root 模式：通过持久 [RootShell] 执行 `ss` 统计全系统 TCP/UDP 连接数。
-     *
-     * 每次调用共使用 **2 次** shell 写入（不创建新进程），极低开销。
-     * 若 `ss` 命令不存在，自动回退到 /proc/net 字节统计法。
-     */
-    private fun readConnectionCountsRoot(): Pair<Long, Long> {
-        return try {
-            // ss -tn: TCP 连接，不解析主机名；tail -n +2 跳过标题行
-            val tcpRaw = RootShell.executeFirstLine(
-                "ss -tn 2>/dev/null | tail -n +2 | wc -l"
-            )
-            val udpRaw = RootShell.executeFirstLine(
-                "ss -un 2>/dev/null | tail -n +2 | wc -l"
-            )
-            val tcp = tcpRaw?.trim()?.toLongOrNull() ?: 0L
-            val udp = udpRaw?.trim()?.toLongOrNull() ?: 0L
-            Pair(tcp, udp)
-        } catch (e: Exception) {
-            Logger.e("StateCollector: Root 模式 ss 失败，回退到 /proc/net", e)
-            readConnectionCountsFromProc()
-        }
+            connectionCountMetric.resolve(privilegedCounts, ::readConnectionCountsFromProc)
+        } else readConnectionCountsFromProc()
     }
 
     /**

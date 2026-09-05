@@ -65,46 +65,10 @@ class ProcNetDevReaderTest {
     }
 
     @Test
-    fun `selection replaces receive-only primary with one fallback snapshot`() {
-        val fallback = TrafficSnapshot(rxBytes = 12L, txBytes = 34L)
-
-        val selected = selectTrafficSnapshot(TrafficSnapshot(rxBytes = 56L, txBytes = 0L)) {
-            fallback
-        }
-
-        assertEquals(fallback, selected)
-    }
-
-    @Test
-    fun `selection replaces transmit-only primary with one fallback snapshot`() {
-        val fallback = TrafficSnapshot(rxBytes = 12L, txBytes = 34L)
-
-        val selected = selectTrafficSnapshot(TrafficSnapshot(rxBytes = 0L, txBytes = 56L)) {
-            fallback
-        }
-
-        assertEquals(fallback, selected)
-    }
-
-    @Test
-    fun `selection preserves receive-only primary when fallback is empty`() {
-        val primary = TrafficSnapshot(rxBytes = 56L, txBytes = 0L)
-
-        val selected = selectTrafficSnapshot(primary) {
-            TrafficSnapshot(rxBytes = 0L, txBytes = 0L)
-        }
-
-        assertEquals(primary, selected)
-    }
-
-    @Test
-    fun `selection preserves transmit-only primary when fallback is empty`() {
-        val primary = TrafficSnapshot(rxBytes = 0L, txBytes = 56L)
-
-        val selected = selectTrafficSnapshot(primary) {
-            TrafficSnapshot(rxBytes = 0L, txBytes = 0L)
-        }
-
-        assertEquals(primary, selected)
+    fun `zero in one direction remains a valid cumulative snapshot`() {
+        assertEquals(
+            TrafficSnapshot(rxBytes = 56L, txBytes = 0L),
+            ProcNetDevReader.parse("eth0: 56 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
+        )
     }
 }

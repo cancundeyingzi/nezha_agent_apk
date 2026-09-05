@@ -26,6 +26,25 @@ until the dashboard ends them.
 **Root and Shizuku** are separate from the switches above. They decide whether an already-permitted
 shell runs with elevation, not whether the dashboard may ask for one.
 
+## 电池指标
+
+温度栏同时上报 `Battery`（摄氏度）、`电池电量 (%)` 和电池侧充电/放电功率（瓦）。
+缺失的指标不发送，真实零值保留。旧面板如果固定追加 `℃`，应按指标名称中的单位显示；
+当前温度协议没有独立单位字段，修改探针不能消除面板写死的单位。
+
+普通模式使用系统广播与 BatteryManager。高权限模式在现有批量快照中读取
+`/sys/class/power_supply/battery/uevent`，优先 `POWER_NOW`，其次同一节点的电压×电流，
+不可读时使用系统 API。不会读取充电器输入功率充当电池功率。
+
+双电芯不自动乘二，也不累加可能重复映射的 battery/bms/main/slave 节点。
+电压×电流统一标注“估算”：部分厂商仅公开单电芯电压或等效电流，通用 API 无法确认其整包口径，
+因此尚不能保证这些机型的整包功率准确；需实机驱动数据才能进一步适配。
+充电期间电池侧净功率不等于整机耗电功率或充电器输入功率。
+
+高权限后端在启用期间保持选择：Shizuku 已授权时直接使用；服务失效或撤权不会尝试 su。
+Shizuku 正在等待授权时不触发 Root 请求。无 Shizuku 服务且存在 su 时，Root 路径以限时
+`id -u` 校验确认 UID 0；失败后本次启用期间不再请求 su。需要重新选择后端时关闭并重新开启高权限模式。
+
 ## Building
 
 ```bash

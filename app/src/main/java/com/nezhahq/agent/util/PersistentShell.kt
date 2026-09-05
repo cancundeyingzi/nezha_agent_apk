@@ -284,8 +284,6 @@ internal class PersistentShell(
             false
         } catch (_: IllegalThreadStateException) {
             true
-        } catch (_: IllegalStateException) {
-            true
         }
     }
 

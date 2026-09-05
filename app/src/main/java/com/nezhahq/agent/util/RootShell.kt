@@ -6,6 +6,8 @@ import java.io.File
 import java.io.InputStream
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
@@ -13,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuRemoteProcess
 
 /**
  * Process-wide privileged-shell boundary.
@@ -28,6 +31,7 @@ object RootShell {
 
     private val managedProcessLock = Any()
     private val managedProcesses = mutableSetOf<ManagedProcess>()
+    private val backendPolicy = ShellBackendPolicy()
 
     private val persistentShell = PersistentShell(
         sessionFactory = ::startSession,
@@ -37,7 +41,7 @@ object RootShell {
             if (command == "<start>") {
                 Logger.e("RootShell: 建立 Shell 会话失败", exception)
             } else {
-                Logger.e("RootShell: 执行命令失败 [$command]，正在重置会话", exception)
+                Logger.e("RootShell: 执行命令失败 [$command]，正在重置会话（${exception.javaClass.name}）", exception)
             }
         }
     )
@@ -52,6 +56,7 @@ object RootShell {
             accessController.enable()
         } else {
             accessController.disableAndRevoke()
+            backendPolicy.reset()
         }
     }
 
@@ -67,6 +72,10 @@ object RootShell {
      */
     fun execute(command: String, timeoutMs: Long = DEFAULT_SHELL_TIMEOUT_MS): String {
         if (!accessController.isEnabled()) return ""
+        if (persistentShell.sessionType() == "shizuku" && !isShizukuAvailable()) {
+            closePrivilegedResources()
+            return ""
+        }
         return persistentShell.execute(command, timeoutMs)
     }
 
@@ -170,7 +179,11 @@ object RootShell {
         return persistentShell.sessionType()
     }
 
-    /** Tries su first, then an authorized Shizuku shell. */
+    /**
+     * Starts an authorized privileged shell.
+     *
+     * Selects one backend from authorization state. A failed Shizuku session never triggers su.
+     */
     private fun startSession(): ShellSession? {
         if (!accessController.isEnabled()) return null
         val launched = startShellProcess(workingDirectory = null) ?: return null
@@ -219,6 +232,25 @@ object RootShell {
 
     private fun startShellProcess(workingDirectory: File?): LaunchedShell? {
         if (!accessController.isEnabled()) return null
+
+        return synchronized(backendPolicy) {
+            val backend = backendPolicy.select(
+                shizukuAuthorized = isShizukuAvailable(),
+                shizukuRunning = runCatching { Shizuku.pingBinder() }.getOrDefault(false),
+                suInstalled = System.getenv("PATH").orEmpty().split(File.pathSeparatorChar)
+                    .filter { it.isNotBlank() }.any { File(it, "su").canExecute() }
+            ) ?: return@synchronized null
+            if (!accessController.isEnabled()) return@synchronized null
+            when (backend) {
+                ShellBackend.SHIZUKU -> startShizukuShell(workingDirectory)
+                ShellBackend.SU -> startSuShell(workingDirectory).also {
+                    if (it == null) backendPolicy.rejectSu()
+                }
+            }
+        }
+    }
+
+    private fun startSuShell(workingDirectory: File?): LaunchedShell? {
         var temporarySuProcess: Process? = null
         try {
             temporarySuProcess = ProcessBuilder("su")
@@ -227,30 +259,28 @@ object RootShell {
                     if (workingDirectory != null) directory(workingDirectory)
                 }
                 .start()
-            Thread.sleep(200)
-            if (isProcessAlive(temporarySuProcess)) {
+            if (verifyRootUid(temporarySuProcess)) {
                 val launched = LaunchedShell(temporarySuProcess, "su")
                 temporarySuProcess = null
                 Logger.i("RootShell: su Shell 已建立（Root 模式）。")
                 return launched
             }
-            Logger.i("RootShell: su 进程已退出（可能权限被拒绝），尝试 Shizuku 回退...")
+            Logger.i("RootShell: Root UID 校验未通过，本次启用期间不再请求 su。")
         } catch (exception: InterruptedException) {
             Thread.currentThread().interrupt()
             Logger.i("RootShell: su 启动被中断，取消本次高权限 Shell 建立。")
             return null
         } catch (exception: Exception) {
-            Logger.i("RootShell: su 命令执行失败（${exception.message}），尝试 Shizuku 回退...")
+            Logger.i("RootShell: su 命令执行失败（${exception.message}）。")
         } finally {
             temporarySuProcess?.let(ShellSession::destroyProcess)
         }
+        return null
+    }
 
+    private fun startShizukuShell(workingDirectory: File?): LaunchedShell? {
+        var temporaryProcess: Process? = null
         try {
-            if (!isShizukuAvailable()) {
-                Logger.i("RootShell: Shizuku 不可用（未运行或未授权），高权限 Shell 功能不可用。")
-                return null
-            }
-
             @Suppress("DEPRECATION")
             val method = Shizuku::class.java.getDeclaredMethod(
                 "newProcess",
@@ -259,17 +289,23 @@ object RootShell {
                 String::class.java
             )
             method.isAccessible = true
-            val process = method.invoke(
+            temporaryProcess = method.invoke(
                 null,
                 arrayOf("sh"),
                 null,
                 workingDirectory?.absolutePath
             ) as Process
-            Logger.i("RootShell: Shizuku Shell 已建立（ADB 模式，UID=${Shizuku.getUid()}）。")
-            return LaunchedShell(process, "shizuku")
+            val remote = temporaryProcess as ShizukuRemoteProcess
+            val launched = LaunchedShell(RemoteShellProcess(remote, remote::alive), "shizuku")
+            val uid = Shizuku.getUid()
+            Logger.i("RootShell: Shizuku Shell 已建立（${if (uid == 0) "Root" else "ADB"} 模式，UID=$uid，状态检查=alive）。")
+            temporaryProcess = null
+            return launched
         } catch (exception: Exception) {
-            Logger.e("RootShell: Shizuku Shell 启动失败，高权限 Shell 功能不可用", exception)
+            Logger.e("RootShell: 已授权的 Shizuku Shell 启动失败", exception)
             return null
+        } finally {
+            temporaryProcess?.let(ShellSession::destroyProcess)
         }
     }
 
@@ -287,14 +323,20 @@ object RootShell {
         }
     }
 
-    private fun isProcessAlive(process: Process): Boolean {
-        return try {
-            process.exitValue()
-            false
-        } catch (_: IllegalThreadStateException) {
-            true
-        } catch (_: IllegalStateException) {
-            true
+    private fun verifyRootUid(process: Process): Boolean {
+        val reader = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "nezha-root-auth").apply { isDaemon = true }
+        }
+        try {
+            val session = ShellSession.openRedirected(process, "su")
+            val marker = ShellMarker(newMarkerToken())
+            session.writeCommand("id -u", marker)
+            val result = reader.submit<ShellReadResult> {
+                ShellProtocolReader(maxOutputBytes = 1024).read(session.input, marker)
+            }.get(DEFAULT_SHELL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            return result.exitCode == 0 && !result.truncated && result.output.trim() == "0"
+        } finally {
+            reader.shutdownNow()
         }
     }
 
@@ -362,5 +404,37 @@ object RootShell {
         override fun close() {
             managedProcess.close()
         }
+    }
+}
+
+internal enum class ShellBackend {
+    SHIZUKU,
+    SU
+}
+
+/** Remembers the selected backend until the user disables privileged mode. No launch fallback. */
+internal class ShellBackendPolicy {
+    private var selected: ShellBackend? = null
+    private var suRejected = false
+
+    @Synchronized
+    fun select(shizukuAuthorized: Boolean, shizukuRunning: Boolean, suInstalled: Boolean): ShellBackend? {
+        if (selected == ShellBackend.SHIZUKU) return if (shizukuAuthorized) selected else null
+        if (selected == ShellBackend.SU) return if (suRejected || !suInstalled) null else selected
+        selected = when {
+            shizukuAuthorized || shizukuRunning -> ShellBackend.SHIZUKU
+            !suInstalled || suRejected -> null
+            else -> ShellBackend.SU
+        }
+        return if (selected == ShellBackend.SHIZUKU && !shizukuAuthorized) null else selected
+    }
+
+    @Synchronized
+    fun rejectSu() { suRejected = true }
+
+    @Synchronized
+    fun reset() {
+        selected = null
+        suRejected = false
     }
 }

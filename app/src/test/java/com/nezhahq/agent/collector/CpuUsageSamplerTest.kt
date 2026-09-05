@@ -31,16 +31,22 @@ class CpuUsageSamplerTest {
     }
 
     @Test
-    fun `invalid sample clears previous baseline`() {
+    fun `brief invalid sample keeps the previous usage and baseline`() {
         sampler.sample("cpu 100 0 100 800 0 0 0 0")
-        assertEquals(0.0, sampler.sample("not cpu data"), 0.0)
-        assertEquals(0.0, sampler.sample("cpu 150 0 150 850 0 0 0 0"), 0.0)
+        assertEquals(66.666, sampler.sample("cpu 150 0 150 850 0 0 0 0"), 0.001)
+
+        assertEquals(66.666, sampler.sample("not cpu data"), 0.001)
+        assertEquals(66.666, sampler.sample("cpu 200 0 200 900 0 0 0 0"), 0.001)
     }
 
     @Test
-    fun `failed read clears previous baseline`() {
+    fun `persistent read failure eventually clears stale usage`() {
         sampler.sample("cpu 100 0 100 800 0 0 0 0")
+        sampler.sample("cpu 150 0 150 850 0 0 0 0")
+
+        assertEquals(66.666, sampler.sample(null), 0.001)
+        assertEquals(66.666, sampler.sample(null), 0.001)
         assertEquals(0.0, sampler.sample(null), 0.0)
-        assertEquals(0.0, sampler.sample("cpu 150 0 150 850 0 0 0 0"), 0.0)
+        assertEquals(0.0, sampler.sample("cpu 200 0 200 900 0 0 0 0"), 0.0)
     }
 }
